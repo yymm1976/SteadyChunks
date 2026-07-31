@@ -3,10 +3,12 @@ package com.mochi_753.steadychunks.governor;
 import com.mochi_753.steadychunks.SteadyChunks;
 import com.mochi_753.steadychunks.config.CommonConfig;
 import com.mochi_753.steadychunks.scheduler.ChunkScheduler;
+import com.mochi_753.steadychunks.scheduler.ResourceType;
 import com.mochi_753.steadychunks.telemetry.ChunkFlightRecorder;
 import com.mochi_753.steadychunks.telemetry.QuantileEstimator;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 
+import java.util.EnumMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -32,6 +34,12 @@ public final class ResourceGovernor {
 
     /** 阈值配置，从 CommonConfig 同步 */
     private volatile PressureSnapshot.ThresholdConfig thresholds;
+
+    // P0-6 修复：滑动窗口增量指标，替代生命周期累计值
+    /** 上次控制周期的 GC 暂停累计值（用于计算增量） */
+    private long prevGcPauseMs = 0;
+    /** 上次控制周期的长帧累计值（用于计算增量） */
+    private long prevFramesOver50ms = 0;
 
     private ResourceGovernor() {
         thresholds = new PressureSnapshot.ThresholdConfig(
@@ -96,6 +104,10 @@ public final class ResourceGovernor {
 
     /**
      * 从 ChunkFlightRecorder 采集指标构建压力快照。
+     * <p>
+     * P0-6 修复：GC 暂停和长帧使用控制周期增量，而非生命周期累计值。
+     * 旧实现将累计值除以控制周期，旧卡顿会持续影响所有未来窗口。
+     * 新实现计算本周期增量，只反映最近一个控制窗口的实际压力。
      */
     private PressureSnapshot collectSnapshot() {
         var sys = ChunkFlightRecorder.system();
@@ -109,17 +121,26 @@ public final class ResourceGovernor {
         double p99Mspt = mspt.quantile(0.99) / 1_000_000.0;
         double p95Frame = frameTime.quantile(0.95) / 1_000_000.0;
         double p99Frame = frameTime.quantile(0.99) / 1_000_000.0;
-        double longFrameRate = cf.framesOver50ms() > 0
-                ? (double) cf.framesOver50ms() / Math.max(1, CONTROL_PERIOD_TICKS / 20.0)
-                : 0;
+
+        // P0-6 修复：长帧率使用本周期增量，而非累计值除以周期数
+        long currentFramesOver50ms = cf.framesOver50ms();
+        long frameDelta = Math.max(0, currentFramesOver50ms - prevFramesOver50ms);
+        prevFramesOver50ms = currentFramesOver50ms;
+        double longFrameRate = frameDelta;
+
         double heapPressure = sys.heapUsedPeak() > 0
                 ? (double) sys.heapUsedCurrent() / Runtime.getRuntime().maxMemory()
                 : 0;
 
+        // P0-6 修复：GC 暂停使用本周期增量，而非累计值
+        long currentGcPauseMs = sys.gcPauseMs();
+        long gcDelta = Math.max(0, currentGcPauseMs - prevGcPauseMs);
+        prevGcPauseMs = currentGcPauseMs;
+
         return new PressureSnapshot(
                 p95Mspt, p99Mspt, p95Frame, p99Frame,
                 longFrameRate, sys.processCpuLoad(), sys.worldgenCpuLoad(),
-                heapPressure, sys.gcPauseMs(),
+                heapPressure, gcDelta,
                 fs.fullQueueDepthCurrent(), 0, // visibleChunkGaps 需要客户端反馈
                 fs.sendQueueDepthCurrent(), cf.sectionCompileQueueDepth()
         );
@@ -127,23 +148,40 @@ public final class ResourceGovernor {
 
     /**
      * 将 AIMD 输出应用到调度器的阶段限制。
-     * 紧急模式下额外限制 NOISE / FEATURES。
+     * <p>
+     * P0-3 修复：按 ResourceType 聚合后再写入共享桶，避免同资源组的多个
+     * ChunkStatus（如 BIOMES/NOISE/SURFACE）连续写入同一桶导致最终值依赖遍历顺序。
+     * 聚合策略：同资源组取最小值（最保守）。
+     * <p>
+     * P0-4 修复：紧急模式使用 admissionPaused 标志而非 permit=0。
+     * 旧实现 setMaxPermits(0) 被 ResourceBucket 钳制为 1，实际仍允许 1 个任务。
      */
     private void applyPermits(ChunkScheduler scheduler, Map<ChunkStatus, Integer> permits,
                               EmergencyMode.ModeState modeState) {
+        // P0-4 修复：紧急模式使用 admissionPaused 标志
+        boolean shouldPause = modeState.emergency() && !modeState.recovering();
+        scheduler.setAdmissionPaused(shouldPause);
+
+        // P0-3 修复：按 ResourceType 聚合，同资源组取最小值
+        EnumMap<ResourceType, Integer> resourcePermits = new EnumMap<>(ResourceType.class);
         for (var entry : permits.entrySet()) {
+            ResourceType rt = scheduler.stageLimiter().resourceTypeOf(entry.getKey());
+            if (rt == null) {
+                continue;
+            }
             int permit = entry.getValue();
-            // 紧急模式下限制 NOISE / FEATURES
-            if (modeState.emergency() && !modeState.recovering()) {
-                if (entry.getKey() == ChunkStatus.NOISE
-                        || entry.getKey() == ChunkStatus.FEATURES) {
-                    permit = 0; // 暂停启动新的 NOISE / FEATURES
-                }
-            } else if (modeState.recovering()) {
-                // 恢复窗口：按比例提升
+            if (modeState.recovering()) {
                 permit = (int) Math.max(1, permit * modeState.recoveryRatio());
             }
-            scheduler.stageLimiter().setStageLimit(entry.getKey(), permit);
+            // 同资源组取最小值（最保守）
+            Integer existing = resourcePermits.get(rt);
+            if (existing == null || permit < existing) {
+                resourcePermits.put(rt, permit);
+            }
+        }
+        // 按 ResourceType 写入共享桶
+        for (var entry : resourcePermits.entrySet()) {
+            scheduler.stageLimiter().setResourceLimit(entry.getKey(), entry.getValue());
         }
     }
 

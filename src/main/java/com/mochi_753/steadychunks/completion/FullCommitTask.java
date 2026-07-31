@@ -3,6 +3,7 @@ package com.mochi_753.steadychunks.completion;
 import net.minecraft.world.level.ChunkPos;
 
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * FULL 整合任务模型，对应开发计划 §5.1。
@@ -14,6 +15,7 @@ import java.util.UUID;
  *   <li>紧迫度等级（决定是否可延迟）</li>
  *   <li>需求玩家（用于公平性）</li>
  *   <li>依赖关键性（是否必须立即执行以解除依赖）</li>
+ *   <li>完成 Future（审查修复：任务执行后完成，异常路径也完成）</li>
  * </ul>
  * <p>
  * 技术指导 §10.3：必须区分可推迟、必须立即执行以解除依赖、原版线程约束要求立即执行三类。
@@ -28,10 +30,20 @@ public final class FullCommitTask implements Comparable<FullCommitTask> {
     private final boolean dependencyCritical;
     private final long enqueueNanos;
     private final Runnable commitAction;
+    /** 审查修复：完成 Future，任务执行后完成（成功或异常），null 表示不需要通知 */
+    private final CompletableFuture<Void> completion;
 
     public FullCommitTask(ChunkPos pos, Object dimension, long estimatedCostNanos,
                           Urgency urgency, UUID nearestPlayer, double distance,
                           boolean dependencyCritical, Runnable commitAction) {
+        this(pos, dimension, estimatedCostNanos, urgency, nearestPlayer, distance,
+                dependencyCritical, commitAction, null);
+    }
+
+    public FullCommitTask(ChunkPos pos, Object dimension, long estimatedCostNanos,
+                          Urgency urgency, UUID nearestPlayer, double distance,
+                          boolean dependencyCritical, Runnable commitAction,
+                          CompletableFuture<Void> completion) {
         this.pos = pos;
         this.dimension = dimension;
         this.estimatedCostNanos = estimatedCostNanos;
@@ -41,6 +53,7 @@ public final class FullCommitTask implements Comparable<FullCommitTask> {
         this.dependencyCritical = dependencyCritical;
         this.enqueueNanos = System.nanoTime();
         this.commitAction = commitAction;
+        this.completion = completion;
     }
 
     public ChunkPos pos() {
@@ -77,6 +90,14 @@ public final class FullCommitTask implements Comparable<FullCommitTask> {
 
     public Runnable commitAction() {
         return commitAction;
+    }
+
+    /**
+     * 审查修复：完成 Future。任务执行后由 FullCommitQueue 完成（成功或异常）。
+     * null 表示调用者不需要完成通知。
+     */
+    public CompletableFuture<Void> completion() {
+        return completion;
     }
 
     /** 排队年龄（毫秒） */

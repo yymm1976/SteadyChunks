@@ -28,12 +28,14 @@ public final class ChunkSendQuota {
 
     /** 每玩家每 Tick 最大发送区块数 */
     private volatile int maxChunksPerTick = 5;
-    /** 每玩家每 Tick 最大字节数 */
+    /** 每玩家每 Tick 最大字节数（软预算，最低保障可绕过） */
     private volatile long maxBytesPerTick = 512 * 1024; // 512KB
-    /** 每玩家每 Tick 最大光照字节数 */
+    /** 每玩家每 Tick 最大光照字节数（软预算，最低保障可绕过） */
     private volatile long maxLightBytesPerTick = 128 * 1024; // 128KB
     /** 最低发送预算（防止速度感知导致缺块） */
     private volatile int minChunksPerTick = 1;
+    /** 单包硬安全上限（字节），任何任务包括最低保障都必须满足，防止巨型数据包 */
+    private volatile long hardMaximumPacketBytes = 2 * 1024 * 1024; // 2MB
     /** 队列容量上限（每玩家） */
     private volatile int queueCapacityPerPlayer = 128;
 
@@ -95,7 +97,8 @@ public final class ChunkSendQuota {
      * <b>竞态修复</b>：原 tryAcquire + recordSent 两步操作存在 check-then-act 竞态，
      * 多个发送线程可能同时通过检查。改为单步原子 reservation：CAS 同时检查配额并扣减。
      * <p>
-     * 由发送路径在构建数据包前调用。成功后无需再调用 recordSent（已在此方法中扣减）。
+     * <b>硬安全上限</b>：{@code hardMaximumPacketBytes} 是任何任务都必须满足的硬上限，
+     * 最低发送保障可绕过软预算（{@code maxBytesPerTick}），但不能绕过硬上限。
      *
      * @param playerId           玩家 ID
      * @param estimatedBytes     预估区块数据字节数
@@ -106,6 +109,11 @@ public final class ChunkSendQuota {
         if (!enabled.get()) {
             return true;
         }
+        // 硬安全上限：任何任务都必须满足，包括最低保障
+        if (estimatedBytes > hardMaximumPacketBytes || estimatedLightBytes > hardMaximumPacketBytes) {
+            totalRejected.incrementAndGet();
+            return false;
+        }
         AtomicLong chunks = tickChunkSent.computeIfAbsent(playerId, k -> new AtomicLong());
         AtomicLong bytes = tickBytesSent.computeIfAbsent(playerId, k -> new AtomicLong());
         AtomicLong lightBytes = tickLightBytesSent.computeIfAbsent(playerId, k -> new AtomicLong());
@@ -114,7 +122,7 @@ public final class ChunkSendQuota {
         while (true) {
             long currentChunks = chunks.get();
 
-            // 最低预算保障：第一个区块总是允许
+            // 最低预算保障：第一个区块总是允许（绕过软预算，但已通过硬上限检查）
             if (currentChunks < minChunksPerTick) {
                 if (chunks.compareAndSet(currentChunks, currentChunks + 1)) {
                     bytes.addAndGet(estimatedBytes);
@@ -210,6 +218,7 @@ public final class ChunkSendQuota {
     public void setMaxBytesPerTick(long max) { this.maxBytesPerTick = max; }
     public void setMaxLightBytesPerTick(long max) { this.maxLightBytesPerTick = max; }
     public void setMinChunksPerTick(int min) { this.minChunksPerTick = min; }
+    public void setHardMaximumPacketBytes(long max) { this.hardMaximumPacketBytes = max; }
     public void setQueueCapacityPerPlayer(int cap) { this.queueCapacityPerPlayer = cap; }
     public int maxChunksPerTick() { return maxChunksPerTick; }
     public long maxBytesPerTick() { return maxBytesPerTick; }

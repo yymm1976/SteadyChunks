@@ -47,6 +47,8 @@ public final class ChunkScheduler {
     private final AtomicInteger inflightCount = new AtomicInteger(0);
     private final AtomicInteger pendingCount = new AtomicInteger(0);
     private final AtomicBoolean enabled = new AtomicBoolean(false);
+    /** P0-4 修复：紧急暂停标志，独立于 permit 额度。暂停时拒绝普通任务，依赖关键任务旁路。 */
+    private volatile boolean admissionPaused = false;
     private volatile double maxVisibleDistance = 128.0;
 
     /** §17.3 内部 tick 计数器，供 Watchdog 扫描间隔判断 */
@@ -88,6 +90,29 @@ public final class ChunkScheduler {
     }
 
     /**
+     * P0-4 修复：设置紧急暂停。暂停时普通任务进入等待队列，依赖关键任务旁路放行。
+     * <p>
+     * 旧实现通过 setMaxPermits(0) 暂停，但 ResourceBucket 钳制为 1，实际仍允许 1 个任务。
+     * 新实现使用独立标志，真正阻止普通任务准入。
+     *
+     * @param paused true 表示暂停普通任务准入
+     */
+    public void setAdmissionPaused(boolean paused) {
+        if (this.admissionPaused != paused) {
+            this.admissionPaused = paused;
+            SteadyChunks.LOGGER.info("SteadyChunks 调度器准入: {}", paused ? "paused" : "resumed");
+            // 恢复时唤醒等待队列
+            if (!paused) {
+                drainPending();
+            }
+        }
+    }
+
+    public boolean isAdmissionPaused() {
+        return admissionPaused;
+    }
+
+    /**
      * 准入控制：Mixin 拦截 GenerationChunkHolder.applyStep 后调用此方法。
      * <p>
      * 流程（审查建议的最小接入路径）：
@@ -116,6 +141,14 @@ public final class ChunkScheduler {
         // PR1：仅门控 NOISE，其他阶段透传
         if (targetStatus != ChunkStatus.NOISE) {
             return originalOperation.get();
+        }
+
+        // P0-4 修复：紧急暂停时普通任务进入等待队列，依赖关键任务旁路放行
+        if (admissionPaused && !isDependencyUnlock) {
+            CompletableFuture<ChunkResult<ChunkAccess>> proxy = new CompletableFuture<>();
+            pendingNoiseTasks.offer(new PendingNoiseTask(originalOperation, proxy, isDependencyUnlock));
+            pendingCount.incrementAndGet();
+            return proxy;
         }
 
         // 尝试获取 permit

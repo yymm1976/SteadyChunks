@@ -124,12 +124,38 @@ public final class StageLimiter {
      * 动态设置阶段 permit 上限（Phase 4 AIMD 调用）。
      * <p>
      * P1-09：调整的是共享桶的上限，同 ResourceType 的所有阶段同时受影响。
+     * <p>
+     * P0-3 修复：此方法仍保留供 PresetApplier 使用，但 Governor 应优先使用
+     * {@link #setResourceLimit} 直接按 ResourceType 设置，避免同资源组的多个
+     * ChunkStatus 连续写入同一桶导致最终值依赖遍历顺序。
      */
     public void setStageLimit(ChunkStatus status, int max) {
         StagePolicy policy = policies.get(status);
         if (policy != null) {
             policy.bucket.setMaxPermits(max);
         }
+    }
+
+    /**
+     * P0-3 修复：直接按 ResourceType 设置共享桶上限。
+     * <p>
+     * Governor 应使用此方法而非 {@link #setStageLimit}，避免同资源组的多个
+     * ChunkStatus（如 BIOMES/NOISE/SURFACE 共享 NOISE_HEAVY）连续写入同一桶
+     * 导致最终值依赖遍历顺序。
+     */
+    public void setResourceLimit(ResourceType resource, int max) {
+        ResourceBucket bucket = buckets.get(resource);
+        if (bucket != null) {
+            bucket.setMaxPermits(max);
+        }
+    }
+
+    /**
+     * P0-3 修复：查询 ChunkStatus 对应的 ResourceType（Governor 聚合用）。
+     */
+    public ResourceType resourceTypeOf(ChunkStatus status) {
+        StagePolicy policy = policies.get(status);
+        return policy != null ? policy.resource : null;
     }
 
     /**

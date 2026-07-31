@@ -97,9 +97,6 @@ configurations {
     }
 }
 
-// P2-19：moddev-gradle 生成的 Minecraft 类 jar（parchment-mapped），供测试源集访问 MC 类
-val minecraftArtifact = layout.buildDirectory.file("moddev/artifacts/neoforge-${neo_version}.jar")
-
 repositories {
     // 国内镜像优先
     maven("https://maven.aliyun.com/repository/public") // Maven Central 镜像
@@ -120,15 +117,16 @@ dependencies {
     testImplementation(platform("org.junit:junit-bom:5.10.2"))
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
-    // P2-19：测试编译期需要 MC 类（ChunkPos 等）。仅声明 testCompileOnly，
-    // 运行期通过 -Xbootclasspath/a 注入，避免污染 Gradle test worker 的 system classpath
-    // （moddev unitTest 扩展在 Gradle 9 下会破坏 worker classpath，故不启用）。
-    testCompileOnly(files(minecraftArtifact))
 
     // P2-19：测试运行期需要 SLF4J（被测类引用 SteadyChunks.LOGGER 触发 SLF4J 类加载）
     // NeoForge 运行时内置 SLF4J，但单元测试不启动 NeoForge，需显式提供
     testRuntimeOnly("org.slf4j:slf4j-api:2.0.7")
     testRuntimeOnly("org.slf4j:slf4j-simple:2.0.7")
+    // 注：MC/NeoForge 类不放入 testCompileOnly/testRuntimeOnly。
+    // 原因：neoforge fat jar 会破坏 Gradle test worker 的 bootstrap classloader，
+    // 导致 ClassNotFoundException: GradleWorkerMain。
+    // 测试代码仅调用不直接引用 MC 类的方法（如 tryReserve(UUID,long,long)），
+    // JVM 懒加载机制保证运行时不需要 MC 类。
 }
 
 tasks.named("createMinecraftArtifacts") {
@@ -161,17 +159,20 @@ tasks.compileJava {
 }
 
 // P2-19：单元测试配置
-// 注意：MC jar 不能放入 testRuntimeClasspath（污染 worker），也不能用 -Xbootclasspath/a
-// （neoforge fat jar 会破坏 bootstrap classloader，导致 GradleWorkerMain ClassNotFoundException）。
-// 因此依赖 MC 类的测试（StructureStartIndexTest/FullCommitQueueTest）运行时会因 NoClassDefFoundError 失败，
-// 暂时排除这两个测试，待 moddev-gradle 完整支持 Gradle 9 的 unitTest 后再启用。
+// 依赖 MC 类的测试（StructureStartIndexTest/FullCommitQueueTest）排除：
+// 这两个测试直接引用 ChunkPos 等 MC 类，普通 JVM 单测运行时无 MC 类会 NoClassDefFoundError。
+// 应迁入 NeoForge GameTest 运行环境（待 CI 闭环建立后处理）。
+sourceSets {
+    test {
+        java {
+            exclude("com/mochi_753/steadychunks/structure/StructureStartIndexTest.java")
+            exclude("com/mochi_753/steadychunks/completion/FullCommitQueueTest.java")
+        }
+    }
+}
+
 tasks.test {
     useJUnitPlatform()
-    dependsOn("createMinecraftArtifacts")
-    filter {
-        excludeTestsMatching("com.mochi_753.steadychunks.structure.StructureStartIndexTest")
-        excludeTestsMatching("com.mochi_753.steadychunks.completion.FullCommitQueueTest")
-    }
     testLogging {
         events("passed", "skipped", "failed")
         showStandardStreams = false
@@ -180,7 +181,6 @@ tasks.test {
 
 tasks.compileTestJava {
     options.encoding = "UTF-8"
-    dependsOn("createMinecraftArtifacts")
 }
 
 idea {

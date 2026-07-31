@@ -2,6 +2,7 @@ package com.mochi_753.steadychunks.completion;
 
 import com.mochi_753.steadychunks.SteadyChunks;
 
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -88,8 +89,8 @@ public final class FullCommitQueue {
      */
     public boolean submit(FullCommitTask task) {
         if (!enabled.get()) {
-            // 未启用时直接执行，不延迟
-            task.commitAction().run();
+            // 未启用时直接执行，不延迟（审查修复：仍完成 completion Future）
+            executeCommit(task);
             return true;
         }
         // 依赖关键任务：入 criticalQueue，由主线程 tick 优先执行（P0-3 线程安全）
@@ -136,11 +137,7 @@ public final class FullCommitQueue {
             }
             long waitMs = task.queueAgeMs();
             maxWaitMs.accumulateAndGet(waitMs, Math::max);
-            try {
-                task.commitAction().run();
-            } catch (Throwable t) {
-                SteadyChunks.LOGGER.warn("FULL 关键整合任务执行失败: {} {}", task.pos(), t.getMessage());
-            }
+            executeCommit(task);
             totalExecuted.incrementAndGet();
             executed++;
         }
@@ -170,18 +167,42 @@ public final class FullCommitQueue {
             long waitMs = task.queueAgeMs();
             maxWaitMs.accumulateAndGet(waitMs, Math::max);
 
-            // 执行
-            try {
-                task.commitAction().run();
-            } catch (Throwable t) {
-                SteadyChunks.LOGGER.warn("FULL 整合任务执行失败: {} {}", task.pos(), t.getMessage());
-            }
+            // 执行（审查修复：完成 completion Future）
+            executeCommit(task);
             totalExecuted.incrementAndGet();
             executed++;
         }
 
         if (deferred > 0 && totalDeferred.get() % 100 == 0) {
             SteadyChunks.LOGGER.debug("FULL 整合积压: deferred={} depth={}", deferred, queueDepth.get());
+        }
+    }
+
+    /**
+     * 执行单个整合任务并完成 completion Future（审查修复）。
+     * <p>
+     * 无论 commitAction 是否抛异常，completion Future 都会被完成：
+     * <ul>
+     *   <li>正常完成 → {@code completion.complete(null)}</li>
+     *   <li>抛异常 → {@code completion.completeExceptionally(ex)}</li>
+     * </ul>
+     * 异常仅记录日志，不向上传播，避免单个任务失败中断整批执行。
+     */
+    private void executeCommit(FullCommitTask task) {
+        Throwable error = null;
+        try {
+            task.commitAction().run();
+        } catch (Throwable t) {
+            error = t;
+            SteadyChunks.LOGGER.warn("FULL 整合任务执行失败: {} {}", task.pos(), t.getMessage());
+        }
+        CompletableFuture<Void> completion = task.completion();
+        if (completion != null) {
+            if (error != null) {
+                completion.completeExceptionally(error);
+            } else {
+                completion.complete(null);
+            }
         }
     }
 

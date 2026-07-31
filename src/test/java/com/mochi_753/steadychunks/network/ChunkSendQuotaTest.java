@@ -91,9 +91,24 @@ class ChunkSendQuotaTest {
         UUID player = UUID.randomUUID();
         quota.setMaxChunksPerTick(0); // 试图禁止
         quota.setMinChunksPerTick(1);
-        // 最低预算保障：第一个总是允许
-        assertTrue(quota.tryReserve(player, 1_000_000_000, 1_000_000_000),
-                "最低预算保障第一个区块发送");
+        // 最低预算保障：第一个总是允许（绕过软预算，但须满足硬上限）
+        // 使用 700KB：超过软预算 512KB，但低于硬上限 2MB
+        assertTrue(quota.tryReserve(player, 700 * 1024, 0),
+                "最低预算保障第一个区块发送（绕过软预算）");
+    }
+
+    /**
+     * 审查修复：最低保障可绕过软预算，但不能绕过硬安全上限。
+     */
+    @Test
+    void minGuaranteeShouldNotBypassHardMaximum() {
+        UUID player = UUID.randomUUID();
+        quota.setMaxChunksPerTick(0);
+        quota.setMinChunksPerTick(1);
+        quota.setHardMaximumPacketBytes(100 * 1024); // 100KB 硬上限
+        // 200KB 超过硬上限，即使最低保障也应拒绝
+        assertFalse(quota.tryReserve(player, 200 * 1024, 0),
+                "硬上限不可被最低保障绕过");
     }
 
     @Test
