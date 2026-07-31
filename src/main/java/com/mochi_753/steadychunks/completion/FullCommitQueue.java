@@ -29,6 +29,9 @@ public final class FullCommitQueue {
 
     /** 延迟整合队列（可推迟的任务） */
     private final PriorityBlockingQueue<FullCommitTask> deferredQueue = new PriorityBlockingQueue<>(64);
+    /** 关键任务队列（依赖关键任务，主线程优先排空，P0-3 线程安全修复） */
+    private final java.util.concurrent.ConcurrentLinkedQueue<FullCommitTask> criticalQueue =
+            new java.util.concurrent.ConcurrentLinkedQueue<>();
     /** 队列容量上限（防内存膨胀） */
     private volatile int queueCapacity = 256;
     /** 每 Tick 最大整合区块数 */
@@ -73,12 +76,15 @@ public final class FullCommitQueue {
     }
 
     /**
-     * 提交整合任务。
+     * 提交整合任务（P0-3 线程安全修复）。
      * <p>
-     * 依赖关键任务直接执行（技术指导 §10.3 关键任务旁路）；
-     * 其余进入延迟队列等待预算。
+     * <b>线程安全修复</b>：依赖关键任务不再在提交线程直接执行，
+     * 而是入 criticalQueue，由主线程 tick() 优先排空。
+     * 这样 FULL commit 始终在主线程执行，符合线程模型。
+     * <p>
+     * 未启用时仍直接执行（无队列开销）。
      *
-     * @return true 表示已接受（执行或入队），false 表示队列满被拒绝
+     * @return true 表示已接受（入队或直接执行），false 表示队列满被拒绝
      */
     public boolean submit(FullCommitTask task) {
         if (!enabled.get()) {
@@ -86,10 +92,9 @@ public final class FullCommitQueue {
             task.commitAction().run();
             return true;
         }
-        // 依赖关键任务：立即执行（不占用普通预算）
+        // 依赖关键任务：入 criticalQueue，由主线程 tick 优先执行（P0-3 线程安全）
         if (task.dependencyCritical()) {
-            task.commitAction().run();
-            totalExecuted.incrementAndGet();
+            criticalQueue.offer(task);
             return true;
         }
         // 容量检查
@@ -105,12 +110,12 @@ public final class FullCommitQueue {
     }
 
     /**
-     * 每 Tick 在主线程调用：按预算执行队列中的整合任务。
+     * 每 Tick 在主线程调用：按预算执行队列中的整合任务（P0-3 线程安全修复）。
      * <p>
      * 执行顺序：
      * <ol>
-     *   <li>先执行依赖关键任务（已直接执行，此处处理延迟队列中标记为 critical 的）</li>
-     *   <li>再按优先级执行普通任务，直到数量或时间预算耗尽</li>
+     *   <li>先排空 criticalQueue（依赖关键任务，有限数量，不占普通预算）</li>
+     *   <li>再按优先级执行 deferredQueue，直到数量或时间预算耗尽</li>
      * </ol>
      *
      * @param deadlineNanos 本 Tick 截止时间（System.nanoTime() + budget）
@@ -122,6 +127,25 @@ public final class FullCommitQueue {
         int executed = 0;
         int deferred = 0;
 
+        // 1. 先排空关键队列（依赖关键任务旁路，不占普通预算，但仍受 maxCommitsPerTick 上限保护）
+        int criticalBudget = Math.min(dependencyCriticalReserve, maxCommitsPerTick);
+        while (executed < criticalBudget) {
+            FullCommitTask task = criticalQueue.poll();
+            if (task == null) {
+                break;
+            }
+            long waitMs = task.queueAgeMs();
+            maxWaitMs.accumulateAndGet(waitMs, Math::max);
+            try {
+                task.commitAction().run();
+            } catch (Throwable t) {
+                SteadyChunks.LOGGER.warn("FULL 关键整合任务执行失败: {} {}", task.pos(), t.getMessage());
+            }
+            totalExecuted.incrementAndGet();
+            executed++;
+        }
+
+        // 2. 执行延迟队列，受 maxCommitsPerTick 总上限和时间预算约束
         while (executed < maxCommitsPerTick) {
             FullCommitTask task = deferredQueue.poll();
             if (task == null) {
@@ -133,11 +157,13 @@ public final class FullCommitQueue {
             long remaining = deadlineNanos - System.nanoTime();
             if (remaining <= 0 && executed >= dependencyCriticalReserve) {
                 // 预算耗尽且已执行保底数量，剩余延迟
+                // 注意：必须 break 而非 continue，否则循环会立即再次取出同一任务重新入队，
+                // 导致 executed 不增长、deadline 仍过期，形成主线程无限循环（P0-3 修复）
                 deferredQueue.offer(task);
                 queueDepth.incrementAndGet();
                 totalDeferred.incrementAndGet();
                 deferred++;
-                continue;
+                break;
             }
 
             // 更新最长等待
@@ -164,6 +190,7 @@ public final class FullCommitQueue {
      */
     public void clear() {
         deferredQueue.clear();
+        criticalQueue.clear();
         queueDepth.set(0);
     }
 

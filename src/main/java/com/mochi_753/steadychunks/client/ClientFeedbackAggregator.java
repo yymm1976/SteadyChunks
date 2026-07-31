@@ -28,6 +28,10 @@ public final class ClientFeedbackAggregator {
     private volatile boolean acceptClientFeedback = true;
     /** 客户端是否有模组（握手后设置） */
     private final ConcurrentHashMap<UUID, Boolean> clientHasMod = new ConcurrentHashMap<>();
+    /** 每玩家上次反馈时间戳（纳秒），用于速率限制（P0-7：每秒最多 1 包） */
+    private final ConcurrentHashMap<UUID, Long> lastFeedbackNanos = new ConcurrentHashMap<>();
+    /** 速率限制间隔：1 秒（1_000_000_000 纳秒） */
+    private static final long FEEDBACK_INTERVAL_NANOS = 1_000_000_000L;
 
     private ClientFeedbackAggregator() {
     }
@@ -40,9 +44,25 @@ public final class ClientFeedbackAggregator {
     }
 
     /**
+     * 速率限制检查：每玩家每秒最多 1 包（P0-7 安全修复）。
+     *
+     * @return true 表示允许本次反馈，false 表示被速率限制拒绝
+     */
+    public boolean tryAcquireFeedbackSlot(UUID playerId) {
+        long now = System.nanoTime();
+        Long last = lastFeedbackNanos.get(playerId);
+        if (last != null && now - last < FEEDBACK_INTERVAL_NANOS) {
+            return false;
+        }
+        lastFeedbackNanos.put(playerId, now);
+        return true;
+    }
+
+    /**
      * 接收客户端反馈。
      * <p>
      * 仅在 {@code acceptClientFeedback} 为 true 且客户端有模组时接受。
+     * 玩家 ID 由服务端从网络 context 取得，不信任客户端（P0-7）。
      */
     public void receive(ClientFeedbackSnapshot snapshot) {
         if (!acceptClientFeedback) {
@@ -84,6 +104,7 @@ public final class ClientFeedbackAggregator {
     public void clearPlayer(UUID playerId) {
         snapshots.remove(playerId);
         clientHasMod.remove(playerId);
+        lastFeedbackNanos.remove(playerId);
     }
 
     public void setAcceptClientFeedback(boolean accept) {

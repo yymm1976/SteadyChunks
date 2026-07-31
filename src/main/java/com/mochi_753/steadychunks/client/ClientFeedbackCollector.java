@@ -20,9 +20,11 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class ClientFeedbackCollector {
     private static ClientFeedbackCollector instance;
 
-    /** 帧时间采样窗口（纳秒） */
-    private final Deque<Long> frameTimeSamples = new ArrayDeque<>();
+    /** 帧时间采样窗口（纳秒，存储 [timestamp, duration] 配对） */
+    private final Deque<long[]> frameTimeSamples = new ArrayDeque<>();
     private static final int MAX_SAMPLES = 600; // 约 30 秒 @ 20fps
+    /** 样本保留窗口（纳秒），10 秒 */
+    private static final long SAMPLE_WINDOW_NANOS = 10_000_000_000L;
     /** 发送间隔（纳秒），2 秒 */
     private static final long SEND_INTERVAL_NANOS = 2_000_000_000L;
     private volatile long lastSendNanos = 0;
@@ -66,8 +68,11 @@ public final class ClientFeedbackCollector {
         if (!enabled.get()) {
             return;
         }
+        long now = System.nanoTime();
         synchronized (frameTimeSamples) {
-            frameTimeSamples.addLast(frameTimeNanos);
+            // P1-14 修复：存储 [timestamp, duration] 配对，原实现仅存 duration
+            // 导致后续按 timestamp 清理时误将所有样本判定为过期（duration 远小于 timestamp）
+            frameTimeSamples.addLast(new long[]{now, frameTimeNanos});
             while (frameTimeSamples.size() > MAX_SAMPLES) {
                 frameTimeSamples.removeFirst();
             }
@@ -110,9 +115,19 @@ public final class ClientFeedbackCollector {
             if (frameTimeSamples.isEmpty()) {
                 return null;
             }
-            long[] sorted = frameTimeSamples.stream().mapToLong(Long::longValue).sorted().toArray();
-            p95 = sorted[(int) (sorted.length * 0.95)] / 1_000_000.0;
-            p99 = sorted[(int) (sorted.length * 0.99)] / 1_000_000.0;
+            // P1-14 修复：清理过期样本（按 timestamp 而非 duration）
+            long cutoff = now - SAMPLE_WINDOW_NANOS;
+            frameTimeSamples.removeIf(s -> s[0] < cutoff);
+            if (frameTimeSamples.isEmpty()) {
+                return null;
+            }
+            // 提取 duration 排序计算分位数
+            long[] sorted = frameTimeSamples.stream().mapToLong(s -> s[1]).sorted().toArray();
+            // P1-11 同类修复：rank = max(0, ceil(n*q)-1)，单样本时返回该样本
+            int p95Idx = Math.min(sorted.length - 1, Math.max(0, (int) Math.ceil(sorted.length * 0.95) - 1));
+            int p99Idx = Math.min(sorted.length - 1, Math.max(0, (int) Math.ceil(sorted.length * 0.99) - 1));
+            p95 = sorted[p95Idx] / 1_000_000.0;
+            p99 = sorted[p99Idx] / 1_000_000.0;
             max = sorted[sorted.length - 1] / 1_000_000.0;
         }
 
@@ -123,12 +138,6 @@ public final class ClientFeedbackCollector {
                 chunkApplyTimeNanos.getAndSet(0) / 1_000_000.0,
                 visibleGaps.get()
         );
-
-        // 清理旧样本（只保留最近 10 秒）
-        synchronized (frameTimeSamples) {
-            long cutoff = now - 10_000_000_000L;
-            frameTimeSamples.removeIf(t -> t < cutoff);
-        }
 
         return snapshot;
     }

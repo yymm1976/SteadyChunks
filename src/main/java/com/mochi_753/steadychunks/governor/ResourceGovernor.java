@@ -160,8 +160,9 @@ public final class ResourceGovernor {
                 CommonConfig.LONG_FRAME_MS.get(),
                 CommonConfig.EMERGENCY_FRAME_MS.get()
         );
-        aimd.setIncreaseCooldownTicks(CommonConfig.INCREASE_COOLDOWN_TICKS.get());
-        aimd.setDecreaseCooldownTicks(CommonConfig.DECREASE_COOLDOWN_TICKS.get());
+        // P1-10：配置单位改为秒，1 秒 = 1 控制周期（20 tick）
+        aimd.setIncreaseCooldownPeriods(CommonConfig.INCREASE_COOLDOWN_SECONDS.get());
+        aimd.setDecreaseCooldownPeriods(CommonConfig.DECREASE_COOLDOWN_SECONDS.get());
     }
 
     // 诊断访问器

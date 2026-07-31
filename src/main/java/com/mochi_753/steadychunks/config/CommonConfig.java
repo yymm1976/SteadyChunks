@@ -57,8 +57,8 @@ public final class CommonConfig {
     public static final ModConfigSpec.DoubleValue HEAP_PRESSURE;
     public static final ModConfigSpec.DoubleValue LONG_FRAME_MS;
     public static final ModConfigSpec.DoubleValue EMERGENCY_FRAME_MS;
-    public static final ModConfigSpec.IntValue INCREASE_COOLDOWN_TICKS;
-    public static final ModConfigSpec.IntValue DECREASE_COOLDOWN_TICKS;
+    public static final ModConfigSpec.IntValue INCREASE_COOLDOWN_SECONDS;
+    public static final ModConfigSpec.IntValue DECREASE_COOLDOWN_SECONDS;
 
     // [completion] FULL 整合与完成批次整形（Phase 5，对应计划 §5.1-5.2）
     public static final ModConfigSpec.BooleanValue COMPLETION_ENABLED;
@@ -154,10 +154,10 @@ public final class CommonConfig {
                 .defineInRange("long_frame_ms", 50.0, 16.0, 500.0);
         EMERGENCY_FRAME_MS = builder.comment("紧急帧阈值（毫秒），超过触发紧急模式")
                 .defineInRange("emergency_frame_ms", 150.0, 50.0, 1000.0);
-        INCREASE_COOLDOWN_TICKS = builder.comment("AIMD 增加 permit 冷却（tick）")
-                .defineInRange("increase_cooldown_ticks", 100, 20, 600);
-        DECREASE_COOLDOWN_TICKS = builder.comment("AIMD 减少 permit 冷却（tick）")
-                .defineInRange("decrease_cooldown_ticks", 20, 1, 200);
+        INCREASE_COOLDOWN_SECONDS = builder.comment("AIMD 增加 permit 冷却（秒，P1-10：原 _ticks 已改名，1 秒 = 1 控制周期）")
+                .defineInRange("increase_cooldown_seconds", 10, 1, 60);
+        DECREASE_COOLDOWN_SECONDS = builder.comment("AIMD 减少 permit 冷却（秒，P1-10：原 _ticks 已改名，1 秒 = 1 控制周期）")
+                .defineInRange("decrease_cooldown_seconds", 1, 1, 30);
         builder.pop();
 
         // [completion] FULL 整合与完成批次整形（Phase 5，对应计划 §5.1-5.2）

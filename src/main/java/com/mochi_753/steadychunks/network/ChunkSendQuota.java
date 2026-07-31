@@ -90,13 +90,19 @@ public final class ChunkSendQuota {
     }
 
     /**
-     * 尝试为玩家获取发送许可（非阻塞）。
+     * 尝试为玩家预留发送许可（P1-13 修复：原子 reservation）。
      * <p>
-     * 由发送路径在构建数据包前调用。
+     * <b>竞态修复</b>：原 tryAcquire + recordSent 两步操作存在 check-then-act 竞态，
+     * 多个发送线程可能同时通过检查。改为单步原子 reservation：CAS 同时检查配额并扣减。
+     * <p>
+     * 由发送路径在构建数据包前调用。成功后无需再调用 recordSent（已在此方法中扣减）。
      *
-     * @return true 表示允许发送，调用方应发送后调用 {@link #recordSent}
+     * @param playerId           玩家 ID
+     * @param estimatedBytes     预估区块数据字节数
+     * @param estimatedLightBytes 预估光照字节数
+     * @return true 表示预留成功（可发送），false 表示配额不足
      */
-    public boolean tryAcquire(UUID playerId, long estimatedBytes, long estimatedLightBytes) {
+    public boolean tryReserve(UUID playerId, long estimatedBytes, long estimatedLightBytes) {
         if (!enabled.get()) {
             return true;
         }
@@ -104,36 +110,63 @@ public final class ChunkSendQuota {
         AtomicLong bytes = tickBytesSent.computeIfAbsent(playerId, k -> new AtomicLong());
         AtomicLong lightBytes = tickLightBytesSent.computeIfAbsent(playerId, k -> new AtomicLong());
 
-        long currentChunks = chunks.get();
-        long currentBytes = bytes.get();
-        long currentLight = currentLight(lightBytes);
+        // 最低预算保障：即使超限也允许最低发送（CAS 保证原子性）
+        while (true) {
+            long currentChunks = chunks.get();
+            long currentBytes = bytes.get();
+            long currentLight = lightBytes.get();
 
-        // 最低预算保障：即使超限也允许最低发送
-        if (currentChunks < minChunksPerTick) {
-            return true;
+            // 最低预算保障：第一个区块总是允许
+            if (currentChunks < minChunksPerTick) {
+                if (chunks.compareAndSet(currentChunks, currentChunks + 1)) {
+                    bytes.addAndGet(estimatedBytes);
+                    lightBytes.addAndGet(estimatedLightBytes);
+                    totalSent.incrementAndGet();
+                    return true;
+                }
+                continue; // CAS 失败重试
+            }
+            // 正常配额检查（原子）
+            if (currentChunks >= maxChunksPerTick) {
+                totalDeferred.incrementAndGet();
+                return false;
+            }
+            if (currentBytes + estimatedBytes > maxBytesPerTick) {
+                totalDeferred.incrementAndGet();
+                return false;
+            }
+            if (currentLight + estimatedLightBytes > maxLightBytesPerTick) {
+                totalDeferred.incrementAndGet();
+                return false;
+            }
+            // CAS 同时扣减 chunk 计数，成功后再扣减 bytes/light
+            if (chunks.compareAndSet(currentChunks, currentChunks + 1)) {
+                bytes.addAndGet(estimatedBytes);
+                lightBytes.addAndGet(estimatedLightBytes);
+                totalSent.incrementAndGet();
+                return true;
+            }
+            // CAS 失败，重试
         }
-        // 正常配额检查
-        if (currentChunks >= maxChunksPerTick) {
-            totalDeferred.incrementAndGet();
-            return false;
-        }
-        if (currentBytes + estimatedBytes > maxBytesPerTick) {
-            totalDeferred.incrementAndGet();
-            return false;
-        }
-        if (currentLight + estimatedLightBytes > maxLightBytesPerTick) {
-            totalDeferred.incrementAndGet();
-            return false;
-        }
-        return true;
-    }
-
-    private long currentLight(AtomicLong lightBytes) {
-        return lightBytes.get();
     }
 
     /**
-     * 记录已发送的区块（发送成功后调用）。
+     * 尝试为玩家获取发送许可（非阻塞）。
+     * <p>
+     * P1-13：保留向后兼容，但内部委托 {@link #tryReserve} 完成原子 reservation。
+     * 成功后<b>不需要</b>再调用 {@link #recordSent}。
+     *
+     * @return true 表示允许发送（已预留配额）
+     */
+    public boolean tryAcquire(UUID playerId, long estimatedBytes, long estimatedLightBytes) {
+        return tryReserve(playerId, estimatedBytes, estimatedLightBytes);
+    }
+
+    /**
+     * 记录已发送的区块。
+     * <p>
+     * P1-13：{@link #tryReserve} 已原子扣减配额，此方法仅用于未走 tryReserve 的旧路径。
+     * 推荐使用 tryReserve 替代 tryAcquire + recordSent 组合。
      */
     public void recordSent(UUID playerId, long bytes, long lightBytes) {
         if (!enabled.get()) {

@@ -30,7 +30,8 @@ public final class SteadyChunksPayloads {
     }
 
     private static void onRegisterPayloads(RegisterPayloadHandlersEvent event) {
-        PayloadRegistrar registrar = new PayloadRegistrar("1");
+        // NeoForge 1.21.1 正确写法：使用 event.registrar() 而非 new PayloadRegistrar()
+        PayloadRegistrar registrar = event.registrar("1");
 
         // S2C：握手请求
         registrar.playToClient(
@@ -85,10 +86,18 @@ public final class SteadyChunksPayloads {
     }
 
     /**
-     * 服务端处理客户端反馈。
+     * 服务端处理客户端反馈（P0-7 安全修复）。
+     * <p>
+     * 玩家 ID 从 context 取得，不信任客户端传入。
+     * 速率限制：每玩家每秒最多 1 包，防止恶意客户端刷包。
      */
     private static void handleClientFeedback(ClientFeedbackPayload payload, IPayloadContext context) {
+        UUID playerId = context.player().getUUID();
         ClientFeedbackAggregator aggregator = ClientFeedbackAggregator.getInstance();
-        aggregator.receive(payload.toSnapshot());
+        // 速率限制：每秒最多 1 包
+        if (!aggregator.tryAcquireFeedbackSlot(playerId)) {
+            return;
+        }
+        aggregator.receive(payload.toSnapshot(playerId));
     }
 }

@@ -6,11 +6,15 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * AIMD（Additive Increase, Multiplicative Decrease）控制器，对应开发计划 §4.3。
+ * AIMD（Additive Increase, Multiplicative Decrease）控制器，对应开发计划 §4.3，P1-10 修复。
+ * <p>
+ * <b>时间单位修复</b>：内部计数单位改为「控制周期」而非 tick。
+ * 控制周期由 ResourceGovernor 定义（默认 20 tick = 1 秒），
+ * 本控制器的 {@link #tick(PressureSnapshot.PressureLevel)} 每个控制周期调用一次。
  * <p>
  * 规则：
  * <pre>
- * 健康窗口持续存在：
+ * 健康窗口持续存在（10 个控制周期）：
  *   缓慢增加一个阶段 permit 或提高小幅预算
  *
  * 出现 CPU、MSPT、帧时间或 GC 超标：
@@ -23,25 +27,25 @@ import java.util.concurrent.ConcurrentHashMap;
  * <ul>
  *   <li>控制周期不短于任务典型完成时间</li>
  *   <li>增加与减少采用不同阈值</li>
- *   <li>使用冷却时间</li>
+ *   <li>使用冷却周期数</li>
  *   <li>对每个阶段设置最小和最大 permit</li>
  * </ul>
  */
 public final class AimdController {
     /** 每个阶段的 AIMD 状态（ChunkStatus 在 1.21.1 非枚举，用 ConcurrentHashMap） */
     private final ConcurrentHashMap<ChunkStatus, StageControl> controls = new ConcurrentHashMap<>();
-    /** 增加冷却（tick） */
-    private volatile int increaseCooldownTicks = 100;
-    /** 减少冷却（tick） */
-    private volatile int decreaseCooldownTicks = 20;
-    /** 距上次增加的 tick 数 */
-    private int ticksSinceIncrease = 0;
-    /** 距上次减少的 tick 数 */
-    private int ticksSinceDecrease = 0;
-    /** 健康窗口连续计数（需持续 N tick 才增加） */
-    private int consecutiveHealthyTicks = 0;
-    /** 触发增加所需连续健康 tick 数 */
-    private static final int HEALTHY_WINDOW_FOR_INCREASE = 200;
+    /** 增加冷却（控制周期数，1 周期 = 1 秒） */
+    private volatile int increaseCooldownPeriods = 10;
+    /** 减少冷却（控制周期数，1 周期 = 1 秒） */
+    private volatile int decreaseCooldownPeriods = 1;
+    /** 距上次增加的控制周期数 */
+    private int periodsSinceIncrease = 0;
+    /** 距上次减少的控制周期数 */
+    private int periodsSinceDecrease = 0;
+    /** 连续健康周期计数（需持续 N 个控制周期才增加） */
+    private int consecutiveHealthyPeriods = 0;
+    /** 触发增加所需连续健康周期数（P1-10：从 200 tick 改为 10 控制周期 = 10 秒） */
+    private static final int HEALTHY_PERIODS_FOR_INCREASE = 10;
 
     /**
      * §9.1 轮流提升顺序：NOISE → STRUCTURE_STARTS → LIGHT → FEATURES。
@@ -75,36 +79,36 @@ public final class AimdController {
     }
 
     /**
-     * 每 tick 调用，根据压力快照调整各阶段 permit。
+     * 每控制周期调用一次（由 ResourceGovernor 每 20 tick 触发），根据压力快照调整各阶段 permit。
      *
      * @param level 当前压力等级
      * @return 各阶段新的 permit 上限
      */
     public Map<ChunkStatus, Integer> tick(PressureSnapshot.PressureLevel level) {
-        ticksSinceIncrease++;
-        ticksSinceDecrease++;
+        periodsSinceIncrease++;
+        periodsSinceDecrease++;
 
         switch (level) {
             case HEALTHY -> {
-                consecutiveHealthyTicks++;
+                consecutiveHealthyPeriods++;
                 // 持续健康窗口后，缓慢增加
-                if (consecutiveHealthyTicks >= HEALTHY_WINDOW_FOR_INCREASE
-                        && ticksSinceIncrease >= increaseCooldownTicks) {
+                if (consecutiveHealthyPeriods >= HEALTHY_PERIODS_FOR_INCREASE
+                        && periodsSinceIncrease >= increaseCooldownPeriods) {
                     additiveIncrease();
-                    consecutiveHealthyTicks = 0;
-                    ticksSinceIncrease = 0;
+                    consecutiveHealthyPeriods = 0;
+                    periodsSinceIncrease = 0;
                 }
             }
             case ELEVATED -> {
                 // 升高：保持不变，重置健康计数
-                consecutiveHealthyTicks = 0;
+                consecutiveHealthyPeriods = 0;
             }
             case CRITICAL -> {
                 // 临界：立即减少
-                consecutiveHealthyTicks = 0;
-                if (ticksSinceDecrease >= decreaseCooldownTicks) {
+                consecutiveHealthyPeriods = 0;
+                if (periodsSinceDecrease >= decreaseCooldownPeriods) {
                     multiplicativeDecrease();
-                    ticksSinceDecrease = 0;
+                    periodsSinceDecrease = 0;
                 }
             }
         }
@@ -181,12 +185,18 @@ public final class AimdController {
         }
     }
 
-    public void setIncreaseCooldownTicks(int ticks) {
-        this.increaseCooldownTicks = ticks;
+    /**
+     * 设置增加冷却（P1-10：单位为控制周期数，1 周期 = 1 秒）。
+     */
+    public void setIncreaseCooldownPeriods(int periods) {
+        this.increaseCooldownPeriods = periods;
     }
 
-    public void setDecreaseCooldownTicks(int ticks) {
-        this.decreaseCooldownTicks = ticks;
+    /**
+     * 设置减少冷却（P1-10：单位为控制周期数，1 周期 = 1 秒）。
+     */
+    public void setDecreaseCooldownPeriods(int periods) {
+        this.decreaseCooldownPeriods = periods;
     }
 
     /** 单个阶段的 AIMD 控制状态 */

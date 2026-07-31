@@ -105,14 +105,16 @@ public final class OwnershipTableRegistry {
         register("Light algorithm", lightOwner, byepregenVersion, byepregenAllowed && states.yalightEnabled());
 
         // SteadyChunks 负责的模块（始终由 SteadyChunks 所有）
-        register("Chunk scheduling", "SteadyChunks", SteadyChunks.VERSION, true);
-        register("Structure profiling", "SteadyChunks", SteadyChunks.VERSION, true);
-        register("FULL commit smoothing", "SteadyChunks", SteadyChunks.VERSION, true);
-        register("Chunk send quota", "SteadyChunks", SteadyChunks.VERSION, true);
-        register("Adaptive resource governor", "SteadyChunks", SteadyChunks.VERSION, true);
-        register("Diagnostics (Flight Recorder)", "SteadyChunks", SteadyChunks.VERSION, true);
-        register("Light task budget", "SteadyChunks", SteadyChunks.VERSION, true);
-        register("I/O backpressure", "SteadyChunks", SteadyChunks.VERSION, true);
+        // P2-18：版本从 ModList 动态读取，避免与 gradle.properties 不一致
+        String scVersion = SteadyChunks.version();
+        register("Chunk scheduling", "SteadyChunks", scVersion, true);
+        register("Structure profiling", "SteadyChunks", scVersion, true);
+        register("FULL commit smoothing", "SteadyChunks", scVersion, true);
+        register("Chunk send quota", "SteadyChunks", scVersion, true);
+        register("Adaptive resource governor", "SteadyChunks", scVersion, true);
+        register("Diagnostics (Flight Recorder)", "SteadyChunks", scVersion, true);
+        register("Light task budget", "SteadyChunks", scVersion, true);
+        register("I/O backpressure", "SteadyChunks", scVersion, true);
 
         built = true;
         logOwnershipTable();

@@ -190,9 +190,12 @@ public final class TemplateMetadataCache implements DatapackGenerationRegistry.I
     }
 
     /**
-     * 模板静态元数据（不可变）。
+     * 模板静态元数据（不可变，P1-16 修复）。
      * <p>
      * 所有坐标均为局部坐标（相对于模板原点），不包含世界坐标转换。
+     * <p>
+     * P1-16 修复：构造时 clone 数组，访问器返回 clone，
+     * 防止外部修改内部状态。提供按索引访问 {@link #connectorAt(int)} 避免数组复制开销。
      */
     public record TemplateMetadata(
             ResourceLocation templateId,
@@ -205,6 +208,48 @@ public final class TemplateMetadataCache implements DatapackGenerationRegistry.I
             int[] staticBlockIndices,
             int[] blockEntityIndices
     ) {
+        // P1-16：构造时防御性 clone 数组
+        public TemplateMetadata {
+            connectors = connectors == null ? new ConnectorInfo[0] : connectors.clone();
+            staticBlockIndices = staticBlockIndices == null ? new int[0] : staticBlockIndices.clone();
+            blockEntityIndices = blockEntityIndices == null ? new int[0] : blockEntityIndices.clone();
+        }
+
+        // P1-16：访问器返回 clone 防止外部修改
+        @Override
+        public ConnectorInfo[] connectors() {
+            return connectors.clone();
+        }
+
+        @Override
+        public int[] staticBlockIndices() {
+            return staticBlockIndices.clone();
+        }
+
+        @Override
+        public int[] blockEntityIndices() {
+            return blockEntityIndices.clone();
+        }
+
+        /** P1-16：按索引访问连接点，避免数组复制开销 */
+        public ConnectorInfo connectorAt(int i) {
+            return connectors[i];
+        }
+
+        /** P1-16：连接点数量 */
+        public int connectorCount() {
+            return connectors.length;
+        }
+
+        /** P1-16：按索引访问静态方块索引 */
+        public int staticBlockIndexAt(int i) {
+            return staticBlockIndices[i];
+        }
+
+        /** P1-16：按索引访问方块实体索引 */
+        public int blockEntityIndexAt(int i) {
+            return blockEntityIndices[i];
+        }
     }
 
     /**

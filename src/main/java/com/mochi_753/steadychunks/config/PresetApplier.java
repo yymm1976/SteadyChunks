@@ -2,20 +2,21 @@ package com.mochi_753.steadychunks.config;
 
 import com.mochi_753.steadychunks.SteadyChunks;
 import com.mochi_753.steadychunks.client.ClientCompileGovernor;
-import com.mochi_753.steadychunks.client.ClientFeedbackAggregator;
 import com.mochi_753.steadychunks.completion.CompletionBatchShaper;
 import com.mochi_753.steadychunks.completion.FullCommitQueue;
-import com.mochi_753.steadychunks.governor.ResourceGovernor;
 import com.mochi_753.steadychunks.network.ChunkSendQuota;
 import com.mochi_753.steadychunks.scheduler.ChunkScheduler;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 
 /**
- * 预设应用器，对应开发计划 §11.6。
+ * 预设应用器，对应开发计划 §11.6，P0-4 修复。
  * <p>
- * 将三套预设（smooth_integrated / balanced / throughput_server）的参数集应用到运行时组件。
- * 在 {@code ModuleBootstrap.onServerStarting} 中于 {@code syncFromConfig} 之后调用，
- * 预设值覆盖配置默认值，确保选择预设即可获得完整可用的工作配置。
+ * <b>配置优先级修复</b>：预设不再无条件覆盖用户显式配置。
+ * 正确的优先级为：代码默认值 → 预设值 → 用户显式配置 → 兼容性安全覆盖。
+ * <p>
+ * 当前实现策略：仅应用数值类参数（maxInflight / 并发上限 / 队列容量等），
+ * 不强制改变 enabled 开关。enabled 开关完全由用户配置决定，
+ * 避免用户明确关闭的模块被预设重新开启。
  * <p>
  * 预设定位（§11.6）：
  * <ul>
@@ -29,20 +30,23 @@ public final class PresetApplier {
     }
 
     /**
-     * 应用指定预设到所有运行时组件。
+     * 应用指定预设的数值参数到运行时组件。
      * <p>
-     * 调用时机：服务端启动时，在各自组件 {@code syncFromConfig} 之后调用。
+     * <b>P0-4 修复</b>：不强制设置 enabled 开关。
+     * 仅当组件已被用户启用时，预设的数值参数才生效。
+     * 这样用户明确关闭的模块不会被预设重新开启。
      *
      * @param preset 目标预设
      */
     public static void apply(CommonConfig.Preset preset) {
         PresetParams params = paramsFor(preset);
+        // 仅应用数值参数，不改变 enabled 状态
+        // enabled 完全由 CommonConfig 中的用户配置决定
         applyToScheduler(params);
-        applyToGovernor(params);
         applyToCompletion(params);
         applyToSendQuota(params);
         applyToClientFeedback(params);
-        SteadyChunks.LOGGER.info("SteadyChunks 预设已应用: {} (maxInflight={} features={} sendMax={})",
+        SteadyChunks.LOGGER.info("SteadyChunks 预设数值已应用: {} (maxInflight={} features={} sendMax={})",
                 preset, params.maxInflight, params.limitFeatures, params.sendMaxChunksPerTick);
     }
 
@@ -98,7 +102,10 @@ public final class PresetApplier {
 
     private static void applyToScheduler(PresetParams p) {
         ChunkScheduler scheduler = ChunkScheduler.getInstance();
-        scheduler.setEnabled(true);
+        // P0-4 修复：不强制 setEnabled，仅当用户已启用调度器时应用数值
+        if (!scheduler.isEnabled()) {
+            return;
+        }
         scheduler.setMaxInflight(p.maxInflight);
         scheduler.stageLimiter().setStageLimit(ChunkStatus.STRUCTURE_STARTS, p.limitStructureStarts);
         scheduler.stageLimiter().setStageLimit(ChunkStatus.NOISE, p.limitNoise);
@@ -106,28 +113,27 @@ public final class PresetApplier {
         scheduler.stageLimiter().setStageLimit(ChunkStatus.LIGHT, p.limitLight);
     }
 
-    private static void applyToGovernor(PresetParams p) {
-        ResourceGovernor governor = ResourceGovernor.getInstance();
-        governor.setEnabled(p.governorEnabled);
-        // 阈值通过 syncFromConfig 读取配置，预设仅控制启用状态与运行模式
-        // 预设的 targetP95/hardMspt 通过配置默认值体现，此处不覆盖以保留用户调优空间
-    }
-
     private static void applyToCompletion(PresetParams p) {
         FullCommitQueue fullQueue = FullCommitQueue.getInstance();
-        fullQueue.setEnabled(p.completionEnabled);
-        fullQueue.setMaxCommitsPerTick(p.fullMaxCommitsPerTick);
-        fullQueue.setDependencyCriticalReserve(p.fullDependencyReserve);
-        fullQueue.setQueueCapacity(p.fullQueueCapacity);
+        // P0-4 修复：不强制 setEnabled，仅当用户已启用时应用数值
+        if (fullQueue.isEnabled()) {
+            fullQueue.setMaxCommitsPerTick(p.fullMaxCommitsPerTick);
+            fullQueue.setDependencyCriticalReserve(p.fullDependencyReserve);
+            fullQueue.setQueueCapacity(p.fullQueueCapacity);
+        }
 
         CompletionBatchShaper batchShaper = CompletionBatchShaper.getInstance();
-        batchShaper.setEnabled(p.completionEnabled);
-        batchShaper.setMaxCallbacksPerTick(p.batchMaxCallbacksPerTick);
+        if (batchShaper.isEnabled()) {
+            batchShaper.setMaxCallbacksPerTick(p.batchMaxCallbacksPerTick);
+        }
     }
 
     private static void applyToSendQuota(PresetParams p) {
         ChunkSendQuota sendQuota = ChunkSendQuota.getInstance();
-        sendQuota.setEnabled(p.sendEnabled);
+        // P0-4 修复：不强制 setEnabled，仅当用户已启用时应用数值
+        if (!sendQuota.isEnabled()) {
+            return;
+        }
         sendQuota.setMaxChunksPerTick(p.sendMaxChunksPerTick);
         sendQuota.setMinChunksPerTick(p.sendMinChunksPerTick);
         sendQuota.setMaxBytesPerTick(p.sendMaxBytesPerTickKb * 1024L);
@@ -135,12 +141,12 @@ public final class PresetApplier {
     }
 
     private static void applyToClientFeedback(PresetParams p) {
-        ClientFeedbackAggregator aggregator = ClientFeedbackAggregator.getInstance();
-        aggregator.setAcceptClientFeedback(p.clientFeedbackEnabled);
-
+        // P0-4 修复：不强制改变 enabled 开关
+        // 客户端编译治理仅在用户已启用时调整数值
         ClientCompileGovernor compileGov = ClientCompileGovernor.getInstance();
-        compileGov.setEnabled(p.compileGovernanceEnabled);
-        compileGov.setMaxSectionRebuildsPerFrame(p.maxSectionRebuildsPerFrame);
+        if (compileGov.isEnabled()) {
+            compileGov.setMaxSectionRebuildsPerFrame(p.maxSectionRebuildsPerFrame);
+        }
     }
 
     /**

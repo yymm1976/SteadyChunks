@@ -94,6 +94,10 @@ public final class ClientCompileGovernor {
         governanceActive.set(on && detectedRenderer == RendererType.VANILLA);
     }
 
+    public boolean isEnabled() {
+        return enabled.get();
+    }
+
     public boolean isGovernanceActive() {
         return governanceActive.get();
     }
