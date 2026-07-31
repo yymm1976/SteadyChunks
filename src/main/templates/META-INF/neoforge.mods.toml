@@ -1,0 +1,37 @@
+modLoader = "javafml"
+loaderVersion = "${loader_version_range}"
+license = "${mod_license}"
+
+[[mods]]
+modId = "${mod_id}"
+version = "${mod_version}"
+displayName = "${mod_name}"
+logoFile = "${mod_id}.png"
+description = '''
+SteadyChunks: 以跑图过程帧时间与 MSPT 稳定性为第一目标的区块生命周期调度与 QoS 模组。
+覆盖区块需求、调度、完成整合、发送与客户端反馈链路；与 FastNoise、Bye-Pregen 兼容并避免重复实现其优势模块。
+目标平台 Minecraft 1.21.1 + NeoForge + Java 21。
+
+注意：本模组与 C2ME 互斥，请勿同装。安装后将自动接管 C2ME 的区块调度与资源治理职责。
+迁移时请参考项目文档完成配置切换。
+'''
+
+[[mixins]]
+config = "${mod_id}.mixins.json"
+
+[[accessTransformers]]
+file = "META-INF/accesstransformer.cfg"
+
+[[dependencies.${ mod_id }]]
+modId = "neoforge"
+type = "required"
+versionRange = "${neo_version_range}"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.${ mod_id }]]
+modId = "minecraft"
+type = "required"
+versionRange = "${minecraft_version_range}"
+ordering = "NONE"
+side = "BOTH"

@@ -1,0 +1,56 @@
+# Gradle
+.gradle/
+build/
+out/
+classes/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.project
+.classpath
+*.swp
+
+# Eclipse
+bin/
+.metadata/
+
+# NetBeans
+/nbproject/private/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+*~
+
+# Forge / NeoForge
+run/
+runs/
+logs/
+crash-reports/
+saves/
+world/
+world_backup/
+
+# SteadyChunks 运行时产物
+steadychunks-reports/
+*.zip
+
+# 临时文件
+*.tmp
+*.bak
+*.log
+
+# JVM
+hs_err_pid*
+replay_pid*
