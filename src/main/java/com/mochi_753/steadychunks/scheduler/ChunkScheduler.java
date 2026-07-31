@@ -11,11 +11,13 @@ import net.minecraft.util.thread.ProcessorHandle;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
 /**
@@ -55,11 +57,41 @@ public final class ChunkScheduler {
     private final AtomicBoolean bypassMode = new AtomicBoolean(false);
     /** P1-3：每 tick 放行的最大 bypass 任务数 */
     private static final int BYPASS_BATCH_PER_TICK = 16;
+    /**
+     * P1 修复（第 4 轮）：bypass 每 tick 放行预算。
+     * 仅由服务器 Tick 补充（{@link #tick()}），Future 完成回调虽能触发 requestDrain，
+     * 但不能补充预算，避免"关闭调度器瞬间单 tick 放行全部积压"的洪峰。
+     */
+    private final AtomicInteger bypassBudget = new AtomicInteger(0);
 
-    /** P1-2：等待队列上限（防内存膨胀；超过时记录告警，由高水位指标监控） */
-    private volatile int maxPendingNoiseTasks = 512;
+    /**
+     * P1 修复（第 4 轮）：等待队列告警阈值。
+     * 超过时仅记录告警（高水位指标监控），<b>不是</b>硬上限——真正背压需前移到原版
+     * 任务被取出之前（见 {@link #pendingCriticalThreshold} 的 fail-open 软保护）。
+     */
+    private volatile int pendingWarningThreshold = 512;
+    /** P1 修复（第 4 轮）：等待队列紧急阈值，超过则临时 fail-open 透传，避免代理 Future 无限积压 */
+    private volatile int pendingCriticalThreshold = 1024;
+    /** P1 修复（第 4 轮）：fail-open 标志。置位期间 controlAdmission 直接透传原版操作。 */
+    private final AtomicBoolean failOpen = new AtomicBoolean(false);
     /** P1-2：等待队列历史峰值（高水位指标） */
     private final AtomicInteger pendingHighWatermark = new AtomicInteger(0);
+
+    /**
+     * P0 修复（第 4 轮）：生命周期接收标志。clearAll 期间置 false（拒绝新入队），
+     * 清理完成后恢复 true。用于修复"clearAll 与并发 enqueuePending"的残留竞态。
+     */
+    private final AtomicBoolean acceptingTasks = new AtomicBoolean(true);
+    /**
+     * P0 修复（第 4 轮）：生命周期代数。每次 clearAll 递增，入队任务记录入队时的代数，
+     * 入队后二次校验代数，捕获"清理期间并发入队"的任务并异常完成。
+     */
+    private final AtomicLong lifecycleGeneration = new AtomicLong(0);
+
+    /** P1 修复（第 4 轮）：Mixin 拦截计数（controlAdmission 接管 NOISE 的次数，真实生成测试断言用） */
+    private final AtomicLong mixinInterceptCount = new AtomicLong(0);
+    /** P1 修复（第 4 轮）：NOISE 在途任务峰值（真实生成测试验证并发上限） */
+    private final AtomicInteger maxActiveNoise = new AtomicInteger(0);
 
     private final ResourcePermit cpuGeneralPermit;
     private final AtomicInteger inflightCount = new AtomicInteger(0);
@@ -93,7 +125,12 @@ public final class ChunkScheduler {
     public void setEnabled(boolean on) {
         enabled.set(on);
         SteadyChunks.LOGGER.info("SteadyChunks 调度器: {}", on ? "enabled" : "disabled");
-        if (!on) {
+        if (on) {
+            // P1 修复（第 4 轮）：重新启用时取消 bypass，避免旧任务继续绕过 permit 洪峰放行。
+            bypassMode.set(false);
+            bypassBudget.set(0);
+            requestDrain();
+        } else {
             bypassMode.set(true);
             requestDrain();
         }
@@ -173,6 +210,27 @@ public final class ChunkScheduler {
             return originalOperation.get();
         }
 
+        // P1 修复（第 4 轮）：Mixin 真实拦截计数（供真实生成 GameTest 断言）。
+        mixinInterceptCount.incrementAndGet();
+
+        // P1 修复（第 4 轮）：队列紧急软保护（fail-open）。
+        // 等待队列超过 critical 阈值时临时透传原版操作，避免代理 Future 与
+        // Holder/Map/Operation 无限积压；回落到 warning 阈值以下后恢复准入。
+        if (failOpen.get()) {
+            if (pendingCount.get() <= pendingWarningThreshold) {
+                failOpen.set(false);
+            } else {
+                SteadyChunks.LOGGER.warn("NOISE 等待队列紧急：临时 fail-open 透传（pending={}）", pendingCount.get());
+                return originalOperation.get();
+            }
+        }
+        if (pendingCount.get() >= pendingCriticalThreshold) {
+            failOpen.set(true);
+            SteadyChunks.LOGGER.warn("NOISE 等待队列超过紧急阈值 {}，进入 fail-open 透传（pending={}）",
+                    pendingCriticalThreshold, pendingCount.get());
+            return originalOperation.get();
+        }
+
         // P0-4 修复：紧急暂停时普通任务进入等待队列，依赖关键任务旁路放行
         if (admissionPaused && !isDependencyUnlock) {
             return enqueuePending(originalOperation, isDependencyUnlock, map, holder);
@@ -196,24 +254,45 @@ public final class ChunkScheduler {
     }
 
     /**
-     * 创建代理 Future 并将任务放入等待队列（P1-2：高水位指标 + 超限告警）。
+     * 创建代理 Future 并将任务放入等待队列（P1-2：高水位指标 + 告警；P0 修复：生命周期屏障）。
+     * <p>
+     * P0 修复（第 4 轮）：clearAll 与并发入队的残留竞态。
+     * 入队前检查 {@link #acceptingTasks}（清理期间拒绝新任务），入队后二次校验
+     * {@link #lifecycleGeneration}（清理已发生则移除任务并异常完成），保证任何
+     * 时序下都不会残留无人处理的代理 Future。
      */
     private CompletableFuture<ChunkResult<ChunkAccess>> enqueuePending(
             Supplier<CompletableFuture<ChunkResult<ChunkAccess>>> originalOperation,
             boolean isDependencyUnlock,
             GeneratingChunkMap map,
             GenerationChunkHolder holder) {
+        // P0 修复（第 4 轮）：生命周期停止接收时拒绝入队（停服/卸载场景，原版同步关闭中，
+        // 返回异常 future 等价于生成失败，不会残留永久等待的代理 Future）。
+        if (!acceptingTasks.get()) {
+            CompletableFuture<ChunkResult<ChunkAccess>> rejected = new CompletableFuture<>();
+            rejected.completeExceptionally(new CancellationException("SteadyChunks 调度器已停止接收任务"));
+            return rejected;
+        }
+        long generation = lifecycleGeneration.get();
         int depth = pendingCount.incrementAndGet();
         // P1-2：更新高水位（历史峰值，供诊断与报警）
         pendingHighWatermark.accumulateAndGet(depth, Math::max);
-        if (depth > maxPendingNoiseTasks) {
-            // 队列超限：不能异常完成（原版会视为生成失败）。
-            // 第一版记录告警，由 pendingHighWatermark 指标持续监控。
-            SteadyChunks.LOGGER.warn("NOISE 等待队列超限: depth={} max={}（请检查 permit 配置或跑图速度）",
-                    depth, maxPendingNoiseTasks);
+        if (depth > pendingWarningThreshold) {
+            // 超过告警阈值：仅记录告警（不是硬上限，见 controlAdmission 的 critical fail-open 软保护）。
+            SteadyChunks.LOGGER.warn("NOISE 等待队列超告警阈值: depth={} warning={}（请检查 permit 配置或跑图速度）",
+                    depth, pendingWarningThreshold);
         }
         CompletableFuture<ChunkResult<ChunkAccess>> proxy = new CompletableFuture<>();
-        pendingNoiseTasks.offer(new PendingNoiseTask(originalOperation, proxy, isDependencyUnlock, map, holder));
+        PendingNoiseTask task = new PendingNoiseTask(originalOperation, proxy, isDependencyUnlock, map, holder);
+        pendingNoiseTasks.offer(task);
+        // P0 修复（第 4 轮）：入队后二次校验生命周期。若清理已在入队与检查之间发生
+        // （generation 变化或停止接收），移除任务并异常完成，避免残留。
+        if (!acceptingTasks.get() || generation != lifecycleGeneration.get()) {
+            if (pendingNoiseTasks.remove(task)) {
+                pendingCount.updateAndGet(v -> Math.max(0, v - 1));
+                proxy.completeExceptionally(new CancellationException("SteadyChunks 调度器生命周期已变化"));
+            }
+        }
         // P0-1：入队后唤醒单一 drainer
         requestDrain();
         return proxy;
@@ -237,7 +316,9 @@ public final class ChunkScheduler {
             PermitLease global,
             PermitLease stage) {
 
-        inflightCount.incrementAndGet();
+        // P1 修复（第 4 轮）：记录 NOISE 在途任务峰值（真实生成测试验证并发上限）。
+        int active = inflightCount.incrementAndGet();
+        maxActiveNoise.accumulateAndGet(active, Math::max);
         CompletableFuture<ChunkResult<ChunkAccess>> future;
         try {
             future = originalOperation.get();
@@ -287,10 +368,16 @@ public final class ChunkScheduler {
         }
         tickCounter++;
         watchdog.tick(tickCounter, this);
+        // P1 修复（第 4 轮）：仅在服务器 Tick 补充 bypass 预算。
+        // Future 完成回调触发 requestDrain 时预算可能为 0，drain 放行量受严格限制。
+        if (bypassMode.get()) {
+            bypassBudget.set(BYPASS_BATCH_PER_TICK);
+        }
         requestDrain();
         // bypass 队列清空后退出 bypass 模式
         if (bypassMode.get() && pendingNoiseTasks.isEmpty() && pendingCount.get() == 0) {
             bypassMode.set(false);
+            bypassBudget.set(0);
         }
     }
 
@@ -336,9 +423,10 @@ public final class ChunkScheduler {
         }
 
         // P1-3：bypass 模式，有节奏放行（不获取 permit）
+        // P1 修复（第 4 轮）：消费 tick 补充的预算（getAndSet(0) 防止重复消费/并发补充超发）
         if (bypassMode.get()) {
-            int batch = 0;
-            while (batch < BYPASS_BATCH_PER_TICK) {
+            int allowed = bypassBudget.getAndSet(0);
+            while (allowed-- > 0) {
                 PendingNoiseTask task = pendingNoiseTasks.poll();
                 if (task == null) {
                     return;
@@ -348,7 +436,6 @@ public final class ChunkScheduler {
                 task.resumeExecutor().execute(() ->
                         executeOriginal(ChunkStatus.NOISE, task.operation(), task.proxy(),
                                 PermitLease.empty(), PermitLease.empty()));
-                batch++;
             }
             return;
         }
@@ -415,14 +502,34 @@ public final class ChunkScheduler {
     public int cpuPermitsMax() { return cpuGeneralPermit.maxPermits(); }
     /** P1-2：等待队列历史峰值（高水位指标，供诊断/报警） */
     public int pendingHighWatermark() { return pendingHighWatermark.get(); }
-    /** P1-2：等待队列上限 */
-    public int maxPendingNoiseTasks() { return maxPendingNoiseTasks; }
-    public void setMaxPendingNoiseTasks(int max) { this.maxPendingNoiseTasks = Math.max(1, max); }
+    /** P1 修复（第 4 轮）：等待队列告警阈值（超过仅告警，非硬上限） */
+    public int pendingWarningThreshold() { return pendingWarningThreshold; }
+    public void setPendingWarningThreshold(int max) { this.pendingWarningThreshold = Math.max(1, max); }
+    /** P1 修复（第 4 轮）：等待队列紧急阈值（超过进入 fail-open 透传） */
+    public int pendingCriticalThreshold() { return pendingCriticalThreshold; }
+    /** P1 修复（第 4 轮）：Mixin 真实拦截计数（真实生成 GameTest 断言） */
+    public long mixinInterceptCount() { return mixinInterceptCount.get(); }
+    /** P1 修复（第 4 轮）：NOISE 在途任务峰值（真实生成 GameTest 断言并发上限） */
+    public int maxActiveNoise() { return maxActiveNoise.get(); }
+    /** P1 修复（第 4 轮）：是否处于 fail-open 透传（诊断） */
+    public boolean isFailOpen() { return failOpen.get(); }
+    /** P1 修复（第 4 轮）：重置测试期诊断计数（GameTest 隔离用） */
+    public void resetDiagnostics() {
+        mixinInterceptCount.set(0);
+        maxActiveNoise.set(0);
+        pendingHighWatermark.set(0);
+    }
     /** P1-3：是否处于有节奏放行模式（调度器已禁用且队列未清空） */
     public boolean isBypassMode() { return bypassMode.get(); }
 
     /**
      * §9.4 服务器关闭或维度卸载时调用：异常完成所有等待任务并清空队列。
+     * <p>
+     * P0 修复（第 4 轮）：clearAll 与并发入队的生命周期竞态。
+     * 先停止接收（{@link #acceptingTasks}）并递增代数（{@link #lifecycleGeneration}），
+     * 再清空队列。清理期间并发入队的任务会被 enqueuePending 的二次校验捕获并异常完成，
+     * 任何时序下都不会残留无人处理的代理 Future。清理完成后恢复接收（运行期重新加载/
+     * GameTest 重置场景）。
      * <p>
      * 审查 P1 修复：
      * <ul>
@@ -435,11 +542,16 @@ public final class ChunkScheduler {
      * @param cause 清理原因（如服务器停止、维度卸载）
      */
     public void clearAll(Throwable cause) {
+        // P0 修复（第 4 轮）：生命周期屏障，先停止接收再清空。
+        acceptingTasks.set(false);
+        lifecycleGeneration.incrementAndGet();
         PendingNoiseTask task;
         while ((task = pendingNoiseTasks.poll()) != null) {
-            pendingCount.decrementAndGet();
+            pendingCount.updateAndGet(v -> Math.max(0, v - 1));
             task.proxy().completeExceptionally(cause);
         }
+        // 清理完成后恢复接收（运行期重载 / GameTest 重置）。
+        acceptingTasks.set(true);
         watchdog.clear();
         SteadyChunks.LOGGER.info("SteadyChunks 调度器已清空所有队列（等待任务异常完成: {}）", cause.getClass().getSimpleName());
     }
