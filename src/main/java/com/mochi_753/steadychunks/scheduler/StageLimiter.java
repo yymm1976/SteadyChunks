@@ -76,6 +76,10 @@ public final class StageLimiter {
      * <p>
      * P1-09 修复：同 ResourceType 的多个阶段共享桶，可用 permit 是共享值。
      * 普通任务检查时使用所有阶段中最小的保留额度作为门槛，避免任一阶段的保留额度被普通任务占用。
+     * <p>
+     * 审查新发现 #4 修复：原实现"先检查 reserve 再 tryAcquire"是两步操作，存在 check-then-act 竞态，
+     * 两个普通任务可同时通过检查后各自 CAS 获取，挤占依赖解锁保留额度。
+     * 改为调用 {@link ResourceBucket#tryAcquireWithReserve} 单 CAS 同时判断 limit 与 reserve。
      *
      * @param status 目标阶段
      * @param isDependencyUnlock 是否为依赖解锁任务（可使用保留 permit）
@@ -87,11 +91,12 @@ public final class StageLimiter {
             return false;
         }
         ResourceBucket bucket = policy.bucket;
-        // 普通任务在可用数 <= 该阶段保留额度时拒绝，保留给依赖解锁
-        if (!isDependencyUnlock && bucket.availablePermits() <= policy.dependencyReserve) {
-            return false;
+        if (isDependencyUnlock) {
+            // 依赖解锁任务可使用保留 permit
+            return bucket.tryAcquire();
         }
-        return bucket.tryAcquire();
+        // 普通任务：单 CAS 同时校验 reserve，消除 check-then-act 竞态
+        return bucket.tryAcquireWithReserve(policy.dependencyReserve);
     }
 
     /**

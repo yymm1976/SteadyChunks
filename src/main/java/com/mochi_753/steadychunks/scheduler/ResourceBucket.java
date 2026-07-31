@@ -50,7 +50,34 @@ public final class ResourceBucket {
     }
 
     /**
-     * CAS 释放一个 permit，检测双重释放。
+     * CAS 获取一个 permit，单 CAS 同时校验保留额度（审查新发现 #4 修复）。
+     * <p>
+     * 普通任务在 {@code available <= reserve} 时拒绝，将保留额度留给依赖解锁任务。
+     * 相比"先检查 reserve 再 tryAcquire"两步操作，单 CAS 消除 check-then-act 竞态，
+     * 避免两个普通任务同时通过检查后各自 CAS 获取，挤占依赖解锁保留额度。
+     *
+     * @param reserve 依赖解锁保留额度（普通任务不能占用）
+     * @return true 表示获取成功
+     */
+    public boolean tryAcquireWithReserve(int reserve) {
+        while (true) {
+            int cur = available.get();
+            if (cur <= reserve) {
+                return false;
+            }
+            if (available.compareAndSet(cur, cur - 1)) {
+                acquired.incrementAndGet();
+                return true;
+            }
+        }
+    }
+
+    /**
+     * CAS 释放一个 permit，检测双重释放（审查新发现 #1 修复）。
+     * <p>
+     * 释放时钳制 {@code available} 不超过 {@code max}，防止缩容后 permit 永久超额。
+     * 场景：max=4 已 acquire 3，缩容到 2（available 钳到 0），
+     * 3 个任务逐步释放后 available 只能增长到 2（新 max），而非旧 max 4。
      *
      * @return true 表示释放成功，false 表示检测到双重释放（已无已获取 permit）
      */
@@ -62,7 +89,18 @@ public final class ResourceBucket {
                 return false;
             }
             if (acquired.compareAndSet(cur, cur - 1)) {
-                available.incrementAndGet();
+                // 钳制 available 不超过 max，避免缩容后超额
+                while (true) {
+                    int curAvail = available.get();
+                    int curMax = max.get();
+                    if (curAvail >= curMax) {
+                        // 已达上限，不再增加（缩容场景）
+                        break;
+                    }
+                    if (available.compareAndSet(curAvail, curAvail + 1)) {
+                        break;
+                    }
+                }
                 return true;
             }
         }
@@ -85,6 +123,9 @@ public final class ResourceBucket {
      * <p>
      * 直接调整 AtomicInteger，无需替换 Semaphore。
      * 已被任务持有的 permit 不受影响，可用数按 delta 调整。
+     * <p>
+     * 缩容配合 {@link #release} 的 max 钳制：缩容时 available 立即减少，
+     * 后续释放的 permit 也受新 max 限制，不会累积超过新上限。
      */
     public void setMaxPermits(int newMax) {
         if (newMax < 1) {

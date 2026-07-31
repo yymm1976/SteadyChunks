@@ -113,8 +113,6 @@ public final class ChunkSendQuota {
         // 最低预算保障：即使超限也允许最低发送（CAS 保证原子性）
         while (true) {
             long currentChunks = chunks.get();
-            long currentBytes = bytes.get();
-            long currentLight = lightBytes.get();
 
             // 最低预算保障：第一个区块总是允许
             if (currentChunks < minChunksPerTick) {
@@ -126,23 +124,25 @@ public final class ChunkSendQuota {
                 }
                 continue; // CAS 失败重试
             }
-            // 正常配额检查（原子）
+            // 正常配额检查
             if (currentChunks >= maxChunksPerTick) {
                 totalDeferred.incrementAndGet();
                 return false;
             }
-            if (currentBytes + estimatedBytes > maxBytesPerTick) {
-                totalDeferred.incrementAndGet();
-                return false;
-            }
-            if (currentLight + estimatedLightBytes > maxLightBytesPerTick) {
-                totalDeferred.incrementAndGet();
-                return false;
-            }
-            // CAS 同时扣减 chunk 计数，成功后再扣减 bytes/light
+            // CAS 同时扣减 chunk 计数（审查新发现 #3 修复）
+            // 字节限制用二次检查 + 回滚：CAS 成功后 addAndGet，再校验是否超限，
+            // 超限则回滚 chunks/bytes/lightBytes。并发下可能少量假阴性（保守拒绝），但不会超发。
             if (chunks.compareAndSet(currentChunks, currentChunks + 1)) {
-                bytes.addAndGet(estimatedBytes);
-                lightBytes.addAndGet(estimatedLightBytes);
+                long newBytes = bytes.addAndGet(estimatedBytes);
+                long newLight = lightBytes.addAndGet(estimatedLightBytes);
+                if (newBytes > maxBytesPerTick || newLight > maxLightBytesPerTick) {
+                    // 回滚
+                    chunks.decrementAndGet();
+                    bytes.addAndGet(-estimatedBytes);
+                    lightBytes.addAndGet(-estimatedLightBytes);
+                    totalDeferred.incrementAndGet();
+                    return false;
+                }
                 totalSent.incrementAndGet();
                 return true;
             }

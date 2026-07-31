@@ -131,6 +131,54 @@ class ChunkSendQuotaTest {
         assertEquals(20, success.get(), "并发 reservation 不应超过 maxChunksPerTick");
     }
 
+    /**
+     * 审查新发现 #3 修复验证：并发下字节限制不应被突破。
+     * <p>
+     * 旧实现字节检查用快照，两线程可同时通过检查后各自 addAndGet，导致字节总量超限。
+     * 修复后用二次检查 + 回滚：CAS 成功后 addAndGet，再校验是否超限，超限则回滚。
+     */
+    @Test
+    void concurrentReservationShouldNotExceedByteLimit() throws InterruptedException {
+        UUID player = UUID.randomUUID();
+        // maxChunks 放大避免 chunk 限制干扰，重点测字节限制
+        quota.setMaxChunksPerTick(100);
+        quota.setMaxBytesPerTick(10_000); // 10KB 总预算
+        quota.setMaxLightBytesPerTick(Long.MAX_VALUE / 2);
+        quota.setMinChunksPerTick(0);
+
+        final int threads = 50;
+        final long bytesPerChunk = 500; // 每个线程申请 500 字节
+        // 理论上限：10_000 / 500 = 20 个成功
+        final int expectedMax = 20;
+
+        final CountDownLatch start = new CountDownLatch(1);
+        final CountDownLatch done = new CountDownLatch(threads);
+        final AtomicInteger success = new AtomicInteger(0);
+
+        for (int i = 0; i < threads; i++) {
+            Thread t = new Thread(() -> {
+                try {
+                    start.await();
+                    if (quota.tryReserve(player, bytesPerChunk, 0)) {
+                        success.incrementAndGet();
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    done.countDown();
+                }
+            });
+            t.start();
+        }
+
+        start.countDown();
+        done.await();
+
+        assertTrue(success.get() <= expectedMax,
+                "并发下成功数不应超过字节预算允许的上限 " + expectedMax + "，实际 " + success.get());
+        assertTrue(success.get() > 0, "至少应有部分成功");
+    }
+
     @Test
     void clearPlayerShouldRemoveState() {
         UUID player = UUID.randomUUID();

@@ -1,7 +1,6 @@
 package com.mochi_753.steadychunks.structure;
 
 import net.minecraft.resources.ResourceKey;
-import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 
 import java.util.ArrayList;
@@ -40,11 +39,26 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class StructureStartIndex implements DatapackGenerationRegistry.InvalidationListener {
     private static final StructureStartIndex INSTANCE = new StructureStartIndex();
 
-    /** 按 (dimensionId, Region) 索引的结构起点列表（P1-15：键加 dimensionId） */
-    private final ConcurrentHashMap<Long, List<IndexedStart>> startsByRegion = new ConcurrentHashMap<>();
+    /**
+     * Region 复合键（审查新发现 #2 修复）。
+     * <p>
+     * 原实现用 {@code composeKey(dimensionId, ChunkPos.asLong(rx, rz))}，
+     * 但 {@code subKey & 0xFFFFFFFFL} 掩码会丢弃 regionX（高 32 位），
+     * 导致同一维度内相同 regionZ 的所有 Region 共享同一个桶，索引退化约 32 倍候选量。
+     * 改用 record 三元组避免位运算冲突。
+     */
+    private record RegionKey(int dimensionId, int regionX, int regionZ) {
+    }
+
+    /** 结构复合键：(dimensionId, structureRawId) */
+    private record StructureKey(int dimensionId, int structureRawId) {
+    }
+
+    /** 按 (dimensionId, regionX, regionZ) 索引的结构起点列表（P1-15：键加 dimensionId） */
+    private final ConcurrentHashMap<RegionKey, List<IndexedStart>> startsByRegion = new ConcurrentHashMap<>();
 
     /** 按 (dimensionId, structureRawId) 索引的起点，用于精确移除（P1-15：键加 dimensionId） */
-    private final ConcurrentHashMap<Long, List<IndexedStart>> startsByStructureId = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<StructureKey, List<IndexedStart>> startsByStructureId = new ConcurrentHashMap<>();
 
     private StructureStartIndex() {
         // §17.2 注册到统一缓存失效注册中心
@@ -53,17 +67,6 @@ public final class StructureStartIndex implements DatapackGenerationRegistry.Inv
 
     public static StructureStartIndex getInstance() {
         return INSTANCE;
-    }
-
-    /**
-     * 组合 dimensionId 和 regionKey/structureRawId 为复合键。
-     */
-    private static long composeKey(int dimensionId, long subKey) {
-        return ((long) dimensionId << 32) | (subKey & 0xFFFFFFFFL);
-    }
-
-    private static long composeKey(int dimensionId, int structureRawId) {
-        return ((long) dimensionId << 32) | (structureRawId & 0xFFFFFFFFL);
     }
 
     /**
@@ -85,7 +88,7 @@ public final class StructureStartIndex implements DatapackGenerationRegistry.Inv
                 minChunkX, minChunkZ, maxChunkX, maxChunkZ);
 
         // 按 (dimensionId, structureId) 索引
-        long idKey = composeKey(dimensionId, structureRawId);
+        StructureKey idKey = new StructureKey(dimensionId, structureRawId);
         startsByStructureId.computeIfAbsent(idKey, k -> Collections.synchronizedList(new ArrayList<>()))
                 .add(start);
 
@@ -96,8 +99,7 @@ public final class StructureStartIndex implements DatapackGenerationRegistry.Inv
         int maxRegionZ = maxChunkZ >> 5;
         for (int rx = minRegionX; rx <= maxRegionX; rx++) {
             for (int rz = minRegionZ; rz <= maxRegionZ; rz++) {
-                long regionSubKey = ChunkPos.asLong(rx, rz);
-                long regionKey = composeKey(dimensionId, regionSubKey);
+                RegionKey regionKey = new RegionKey(dimensionId, rx, rz);
                 startsByRegion.computeIfAbsent(regionKey, k -> Collections.synchronizedList(new ArrayList<>()))
                         .add(start);
             }
@@ -117,8 +119,7 @@ public final class StructureStartIndex implements DatapackGenerationRegistry.Inv
     public List<IndexedStart> queryCandidates(int dimensionId, int chunkX, int chunkZ) {
         int regionX = chunkX >> 5;
         int regionZ = chunkZ >> 5;
-        long regionSubKey = ChunkPos.asLong(regionX, regionZ);
-        long regionKey = composeKey(dimensionId, regionSubKey);
+        RegionKey regionKey = new RegionKey(dimensionId, regionX, regionZ);
         List<IndexedStart> regionStarts = startsByRegion.get(regionKey);
         if (regionStarts == null || regionStarts.isEmpty()) {
             return List.of();
@@ -143,7 +144,7 @@ public final class StructureStartIndex implements DatapackGenerationRegistry.Inv
      * @param structureRawId 结构 rawId
      */
     public void removeStructure(int dimensionId, int structureRawId) {
-        long idKey = composeKey(dimensionId, structureRawId);
+        StructureKey idKey = new StructureKey(dimensionId, structureRawId);
         List<IndexedStart> starts = startsByStructureId.remove(idKey);
         if (starts == null) {
             return;
@@ -161,8 +162,7 @@ public final class StructureStartIndex implements DatapackGenerationRegistry.Inv
             int maxRegionZ = s.maxChunkZ() >> 5;
             for (int rx = minRegionX; rx <= maxRegionX; rx++) {
                 for (int rz = minRegionZ; rz <= maxRegionZ; rz++) {
-                    long regionSubKey = ChunkPos.asLong(rx, rz);
-                    long regionKey = composeKey(dimensionId, regionSubKey);
+                    RegionKey regionKey = new RegionKey(dimensionId, rx, rz);
                     List<IndexedStart> regionStarts = startsByRegion.get(regionKey);
                     if (regionStarts != null) {
                         synchronized (regionStarts) {
@@ -181,9 +181,8 @@ public final class StructureStartIndex implements DatapackGenerationRegistry.Inv
      */
     public void clearDimension(int dimensionId) {
         // 移除该维度的所有 Region 索引
-        long dimMask = (long) dimensionId << 32;
-        startsByRegion.keySet().removeIf(k -> (k & 0xFFFFFFFF00000000L) == dimMask);
-        startsByStructureId.keySet().removeIf(k -> (k & 0xFFFFFFFF00000000L) == dimMask);
+        startsByRegion.keySet().removeIf(k -> k.dimensionId() == dimensionId);
+        startsByStructureId.keySet().removeIf(k -> k.dimensionId() == dimensionId);
     }
 
     /**

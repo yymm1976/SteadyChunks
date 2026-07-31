@@ -124,4 +124,31 @@ class StructureStartIndexTest {
         // 同一结构重复注册应累积（不自动去重，由调用方保证唯一性）
         assertEquals(2, idx.totalStarts(), "重复注册应累积计数");
     }
+
+    /**
+     * 审查新发现 #2 修复验证：同 regionZ 不同 regionX 的 Region 不应碰撞。
+     * <p>
+     * 旧实现 composeKey 用 {@code subKey & 0xFFFFFFFFL} 掩码丢弃 regionX（高 32 位），
+     * 导致同维度内相同 regionZ 的所有 Region 共享同一个桶，索引退化约 32 倍候选量。
+     */
+    @Test
+    void differentRegionXWithSameRegionZShouldNotCollide() {
+        StructureStartIndex idx = StructureStartIndex.getInstance();
+        // Region (0,0)：chunk (1,1)，结构 900
+        long start1 = ChunkPos.asLong(1, 1);
+        idx.register(0, 900, start1, 1, 1, 1, 1);
+        // Region (1,0)：chunk (33,1)，结构 901（同 regionZ=0，不同 regionX）
+        long start2 = ChunkPos.asLong(33, 1);
+        idx.register(0, 901, start2, 33, 1, 33, 1);
+
+        // 查询 chunk (1,1) 应只返回结构 900，不应返回 901
+        List<IndexedStart> candidates1 = idx.queryCandidates(0, 1, 1);
+        assertEquals(1, candidates1.size(), "Region (0,0) 查询应只返回 1 个候选");
+        assertEquals(900, candidates1.get(0).structureRawId(), "应返回结构 900");
+
+        // 查询 chunk (33,1) 应只返回结构 901
+        List<IndexedStart> candidates2 = idx.queryCandidates(0, 33, 1);
+        assertEquals(1, candidates2.size(), "Region (1,0) 查询应只返回 1 个候选");
+        assertEquals(901, candidates2.get(0).structureRawId(), "应返回结构 901");
+    }
 }

@@ -35,13 +35,71 @@ class ResourceBucketTest {
         // available 应为 0（不能为负）
         assertEquals(0, bucket.availablePermits(), "缩容后可用 permit 不能为负");
 
-        // 释放一个后，由于已超过 max，available 仍应为 0
+        // 释放一个后：acquired=2，available 增加到 1（未达 max=2）
         assertTrue(bucket.release());
         assertEquals(2, bucket.acquiredCount());
-        // acquired 仍 >= max，因此 available 仍为 0
-        // 注：当前实现 release 仅增加 available，不校验 max，所以 available 会变成 1
-        // 这是设计选择：缩容期间允许临时超额，等任务自然释放归零
         assertEquals(1, bucket.availablePermits(), "释放后 available 增加 1");
+    }
+
+    /**
+     * 审查新发现 #1 修复验证：缩容后逐步释放，available 不应超过新 max。
+     * <p>
+     * 旧实现 release 无条件 incrementAndGet，全部释放后 available 会累积到旧 max，
+     * 导致后续 tryAcquire 可获取超过新 max 的 permit。
+     */
+    @Test
+    void releaseAfterShrinkShouldNotExceedNewMax() {
+        ResourceBucket bucket = new ResourceBucket(ResourceType.NOISE_HEAVY, 4);
+        // 获取 3 个，缩容到 2
+        assertTrue(bucket.tryAcquire());
+        assertTrue(bucket.tryAcquire());
+        assertTrue(bucket.tryAcquire());
+        bucket.setMaxPermits(2);
+        assertEquals(0, bucket.availablePermits());
+
+        // 全部释放
+        assertTrue(bucket.release());
+        assertTrue(bucket.release());
+        assertTrue(bucket.release());
+        assertEquals(0, bucket.acquiredCount());
+
+        // 关键断言：available 不应超过新 max=2
+        assertEquals(2, bucket.availablePermits(), "全部释放后 available 不应超过新 max");
+        assertEquals(2, bucket.maxPermits());
+
+        // 后续 tryAcquire 只能获取 2 个（新 max），而非 4 个（旧 max）
+        assertTrue(bucket.tryAcquire());
+        assertTrue(bucket.tryAcquire());
+        assertFalse(bucket.tryAcquire(), "不应能获取超过新 max 的 permit");
+    }
+
+    /**
+     * 审查新发现 #4 修复验证：tryAcquireWithReserve 单 CAS 校验保留额度。
+     */
+    @Test
+    void tryAcquireWithReserveShouldProtectReservedPermits() {
+        ResourceBucket bucket = new ResourceBucket(ResourceType.STRUCTURE_PLANNING, 3);
+        // reserve=1：普通任务在 available <= 1 时拒绝
+        // available=3 > 1，普通任务可获取
+        assertTrue(bucket.tryAcquireWithReserve(1));
+        assertEquals(2, bucket.availablePermits());
+
+        // available=2 > 1，普通任务可获取
+        assertTrue(bucket.tryAcquireWithReserve(1));
+        assertEquals(1, bucket.availablePermits());
+
+        // available=1 <= 1，普通任务应被拒绝（保留给依赖解锁）
+        assertFalse(bucket.tryAcquireWithReserve(1), "普通任务不应占用保留额度");
+
+        // 但无 reserve 的 tryAcquire 仍可获取最后一个
+        assertTrue(bucket.tryAcquire());
+        assertEquals(0, bucket.availablePermits());
+
+        // reserve=0 退化为普通 tryAcquire
+        ResourceBucket bucket2 = new ResourceBucket(ResourceType.LIGHT, 2);
+        assertTrue(bucket2.tryAcquireWithReserve(0));
+        assertTrue(bucket2.tryAcquireWithReserve(0));
+        assertFalse(bucket2.tryAcquireWithReserve(0));
     }
 
     @Test
