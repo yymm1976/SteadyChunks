@@ -35,10 +35,10 @@ class ResourceBucketTest {
         // available 应为 0（不能为负）
         assertEquals(0, bucket.availablePermits(), "缩容后可用 permit 不能为负");
 
-        // 释放一个后：acquired=2，available 增加到 1（未达 max=2）
+        // 释放一个后：inUse=2，available=max(0, 2-2)=0（恰好达到 limit）
         assertTrue(bucket.release());
         assertEquals(2, bucket.acquiredCount());
-        assertEquals(1, bucket.availablePermits(), "释放后 available 增加 1");
+        assertEquals(0, bucket.availablePermits(), "释放后 inUse==limit，available 仍为 0");
     }
 
     /**

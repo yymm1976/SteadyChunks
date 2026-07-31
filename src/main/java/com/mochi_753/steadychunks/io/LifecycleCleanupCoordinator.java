@@ -124,11 +124,8 @@ public final class LifecycleCleanupCoordinator {
     public void onChunkUnload(ResourceKey<Level> dimension, long packedChunkPos) {
         totalChunksUnloaded.incrementAndGet();
 
-        // 清理选址缓存（按维度批量清理在 onDimensionUnload 中处理）
-        // 单区块清理由各缓存自行实现（如需要可扩展）
-
-        // 清理调度器中的任务
-        ChunkScheduler.getInstance().onChunkUnload(packedChunkPos);
+        // 审查修复：ChunkScheduler 不再管理区块级任务（删除了 ChunkTaskGraph）
+        // permit 在 Future 完成时自动释放，无需区块级清理
 
         SteadyChunks.LOGGER.debug("SteadyChunks 清理区块: dim={} pos={}", dimension.location(), packedChunkPos);
     }
@@ -151,8 +148,8 @@ public final class LifecycleCleanupCoordinator {
         totalDimensionsUnloaded.incrementAndGet();
         int remainingTasks = dimensionTaskCounts.getOrDefault(dimension, new AtomicInteger(0)).get();
 
-        // 取消该维度的等待任务（同时注册到 Watchdog 用于孤儿任务检测）
-        ChunkScheduler.getInstance().onDimensionUnload(dimension);
+        // 审查修复：ChunkScheduler 不再有 onDimensionUnload（删除了 ChunkTaskGraph）
+        // 维度卸载时等待队列中的任务会随 permit 释放自然完成
 
         // §17.2 统一通知注册缓存失效（PlacementCandidateCache / TemplateMetadataCache / StructureStartIndex）
         DatapackGenerationRegistry.getInstance().fireDimensionUnload(dimension);

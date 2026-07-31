@@ -3,19 +3,27 @@ package com.mochi_753.steadychunks.bootstrap;
 import org.jetbrains.annotations.Nullable;
 
 /**
- * Mixin 应用决策中心，对应开发计划 P0-5 修复。
+ * Mixin 应用决策中心，对应开发计划 P0-5 修复 + 审查两层门控修复。
  * <p>
- * 决策分两类：
+ * 审查修复：拆分为加载阶段和运行阶段两层门控。
  * <ul>
- *   <li><b>早期静态决策</b>：MixinPlugin 在类转换阶段调用 {@link #shouldApplyMixin}，
- *       此时模组构造函数可能尚未执行，{@link #states} 为 null。
- *       此时必须安全默认：<b>拒绝</b>有冲突风险的 Mixin，<b>接受</b>无冲突的诊断类 Mixin。</li>
- *   <li><b>晚期运行决策</b>：模组构造完成后 {@link #states} 已填充，
- *       可按模块前缀精确判断让路。</li>
+ *   <li><b>加载阶段</b>（MixinPlugin 类转换时）：
+ *       <ul>
+ *         <li>遥测/诊断 Mixin：总是安全（只观测不修改）</li>
+ *         <li>调度类 Mixin（.server. 包）：总是应用，行为由运行时门控控制。
+ *             即使 Mixin 被应用，调度器未启用时也会透传原版路径。</li>
+ *         <li>冲突类 Mixin（.noise. / .io.）：仅当 states 已填充且确认冲突时才拒绝。
+ *             states == null 时保守拒绝（可能冲突）。</li>
+ *       </ul>
+ *   </li>
+ *   <li><b>运行阶段</b>（Mixin 已应用，代码执行时）：
+ *       调度 Mixin 内部通过 {@code ChunkScheduler.getInstance().isEnabled()} 判断是否启用。
+ *       未启用时直接 return 走原版路径，不修改任何行为。</li>
  * </ul>
  * <p>
- * 核心安全原则：Mixin 在类加载和转换阶段工作，不能依赖之后才执行的普通模组构造阶段。
- * null 时默认拒绝有风险的 Mixin，避免在探测完成前注入冲突代码。
+ * 核心原则：调度 Mixin 的"是否应用"与"是否生效"分离。
+ * Mixin 总是被应用（加载阶段允许），但行为由运行时门控控制。
+ * 这样避免了 states 未初始化时调度 Mixin 被永久拒绝的问题。
  */
 public final class MixinGate {
     @Nullable
@@ -37,33 +45,49 @@ public final class MixinGate {
      * <p>
      * 决策逻辑：
      * <ol>
-     *   <li>若 {@link #states} 为 null（早期静态阶段，bootstrap 未完成）：
-     *       仅允许诊断类 Mixin（telemetry / diagnostics 包），拒绝其他可能有冲突的 Mixin。</li>
-     *   <li>若 {@link #states} 已填充（晚期运行阶段）：
-     *       按类名前缀匹配模块，查 ModuleStates 决定让路。</li>
+     *   <li>遥测/诊断 Mixin：总是允许（只观测不修改）</li>
+     *   <li>调度类 Mixin（.server. 包）：总是允许（行为由运行时门控控制）</li>
+     *   <li>冲突类 Mixin（.noise. / .io.）：
+     *       <ul>
+     *         <li>states 已填充：按冲突检测结果决定让路</li>
+     *         <li>states == null：保守拒绝（可能冲突）</li>
+     *       </ul>
+     *   </li>
+     *   <li>其他 Mixin：默认允许</li>
      * </ol>
      *
      * @param mixinClassName Mixin 类的全限定名
      * @return true 表示应用，false 表示跳过
      */
     public static boolean shouldApplyMixin(String mixinClassName) {
-        if (states == null) {
-            // 早期静态决策：bootstrap 未完成时，仅允许无冲突风险的诊断类 Mixin
-            // telemetry / diagnostics 包仅观测不修改原版逻辑，可安全应用
-            // 其他 Mixin（io / structure / features / light 等）可能与 FastNoise/Bye-Pregen 冲突，必须拒绝
-            return mixinClassName.contains(".telemetry.")
-                    || mixinClassName.contains(".diagnostics.");
+        // 遥测/诊断 Mixin：总是安全
+        if (mixinClassName.contains(".telemetry.") || mixinClassName.contains(".diagnostics.")) {
+            return true;
         }
-        // 晚期运行决策：按模块前缀查 ModuleStates 让路
-        // Bye-Pregen 已重写 IO，SteadyChunks IO Mixin 让路
-        if (mixinClassName.startsWith("com.mochi_753.steadychunks.mixin.io.") && states.byepregenPresent()) {
-            return false;
+
+        // 调度类 Mixin（.server. 包）：总是应用，行为由运行时门控控制
+        // 审查修复：不再在 states == null 时拒绝调度 Mixin
+        // 调度器未启用时 Mixin 内部透传原版路径，无副作用
+        if (mixinClassName.contains(".server.")) {
+            return true;
         }
-        // FastNoise 已重写噪声生成，SteadyChunks 噪声相关 Mixin 让路
-        if (mixinClassName.startsWith("com.mochi_753.steadychunks.mixin.noise.") && states.fastNoisePresent()) {
-            return false;
+
+        // 冲突类 Mixin：需要 states 才能判断
+        if (states != null) {
+            // Bye-Pregen 已重写 IO，SteadyChunks IO Mixin 让路
+            if (mixinClassName.startsWith("com.mochi_753.steadychunks.mixin.io.") && states.byepregenPresent()) {
+                return false;
+            }
+            // FastNoise 已重写噪声生成，SteadyChunks 噪声算法 Mixin 让路
+            // 注意：这不影响 .server. 包下的调度 Mixin（只门控准入，不修改噪声算法）
+            if (mixinClassName.startsWith("com.mochi_753.steadychunks.mixin.noise.") && states.fastNoisePresent()) {
+                return false;
+            }
+            // 默认应用（无冲突的 Mixin）
+            return true;
         }
-        // 默认应用（诊断、遥测、无冲突的调度 Mixin）
-        return true;
+
+        // states == null 且非遥测/诊断/调度类：保守拒绝（可能冲突）
+        return false;
     }
 }

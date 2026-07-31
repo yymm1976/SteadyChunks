@@ -68,10 +68,9 @@ public final class CrashReportContributor {
         ChunkScheduler scheduler = ChunkScheduler.getInstance();
         sb.append("调度器: enabled=").append(scheduler.isEnabled())
                 .append(" inflight=").append(scheduler.inflightCount())
-                .append(" readyQueue=").append(scheduler.readyQueueSize())
+                .append(" pending=").append(scheduler.pendingCount())
                 .append(" permitsMax=").append(scheduler.cpuPermitsMax())
                 .append(" permitsAvailable=").append(scheduler.cpuPermitsAvailable())
-                .append(" taskGraphSize=").append(scheduler.taskGraph().size())
                 .append('\n');
     }
 

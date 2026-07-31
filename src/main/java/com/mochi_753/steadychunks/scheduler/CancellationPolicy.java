@@ -10,34 +10,24 @@ package com.mochi_753.steadychunks.scheduler;
  *   <li>FEATURES 阶段已开始时不可中断（§8.1），但可阻止后续阶段</li>
  * </ul>
  * <p>
- * 仅允许：
- * <ul>
- *   <li>从等待队列移除</li>
- *   <li>阻止尚未开始的阶段</li>
- *   <li>阻止任务进入下一个高成本阶段</li>
- *   <li>释放未使用资源令牌</li>
- * </ul>
+ * 审查修复：移除 ChunkTaskGraph 依赖。原版已通过 ChunkGenerationTask 和 GenerationChunkHolder
+ * 解决邻区块依赖，SteadyChunks 第一版不需要自建依赖图。
+ * <p>
  * 禁止：
  * <ul>
  *   <li>中断正在写区块的阶段</li>
  *   <li>中断 FEATURES 中的结构或特征放置</li>
  *   <li>中断光照传播</li>
  *   <li>中断保存</li>
- *   <li>取消仍被其他区块依赖的共享任务（除非已无依赖）</li>
  * </ul>
  */
 public final class CancellationPolicy {
-    private final ChunkTaskGraph graph;
-
-    public CancellationPolicy(ChunkTaskGraph graph) {
-        this.graph = graph;
-    }
 
     /**
      * 判断任务是否可以被安全取消，以及取消的生效方式。
      *
      * @param task 待取消任务
-     * @return CancellationDecision：ALLOWED / ALLOWED_DEFERRED / DENY_DEPENDENT / ALREADY_FINISHED
+     * @return CancellationDecision：ALLOWED / ALLOWED_DEFERRED / ALREADY_FINISHED
      */
     public CancellationDecision canCancel(ChunkTask task) {
         TaskState state = task.state();
@@ -51,11 +41,8 @@ public final class CancellationPolicy {
         if (state == TaskState.RUNNING) {
             return CancellationDecision.ALLOWED_DEFERRED;
         }
-        // QUEUED / WAITING_DEPS / READY：仍被其他区块依赖的共享任务不可立即取消
-        if (hasDependents(task)) {
-            return CancellationDecision.DENY_DEPENDENT;
-        }
         // QUEUED / WAITING_DEPS / READY 可安全立即取消
+        // 审查修复：移除 DENY_DEPENDENT 检查，原版 ChunkGenerationTask 已处理依赖
         return CancellationDecision.ALLOWED;
     }
 
@@ -73,12 +60,9 @@ public final class CancellationPolicy {
         CancellationDecision decision = canCancel(task);
         switch (decision) {
             case ALLOWED -> {
-                // 立即取消：CAS 到 CANCELLED，permit 由 ChunkScheduler.tick 的 CANCELLED 分支释放
                 return task.compareAndSetState(task.state(), TaskState.CANCELLED);
             }
             case ALLOWED_DEFERRED -> {
-                // 延迟取消：CAS 到 CANCEL_REQUESTED，阶段完成后阻止下一阶段
-                // §8.1 FEATURES 已开始时不中断，但 CANCEL_REQUESTED 仍可阻止后续阶段
                 return task.compareAndSetState(TaskState.RUNNING, TaskState.CANCEL_REQUESTED);
             }
             default -> {
@@ -87,21 +71,12 @@ public final class CancellationPolicy {
         }
     }
 
-    /**
-     * 检查任务是否仍被其他任务依赖。
-     */
-    private boolean hasDependents(ChunkTask task) {
-        return !graph.getDependents(task.pos()).isEmpty();
-    }
-
     /** 取消决策结果 */
     public enum CancellationDecision {
         /** 允许立即取消（QUEUED/WAITING_DEPS/READY） */
         ALLOWED,
         /** 允许延迟取消（RUNNING，置为 CANCEL_REQUESTED，阶段完成后生效） */
         ALLOWED_DEFERRED,
-        /** 拒绝：仍有依赖此任务的其他任务 */
-        DENY_DEPENDENT,
         /** 任务已结束、已取消或已请求取消 */
         ALREADY_FINISHED
     }

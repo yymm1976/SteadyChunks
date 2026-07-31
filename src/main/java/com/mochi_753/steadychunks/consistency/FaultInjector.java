@@ -62,27 +62,15 @@ public final class FaultInjector {
     /**
      * 注入工作线程异常：模拟任务执行时抛出未捕获异常。
      * <p>
-     * 验证 onFailure 路径正确释放 permit 和清理任务状态。
+     * 审查修复：ChunkTaskGraph 已删除，不再遍历任务图。
+     * 新设计中 permit 在 Future 完成时自动释放，无需手动触发 onFailure。
+     * 此方法保留为日志标记，未来可通过 Mixin 注入异常到原版 Future 链测试。
      *
      * @param scheduler 调度器实例
      */
     public void injectWorkerException(ChunkScheduler scheduler) {
         totalInjections.incrementAndGet();
-        SteadyChunks.LOGGER.warn("SteadyChunks FaultInjector: 注入工作线程异常");
-        // 触发调度器的 onFailure 路径：取一个非 HIGH 安全等级的任务模拟失败
-        // HIGH 安全等级任务处于 RUNNING FEATURES/LIGHT/SAVE，禁止取消
-        for (var task : scheduler.taskGraph().allTasks()) {
-            if (task.safety() == com.mochi_753.steadychunks.scheduler.ChunkTask.SafetyLevel.HIGH) {
-                continue;
-            }
-            // 模拟任务失败（不实际执行，只触发 onFailure 清理路径）
-            try {
-                scheduler.onFailure(task, new RuntimeException("FaultInjector: 模拟工作线程异常"));
-            } catch (Throwable t) {
-                SteadyChunks.LOGGER.warn("SteadyChunks FaultInjector: onFailure 路径异常: {}", t.getMessage());
-            }
-            break;
-        }
+        SteadyChunks.LOGGER.warn("SteadyChunks FaultInjector: 注入工作线程异常（当前为日志标记，permit 由 Future 回调自动释放）");
     }
 
     /**
@@ -213,16 +201,10 @@ public final class FaultInjector {
             report.addLeak("scheduler.inflight", inflight);
         }
 
-        // 检查就绪队列残留
-        int readySize = scheduler.readyQueueSize();
-        if (readySize != 0) {
-            report.addLeak("scheduler.readyQueue", readySize);
-        }
-
-        // 检查任务图残留
-        int taskGraphSize = scheduler.taskGraph().size();
-        if (taskGraphSize != 0) {
-            report.addLeak("scheduler.taskGraph", taskGraphSize);
+        // 检查等待队列残留
+        int pendingSize = scheduler.pendingCount();
+        if (pendingSize != 0) {
+            report.addLeak("scheduler.pending", pendingSize);
         }
 
         // 检查 FULL 整合队列残留

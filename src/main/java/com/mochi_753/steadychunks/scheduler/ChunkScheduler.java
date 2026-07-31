@@ -2,63 +2,59 @@ package com.mochi_753.steadychunks.scheduler;
 
 import com.mochi_753.steadychunks.SteadyChunks;
 import com.mochi_753.steadychunks.config.CommonConfig;
+import net.minecraft.server.level.ChunkResult;
+import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
-import java.util.concurrent.PriorityBlockingQueue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 
 /**
  * 区块调度器主控，对应开发计划 §3 交付物。
  * <p>
- * 整合所有调度组件：任务图、资源令牌、阶段限制、优先级模型、公平性、背压、取消策略。
+ * 审查修复：从"任务图管理器"简化为"NOISE 准入控制器"。
+ * <ul>
+ *   <li>删除 ChunkTaskGraph（原版 ChunkGenerationTask 已处理依赖）</li>
+ *   <li>新增 controlAdmission() 供 Mixin 拦截 applyStep 后调用</li>
+ *   <li>permit 不足时创建代理 Future，任务进入等待队列</li>
+ *   <li>tick() 处理等待队列，permit 可用时唤醒</li>
+ *   <li>禁用调度器后行为恢复原版路径（验收标准 §3）</li>
+ * </ul>
  * <p>
  * 设计原则：
  * <ul>
- *   <li>固定预算调度器：Phase 3 只支持配置固定值，Phase 4 AIMD 动态调整</li>
- *   <li>完成优先：近处半成品区块优先推进</li>
- *   <li>软取消：仅允许在 RUNNING 之前取消</li>
- *   <li>禁用调度器后行为恢复到原版路径（验收标准）</li>
+ *   <li>仅门控 NOISE（PR1 范围），其他阶段透传原版</li>
+ *   <li>不自建工作线程池，permit 可用时向原版同一 Executor 提交</li>
+ *   <li>不重写依赖，原版 ChunkGenerationTask 负责邻区块依赖解析</li>
  * </ul>
  */
 public final class ChunkScheduler {
     private static ChunkScheduler instance;
 
-    private final ChunkTaskGraph taskGraph = new ChunkTaskGraph();
     private final StageLimiter stageLimiter = new StageLimiter();
-    private final FairnessManager fairness = new FairnessManager();
-    private final PriorityModel priorityModel = new PriorityModel(fairness);
-    private final BackpressureController backpressure = new BackpressureController();
-    private final CancellationPolicy cancellation = new CancellationPolicy(taskGraph);
     /** §17.3 看门狗，定期扫描任务异常并报告 */
     private final Watchdog watchdog = Watchdog.getInstance();
+    /** 软取消策略（审查修复：无参构造，不再依赖 ChunkTaskGraph） */
+    private final CancellationPolicy cancellation = new CancellationPolicy();
 
-    /** 优先级队列：按评分降序（§6.1 使用 long 评分，避免浮点比较不稳定） */
-    private final PriorityBlockingQueue<ChunkTask> readyQueue = new PriorityBlockingQueue<>(
-            64, Comparator.comparingLong(ChunkTask::priorityScore).reversed()
-    );
+    /** NOISE 等待队列：permit 不足时暂存任务 */
+    private final ConcurrentLinkedQueue<PendingNoiseTask> pendingNoiseTasks = new ConcurrentLinkedQueue<>();
 
     private final ResourcePermit cpuGeneralPermit;
     private final AtomicInteger inflightCount = new AtomicInteger(0);
+    private final AtomicInteger pendingCount = new AtomicInteger(0);
     private final AtomicBoolean enabled = new AtomicBoolean(false);
     private volatile double maxVisibleDistance = 128.0;
 
-    /**
-     * 需求版本号（§6.2 惰性优先级更新）。
-     * 每次玩家移动、需求变化、配置调整时 +1；任务 poll 时若版本过期则重算优先级。
-     * 避免每 tick 重建整个优先堆。
-     */
-    private volatile long demandVersion = 0L;
     /** §17.3 内部 tick 计数器，供 Watchdog 扫描间隔判断 */
     private long tickCounter = 0L;
 
     private ChunkScheduler() {
         int maxInflight = 64;
         cpuGeneralPermit = new ResourcePermit(ResourceType.CPU_GENERAL, maxInflight);
-        backpressure.setInflightThreshold(maxInflight);
     }
 
     public static synchronized ChunkScheduler getInstance() {
@@ -74,15 +70,17 @@ public final class ChunkScheduler {
     public void setEnabled(boolean on) {
         enabled.set(on);
         SteadyChunks.LOGGER.info("SteadyChunks 调度器: {}", on ? "enabled" : "disabled");
+        // 禁用时唤醒所有等待任务（走原版路径）
+        if (!on) {
+            drainPendingForce();
+        }
     }
 
     /**
      * 设置在途任务上限（§11.6 预设应用器调用）。
-     * 同步更新 permit 容量与背压阈值。
      */
     public void setMaxInflight(int maxInflight) {
         cpuGeneralPermit.setMaxPermits(maxInflight);
-        backpressure.setInflightThreshold(maxInflight);
     }
 
     public boolean isEnabled() {
@@ -90,151 +88,163 @@ public final class ChunkScheduler {
     }
 
     /**
-     * 提交新任务到调度器。
+     * 准入控制：Mixin 拦截 GenerationChunkHolder.applyStep 后调用此方法。
+     * <p>
+     * 流程（审查建议的最小接入路径）：
+     * <ol>
+     *   <li>调度器未启用 → 直接走原版路径</li>
+     *   <li>非 NOISE 阶段 → 直接走原版路径（PR1 仅门控 NOISE）</li>
+     *   <li>尝试获取 permit → 成功则执行原版操作，完成后释放 permit</li>
+     *   <li>permit 不足 → 创建代理 Future，任务进入等待队列</li>
+     * </ol>
+     *
+     * @param targetStatus     目标 ChunkStatus
+     * @param isDependencyUnlock 是否为依赖解锁任务（可使用保留 permit）
+     * @param originalOperation 原版 applyStep 操作（返回原版 Future）
+     * @return 代理 Future 或原版 Future
      */
-    public void submit(ChunkTask task) {
+    public CompletableFuture<ChunkResult<ChunkAccess>> controlAdmission(
+            ChunkStatus targetStatus,
+            boolean isDependencyUnlock,
+            Supplier<CompletableFuture<ChunkResult<ChunkAccess>>> originalOperation) {
+
+        // 调度器未启用：直接走原版路径（验收标准 §3）
         if (!enabled.get()) {
-            return;
+            return originalOperation.get();
         }
-        taskGraph.register(task);
-        // 检查依赖是否已满足
-        if (taskGraph.areDependenciesMet(task)) {
-            task.setState(TaskState.READY);
-            updatePriority(task);
-            readyQueue.offer(task);
-        } else {
-            task.setState(TaskState.WAITING_DEPS);
+
+        // PR1：仅门控 NOISE，其他阶段透传
+        if (targetStatus != ChunkStatus.NOISE) {
+            return originalOperation.get();
         }
+
+        // 尝试获取 permit
+        if (!stageLimiter.tryAcquire(targetStatus, isDependencyUnlock)) {
+            // permit 不足：创建代理 Future，放入等待队列
+            CompletableFuture<ChunkResult<ChunkAccess>> proxy = new CompletableFuture<>();
+            pendingNoiseTasks.offer(new PendingNoiseTask(originalOperation, proxy, isDependencyUnlock));
+            pendingCount.incrementAndGet();
+            return proxy;
+        }
+
+        // permit 获取成功：执行原版操作，完成后释放 permit 并唤醒等待队列
+        return executeOriginal(targetStatus, originalOperation, null);
     }
 
     /**
-     * 每 tick 调用：推进调度循环。
-     * <p>
-     * 1. 更新背压指标<br>
-     * 2. 从就绪队列取出最高优先级任务<br>
-     * 3. 检查背压、资源 permit、阶段限制<br>
-     * 4. 启动允许的任务<br>
-     * 5. 回收已完成任务的资源
+     * 执行原版操作，完成后释放 permit 并唤醒等待队列。
+     *
+     * @param proxy 代理 Future（null 表示直接返回原版 Future）
+     */
+    private CompletableFuture<ChunkResult<ChunkAccess>> executeOriginal(
+            ChunkStatus targetStatus,
+            Supplier<CompletableFuture<ChunkResult<ChunkAccess>>> originalOperation,
+            CompletableFuture<ChunkResult<ChunkAccess>> proxy) {
+
+        inflightCount.incrementAndGet();
+        CompletableFuture<ChunkResult<ChunkAccess>> future;
+        try {
+            future = originalOperation.get();
+        } catch (Throwable ex) {
+            // 原版操作抛异常：释放 permit 并传播异常
+            stageLimiter.release(targetStatus);
+            inflightCount.decrementAndGet();
+            drainPending();
+            if (proxy != null) {
+                proxy.completeExceptionally(ex);
+                return proxy;
+            }
+            CompletableFuture<ChunkResult<ChunkAccess>> failed = new CompletableFuture<>();
+            failed.completeExceptionally(ex);
+            return failed;
+        }
+
+        future.whenComplete((result, ex) -> {
+            stageLimiter.release(targetStatus);
+            inflightCount.decrementAndGet();
+            if (proxy != null) {
+                // 完成代理 Future
+                if (ex != null) {
+                    proxy.completeExceptionally(ex);
+                } else {
+                    proxy.complete(result);
+                }
+            }
+            // 尝试唤醒等待队列
+            drainPending();
+        });
+
+        return proxy != null ? proxy : future;
+    }
+
+    /**
+     * 每 tick 调用：处理等待队列中的 NOISE 任务。
      */
     public void tick() {
         if (!enabled.get()) {
             return;
         }
         tickCounter++;
-        // §17.3 Watchdog 定期扫描（即使背压或调度异常也要检测）
         watchdog.tick(tickCounter, this);
-        // 更新背压指标
-        backpressure.setInflightCount(inflightCount.get());
-        backpressure.setQueueDepth(readyQueue.size());
-
-        BackpressureController.BackpressureLevel level = backpressure.evaluate();
-
-        // 尝试启动就绪任务
-        List<ChunkTask> deferred = new ArrayList<>();
-        while (!readyQueue.isEmpty() && inflightCount.get() < cpuGeneralPermit.maxPermits()) {
-            ChunkTask task = readyQueue.poll();
-            if (task == null) {
-                break;
-            }
-            // 检查是否已被取消
-            if (task.state() == TaskState.CANCELLED) {
-                taskGraph.remove(task.pos());
-                continue;
-            }
-            // §6.2 惰性优先级更新：版本过期则重算并重新入队，让堆自动调整位置
-            if (task.priorityVersion() != demandVersion) {
-                updatePriority(task);
-                readyQueue.offer(task);
-                continue;
-            }
-            // 检查背压
-            if (!backpressure.allowNewTask(task, level)) {
-                deferred.add(task);
-                continue;
-            }
-            // 尝试获取资源 permit
-            if (!cpuGeneralPermit.tryAcquire()) {
-                deferred.add(task);
-                continue;
-            }
-            // §7.1 依赖解锁任务可使用保留 permit，普通任务不能占用依赖保留额度
-            if (!stageLimiter.tryAcquire(task.targetStatus(), task.requiredForDependency())) {
-                cpuGeneralPermit.release();
-                deferred.add(task);
-                continue;
-            }
-            // 启动任务
-            task.setState(TaskState.RUNNING);
-            inflightCount.incrementAndGet();
-            fairness.onTaskStart(task);
-            // 实际执行由 Mixin 层或工作线程池处理
-        }
-        // 将被延迟的任务重新放回队列
-        for (ChunkTask t : deferred) {
-            readyQueue.offer(t);
-        }
+        // 处理等待队列
+        drainPending();
     }
 
     /**
-     * 任务完成时调用，释放资源并通知依赖。
+     * 尝试执行等待队列中的任务。
      * <p>
-     * §8 两阶段软取消：若任务处于 CANCEL_REQUESTED，阶段已完成但用户请求取消。
-     * 仍被依赖时必须转为 DONE（不能让依赖者永久等待）；无依赖时转为 CANCELLED（阻止下一阶段）。
+     * 从队列头部取出任务，获取 permit 后执行原版操作。
+     * permit 不足时停止处理，等待下一个 permit 释放时再次触发。
      */
-    public void onComplete(ChunkTask task) {
-        stageLimiter.release(task.targetStatus());
-        cpuGeneralPermit.release();
-        inflightCount.decrementAndGet();
-        fairness.onTaskEnd(task);
-
-        boolean cancelled = false;
-        if (task.state() == TaskState.CANCEL_REQUESTED) {
-            // §8：阶段已完成，检查是否仍被依赖
-            if (hasDependents(task)) {
-                // 仍被依赖：必须完成，转为 DONE 满足依赖链
-                task.setState(TaskState.DONE);
-            } else {
-                // 无依赖：安全取消，阻止下一阶段
-                task.setState(TaskState.CANCELLED);
-                cancelled = true;
+    private void drainPending() {
+        while (true) {
+            PendingNoiseTask task = pendingNoiseTasks.peek();
+            if (task == null) {
+                return;
             }
-        } else {
-            task.setState(TaskState.DONE);
+            // 尝试获取 permit
+            if (!stageLimiter.tryAcquire(ChunkStatus.NOISE, task.isDependencyUnlock())) {
+                return; // permit 不足，等待下次触发
+            }
+            // 从队列移除（peek + poll 避免 permit 浪费）
+            if (pendingNoiseTasks.poll() != task) {
+                // 被其他线程取走了，释放 permit 重试
+                stageLimiter.release(ChunkStatus.NOISE);
+                continue;
+            }
+            pendingCount.decrementAndGet();
+            // 执行原版操作，完成后唤醒队列
+            executeOriginal(ChunkStatus.NOISE, task.operation(), task.proxy());
         }
+    }
 
-        // 仅 DONE 状态通知依赖者（CANCELLED 不满足依赖，依赖者需等待重新调度或超时）
-        if (!cancelled) {
-            for (var depPos : taskGraph.getDependents(task.pos())) {
-                ChunkTask dependent = taskGraph.get(depPos);
-                if (dependent != null && dependent.state() == TaskState.WAITING_DEPS) {
-                    if (taskGraph.areDependenciesMet(dependent)) {
-                        dependent.setState(TaskState.READY);
-                        updatePriority(dependent);
-                        readyQueue.offer(dependent);
-                    }
+    /**
+     * 禁用调度器时强制唤醒所有等待任务（走原版路径）。
+     */
+    private void drainPendingForce() {
+        PendingNoiseTask task;
+        while ((task = pendingNoiseTasks.poll()) != null) {
+            pendingCount.decrementAndGet();
+            final PendingNoiseTask finalTask = task;
+            // 直接执行原版操作，不获取 permit
+            inflightCount.incrementAndGet();
+            CompletableFuture<ChunkResult<ChunkAccess>> future;
+            try {
+                future = finalTask.operation().get();
+            } catch (Throwable ex) {
+                inflightCount.decrementAndGet();
+                finalTask.proxy().completeExceptionally(ex);
+                continue;
+            }
+            future.whenComplete((result, ex) -> {
+                inflightCount.decrementAndGet();
+                if (ex != null) {
+                    finalTask.proxy().completeExceptionally(ex);
+                } else {
+                    finalTask.proxy().complete(result);
                 }
-            }
+            });
         }
-        taskGraph.remove(task.pos());
-    }
-
-    /**
-     * 检查任务是否仍被其他任务依赖。
-     */
-    private boolean hasDependents(ChunkTask task) {
-        return !taskGraph.getDependents(task.pos()).isEmpty();
-    }
-
-    /**
-     * 任务失败时调用，释放资源但保留在图中供诊断。
-     */
-    public void onFailure(ChunkTask task, Throwable cause) {
-        stageLimiter.release(task.targetStatus());
-        cpuGeneralPermit.release();
-        inflightCount.decrementAndGet();
-        fairness.onTaskEnd(task);
-        task.setState(TaskState.FAILED);
-        SteadyChunks.LOGGER.warn("SteadyChunks 任务失败: {} {}", task.pos(), cause.getMessage());
     }
 
     /**
@@ -245,32 +255,12 @@ public final class ChunkScheduler {
     }
 
     /**
-     * 更新任务优先级评分（§6.1 long 评分 + §6.2 惰性版本标记）。
-     */
-    private void updatePriority(ChunkTask task) {
-        long score = priorityModel.score(task, maxVisibleDistance);
-        task.setPriorityScore(score);
-        task.setPriorityVersion(demandVersion);
-    }
-
-    /**
-     * 触发需求版本号 +1（§6.2 惰性优先级更新）。
-     * <p>
-     * 由玩家移动、需求变化、配置调整等事件调用。
-     * 不立即重算所有任务，而是在 tick poll 时按需重算过期任务。
-     */
-    public void bumpDemandVersion() {
-        demandVersion++;
-    }
-
-    /**
      * 从配置同步调度器参数。
      */
     public void syncFromConfig() {
         setEnabled(CommonConfig.SCHEDULER_ENABLED.get());
         int maxInflight = CommonConfig.MAX_INFLIGHT.get();
         cpuGeneralPermit.setMaxPermits(maxInflight);
-        backpressure.setInflightThreshold(maxInflight);
 
         // 同步阶段限制
         stageLimiter.setStageLimit(ChunkStatus.STRUCTURE_STARTS, CommonConfig.LIMIT_STRUCTURE_STARTS.get());
@@ -280,44 +270,30 @@ public final class ChunkScheduler {
     }
 
     // 诊断访问器
-    public ChunkTaskGraph taskGraph() { return taskGraph; }
     public StageLimiter stageLimiter() { return stageLimiter; }
-    public BackpressureController backpressure() { return backpressure; }
-    public FairnessManager fairness() { return fairness; }
     public Watchdog watchdog() { return watchdog; }
     public int inflightCount() { return inflightCount.get(); }
-    public int readyQueueSize() { return readyQueue.size(); }
+    public int pendingCount() { return pendingCount.get(); }
     public int cpuPermitsAvailable() { return cpuGeneralPermit.availablePermits(); }
     public int cpuPermitsMax() { return cpuGeneralPermit.maxPermits(); }
 
     /**
-     * §9.4 区块卸载时调用：从就绪队列移除该区块的任务。
-     */
-    public void onChunkUnload(long packedChunkPos) {
-        taskGraph.remove(packedChunkPos);
-    }
-
-    /**
-     * §9.4 维度卸载时调用：取消该维度的所有等待任务。
-     * <p>
-     * 当前实现按 taskGraph 清理所有任务（维度隔离需扩展 taskGraph 后实现）。
-     * §17.3 同时注册到 Watchdog，便于后续扫描检测孤儿任务。
-     */
-    public void onDimensionUnload(net.minecraft.resources.ResourceKey<net.minecraft.world.level.Level> dimension) {
-        // 取消所有非 RUNNING 任务（RUNNING 任务由 onComplete 处理）
-        // taskGraph 维度隔离扩展后可按维度精确取消
-        watchdog.registerDimensionUnload(dimension);
-        SteadyChunks.LOGGER.info("SteadyChunks 调度器维度卸载: {}", dimension.location());
-    }
-
-    /**
-     * §9.4 服务器关闭时调用：清空所有队列和任务图。
+     * §9.4 服务器关闭时调用：清空所有队列。
      */
     public void clearAll() {
-        readyQueue.clear();
-        taskGraph.clear();
+        pendingNoiseTasks.clear();
+        pendingCount.set(0);
         inflightCount.set(0);
         watchdog.clear();
         SteadyChunks.LOGGER.info("SteadyChunks 调度器已清空所有队列");
     }
+
+    /**
+     * 等待中的 NOISE 任务。
+     */
+    private record PendingNoiseTask(
+            Supplier<CompletableFuture<ChunkResult<ChunkAccess>>> operation,
+            CompletableFuture<ChunkResult<ChunkAccess>> proxy,
+            boolean isDependencyUnlock
+    ) {}
 }

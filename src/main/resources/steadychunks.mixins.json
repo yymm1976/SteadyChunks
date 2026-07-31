@@ -5,7 +5,8 @@
   "compatibilityLevel": "JAVA_21",
   "mixins": [
     "telemetry.MixinMinecraftServer",
-    "diagnostics.MixinCrashReport"
+    "diagnostics.MixinCrashReport",
+    "server.MixinGenerationChunkHolder"
   ],
   "client": [
     "telemetry.MixinMinecraft"
