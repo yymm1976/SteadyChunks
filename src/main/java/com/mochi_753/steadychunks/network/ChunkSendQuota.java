@@ -204,6 +204,65 @@ public final class ChunkSendQuota {
     }
 
     /**
+     * 每 Tick 在主线程调用：排空所有玩家的发送队列（审查修复：真正的 drain/poll/send 路径）。
+     * <p>
+     * 遍历当前在线玩家队列，逐个按配额预留 → 出队 → 执行 sendAction。
+     * 配额不足时停止该玩家本轮发送，等待下 Tick。
+     */
+    public void drainAll() {
+        if (!enabled.get()) {
+            return;
+        }
+        // 快照玩家列表，避免遍历时并发修改
+        for (UUID playerId : playerQueues.keySet().toArray(new UUID[0])) {
+            drainPlayer(playerId);
+        }
+    }
+
+    /**
+     * 主线程 drain 单个玩家的发送队列（审查修复：完整的 drain/poll/send 路径）。
+     * <p>
+     * 流程：
+     * <ol>
+     *   <li>peek 队列头（最高优先级任务）</li>
+     *   <li>{@link #tryReserve} 预留配额（含硬上限检查）→ 失败停止本轮</li>
+     *   <li>poll 出队并执行 {@link ChunkSendTask#sendAction()}</li>
+     * </ol>
+     * <p>
+     * 只有在原版区块发送调用点被 Mixin 拦截并调用 {@link #submit} 后此路径才实际生效；
+     * 当前发送链路尚未接入（Mixin 未注入 ChunkMap 发送调用点），此为基础设施闭环。
+     */
+    public void drainPlayer(UUID playerId) {
+        if (!enabled.get()) {
+            return;
+        }
+        PriorityBlockingQueue<ChunkSendTask> queue = playerQueues.get(playerId);
+        if (queue == null) {
+            return;
+        }
+        while (true) {
+            ChunkSendTask task = queue.peek();
+            if (task == null) {
+                return;
+            }
+            // 配额预留（原子 reservation，含硬上限检查）；失败停止本轮
+            if (!tryReserve(playerId, task.estimatedBytes(), task.lightBytes())) {
+                return;
+            }
+            // 出队（peek + poll 避免配额浪费）
+            if (queue.poll() != task) {
+                continue;
+            }
+            // 执行实际发送
+            try {
+                task.sendAction().run();
+            } catch (Throwable t) {
+                SteadyChunks.LOGGER.warn("区块发送执行失败: player={} pos={} {}", playerId, task.pos(), t.getMessage());
+            }
+        }
+    }
+
+    /**
      * 玩家断开或维度卸载时清理。
      */
     public void clearPlayer(UUID playerId) {

@@ -64,6 +64,22 @@ public final class ResourceBucket {
     }
 
     /**
+     * CAS 获取 permit 并返回 {@link PermitLease}（AutoCloseable）。
+     * <p>
+     * 配合 try-with-resources 保证 permit 在正常、异常、取消路径均被释放。
+     * 保留额度语义与 {@link #tryAcquireWithReserve} 一致。
+     *
+     * @param reserve 依赖解锁保留额度（普通任务不能占用）
+     * @return PermitLease，{@link PermitLease#acquired()} 为 true 表示获取成功
+     */
+    public PermitLease tryAcquireLease(int reserve) {
+        if (tryAcquireWithReserve(reserve)) {
+            return PermitLease.acquired(this);
+        }
+        return PermitLease.empty();
+    }
+
+    /**
      * CAS 释放一个 permit，检测双重释放。
      *
      * @return true 表示释放成功，false 表示检测到双重释放（已无已获取 permit）

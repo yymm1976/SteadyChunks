@@ -113,19 +113,24 @@ public final class ChunkScheduler {
     }
 
     /**
-     * 准入控制：Mixin 拦截 GenerationChunkHolder.applyStep 后调用此方法。
+     * 准入控制：Mixin 在 {@code ChunkGenerationTask.scheduleChunkInLayer} 的
+     * {@code GenerationChunkHolder.applyStep} 调用点（@WrapOperation）调用此方法。
      * <p>
      * 流程（审查建议的最小接入路径）：
      * <ol>
      *   <li>调度器未启用 → 直接走原版路径</li>
      *   <li>非 NOISE 阶段 → 直接走原版路径（PR1 仅门控 NOISE）</li>
-     *   <li>尝试获取 permit → 成功则执行原版操作，完成后释放 permit</li>
-     *   <li>permit 不足 → 创建代理 Future，任务进入等待队列</li>
+     *   <li>获取全局 permit（max_inflight）→ 失败入队等待</li>
+     *   <li>获取阶段 permit（NOISE_HEAVY）→ 失败释放全局并入队等待</li>
+     *   <li>都成功 → 执行原版操作，完成后释放两个 permit</li>
      * </ol>
+     * <p>
+     * P0 修复：获取顺序固定为 global → stage，释放顺序相反，避免死锁。
+     * 组合 lease 在正常、异常、取消路径统一关闭，保证 permit 不泄漏。
      *
-     * @param targetStatus     目标 ChunkStatus
-     * @param isDependencyUnlock 是否为依赖解锁任务（可使用保留 permit）
-     * @param originalOperation 原版 applyStep 操作（返回原版 Future）
+     * @param targetStatus       目标 ChunkStatus
+     * @param isDependencyUnlock 是否为依赖解锁任务（PR1 阶段恒为 false，预留旁路）
+     * @param originalOperation  原版 applyStep 操作（返回原版 Future）
      * @return 代理 Future 或原版 Future
      */
     public CompletableFuture<ChunkResult<ChunkAccess>> controlAdmission(
@@ -145,42 +150,64 @@ public final class ChunkScheduler {
 
         // P0-4 修复：紧急暂停时普通任务进入等待队列，依赖关键任务旁路放行
         if (admissionPaused && !isDependencyUnlock) {
-            CompletableFuture<ChunkResult<ChunkAccess>> proxy = new CompletableFuture<>();
-            pendingNoiseTasks.offer(new PendingNoiseTask(originalOperation, proxy, isDependencyUnlock));
-            pendingCount.incrementAndGet();
-            return proxy;
+            return enqueuePending(originalOperation, isDependencyUnlock);
         }
 
-        // 尝试获取 permit
-        if (!stageLimiter.tryAcquire(targetStatus, isDependencyUnlock)) {
-            // permit 不足：创建代理 Future，放入等待队列
-            CompletableFuture<ChunkResult<ChunkAccess>> proxy = new CompletableFuture<>();
-            pendingNoiseTasks.offer(new PendingNoiseTask(originalOperation, proxy, isDependencyUnlock));
-            pendingCount.incrementAndGet();
-            return proxy;
+        // 组合 lease：固定获取顺序 global → stage
+        PermitLease global = cpuGeneralPermit.tryAcquireLease();
+        if (!global.acquired()) {
+            // 全局 permit 不足：入队等待
+            return enqueuePending(originalOperation, isDependencyUnlock);
+        }
+        PermitLease stage = stageLimiter.tryAcquireLease(targetStatus, isDependencyUnlock);
+        if (!stage.acquired()) {
+            // 阶段 permit 不足：释放全局 permit 后入队等待
+            global.close();
+            return enqueuePending(originalOperation, isDependencyUnlock);
         }
 
-        // permit 获取成功：执行原版操作，完成后释放 permit 并唤醒等待队列
-        return executeOriginal(targetStatus, originalOperation, null);
+        // 组合 permit 获取成功：执行原版操作，完成后统一释放
+        return executeOriginal(targetStatus, originalOperation, null, global, stage);
     }
 
     /**
-     * 执行原版操作，完成后释放 permit 并唤醒等待队列。
+     * 创建代理 Future 并将任务放入等待队列。
+     */
+    private CompletableFuture<ChunkResult<ChunkAccess>> enqueuePending(
+            Supplier<CompletableFuture<ChunkResult<ChunkAccess>>> originalOperation,
+            boolean isDependencyUnlock) {
+        CompletableFuture<ChunkResult<ChunkAccess>> proxy = new CompletableFuture<>();
+        pendingNoiseTasks.offer(new PendingNoiseTask(originalOperation, proxy, isDependencyUnlock));
+        pendingCount.incrementAndGet();
+        return proxy;
+    }
+
+    /**
+     * 执行原版操作，完成后释放组合 permit 并唤醒等待队列。
+     * <p>
+     * 原版操作执行于当前调用线程（applyStep 为纯调度函数：同步调用
+     * {@code ChunkStep.apply} 返回 Future，真正的噪声填充由 Future 内部驱动）。
+     * 延迟恢复时该线程是触发 drainPending 的线程（多为原版 Future 完成回调线程）。
      *
-     * @param proxy 代理 Future（null 表示直接返回原版 Future）
+     * @param proxy  代理 Future（null 表示直接返回原版 Future）
+     * @param global 全局 permit lease（必须非 null）
+     * @param stage  阶段 permit lease（必须非 null）
      */
     private CompletableFuture<ChunkResult<ChunkAccess>> executeOriginal(
             ChunkStatus targetStatus,
             Supplier<CompletableFuture<ChunkResult<ChunkAccess>>> originalOperation,
-            CompletableFuture<ChunkResult<ChunkAccess>> proxy) {
+            CompletableFuture<ChunkResult<ChunkAccess>> proxy,
+            PermitLease global,
+            PermitLease stage) {
 
         inflightCount.incrementAndGet();
         CompletableFuture<ChunkResult<ChunkAccess>> future;
         try {
             future = originalOperation.get();
         } catch (Throwable ex) {
-            // 原版操作抛异常：释放 permit 并传播异常
-            stageLimiter.release(targetStatus);
+            // 原版操作抛异常：释放组合 permit 并传播异常（审查修复：统一 close 路径）
+            stage.close();
+            global.close();
             inflightCount.decrementAndGet();
             drainPending();
             if (proxy != null) {
@@ -193,7 +220,9 @@ public final class ChunkScheduler {
         }
 
         future.whenComplete((result, ex) -> {
-            stageLimiter.release(targetStatus);
+            // 释放顺序与获取顺序相反：stage → global
+            stage.close();
+            global.close();
             inflightCount.decrementAndGet();
             if (proxy != null) {
                 // 完成代理 Future
@@ -203,7 +232,7 @@ public final class ChunkScheduler {
                     proxy.complete(result);
                 }
             }
-            // 尝试唤醒等待队列
+            // 尝试唤醒等待队列（回调运行于原版任务完成线程 = worldgen 上下文）
             drainPending();
         });
 
@@ -226,28 +255,42 @@ public final class ChunkScheduler {
     /**
      * 尝试执行等待队列中的任务。
      * <p>
-     * 从队列头部取出任务，获取 permit 后执行原版操作。
+     * 从队列头部取出任务，获取组合 permit 后执行原版操作。
      * permit 不足时停止处理，等待下一个 permit 释放时再次触发。
+     * <p>
+     * P0-4 修复：admissionPaused 时直接返回，普通任务不被启动。
+     * 依赖关键任务（当前恒为 false）理论上可旁路，防止依赖饥饿。
      */
     private void drainPending() {
         while (true) {
+            // P0-4 修复：紧急暂停时禁止启动任何普通任务
+            if (admissionPaused) {
+                return;
+            }
             PendingNoiseTask task = pendingNoiseTasks.peek();
             if (task == null) {
                 return;
             }
-            // 尝试获取 permit
-            if (!stageLimiter.tryAcquire(ChunkStatus.NOISE, task.isDependencyUnlock())) {
-                return; // permit 不足，等待下次触发
+            // 组合 lease：固定获取顺序 global → stage
+            PermitLease global = cpuGeneralPermit.tryAcquireLease();
+            if (!global.acquired()) {
+                return; // 全局 permit 不足，等待下次触发
+            }
+            PermitLease stage = stageLimiter.tryAcquireLease(ChunkStatus.NOISE, task.isDependencyUnlock());
+            if (!stage.acquired()) {
+                global.close();
+                return; // 阶段 permit 不足，等待下次触发
             }
             // 从队列移除（peek + poll 避免 permit 浪费）
             if (pendingNoiseTasks.poll() != task) {
                 // 被其他线程取走了，释放 permit 重试
-                stageLimiter.release(ChunkStatus.NOISE);
+                stage.close();
+                global.close();
                 continue;
             }
             pendingCount.decrementAndGet();
             // 执行原版操作，完成后唤醒队列
-            executeOriginal(ChunkStatus.NOISE, task.operation(), task.proxy());
+            executeOriginal(ChunkStatus.NOISE, task.operation(), task.proxy(), global, stage);
         }
     }
 
@@ -311,22 +354,44 @@ public final class ChunkScheduler {
     public int cpuPermitsMax() { return cpuGeneralPermit.maxPermits(); }
 
     /**
-     * §9.4 服务器关闭时调用：清空所有队列。
+     * §9.4 服务器关闭或维度卸载时调用：异常完成所有等待任务并清空队列。
+     * <p>
+     * 审查 P1 修复：
+     * <ul>
+     *   <li>等待队列中的任务已向原版返回代理 Future，直接丢弃会让依赖它们的区块永久等待。
+     *       此处对每个代理 Future 调用 {@code completeExceptionally(cause)}。</li>
+     *   <li>不重置 inflightCount —— 已在运行的任务仍会自然经过统一完成路径递减，
+     *       直接归零会导致计数被减成负数。</li>
+     * </ul>
+     *
+     * @param cause 清理原因（如服务器停止、维度卸载）
      */
-    public void clearAll() {
-        pendingNoiseTasks.clear();
-        pendingCount.set(0);
-        inflightCount.set(0);
+    public void clearAll(Throwable cause) {
+        PendingNoiseTask task;
+        while ((task = pendingNoiseTasks.poll()) != null) {
+            pendingCount.decrementAndGet();
+            task.proxy().completeExceptionally(cause);
+        }
         watchdog.clear();
-        SteadyChunks.LOGGER.info("SteadyChunks 调度器已清空所有队列");
+        SteadyChunks.LOGGER.info("SteadyChunks 调度器已清空所有队列（等待任务异常完成: {}）", cause.getClass().getSimpleName());
     }
 
     /**
      * 等待中的 NOISE 任务。
+     * <p>
+     * resumeExecutor 语义（审查建议）：permit 可用后通过该执行器恢复原版操作。
+     * 当前实现使用 {@link Runnable#run()}（直接执行），因为 applyStep 是纯调度函数、
+     * 不修改任何共享状态，在触发 drainPending 的线程执行是安全的。
+     * 未来接入真正的 worldgen worker executor 后替换此字段即可。
      */
     private record PendingNoiseTask(
             Supplier<CompletableFuture<ChunkResult<ChunkAccess>>> operation,
             CompletableFuture<ChunkResult<ChunkAccess>> proxy,
             boolean isDependencyUnlock
-    ) {}
+    ) {
+        /** 恢复执行器：当前直接执行（Runnable::run），预留原执行上下文接入点 */
+        java.util.concurrent.Executor resumeExecutor() {
+            return Runnable::run;
+        }
+    }
 }

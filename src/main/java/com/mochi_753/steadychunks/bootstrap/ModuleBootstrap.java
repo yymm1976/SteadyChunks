@@ -160,12 +160,16 @@ public final class ModuleBootstrap {
         ResourceGovernor.getInstance().tick();
 
         // Phase 5：FULL 整合与完成批次整形
-        long tickDeadline = System.nanoTime() + 10_000_000L; // 10ms 预算
-        FullCommitQueue.getInstance().tick(tickDeadline);
-        CompletionBatchShaper.getInstance().tick(tickDeadline);
+        // 审查修复：各自使用独立预算，避免前一个队列耗尽整个 tick 预算
+        FullCommitQueue fullQueue = FullCommitQueue.getInstance();
+        CompletionBatchShaper batchShaper = CompletionBatchShaper.getInstance();
+        fullQueue.tick(System.nanoTime() + fullQueue.budgetNanosPerTick());
+        batchShaper.tick(System.nanoTime() + batchShaper.budgetNanosPerTick());
 
-        // 发送配额每 tick 重置
-        ChunkSendQuota.getInstance().resetTick();
+        // 发送配额：每 tick 先清零，再 drain 所有玩家队列（审查修复：接通 drain/poll/send 路径）
+        ChunkSendQuota sendQuota = ChunkSendQuota.getInstance();
+        sendQuota.resetTick();
+        sendQuota.drainAll();
     }
 
     /**

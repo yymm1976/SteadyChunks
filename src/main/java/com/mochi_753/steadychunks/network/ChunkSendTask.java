@@ -23,29 +23,43 @@ public final class ChunkSendTask implements Comparable<ChunkSendTask> {
     private final UUID playerId;
     private final ChunkPos pos;
     private final long estimatedBytes;
+    /** 预计光照字节数（配额控制用，审查修复） */
+    private final long lightBytes;
     private final SendPriority priority;
     private final double distance;
     private final boolean resend;
     private final long enqueueNanos;
+    /** 实际发送动作（主线程 drain 时执行，审查修复） */
+    private final Runnable sendAction;
 
     public ChunkSendTask(UUID playerId, ChunkPos pos, long estimatedBytes,
                          SendPriority priority, double distance, boolean resend) {
+        this(playerId, pos, estimatedBytes, 0, priority, distance, resend, () -> {});
+    }
+
+    public ChunkSendTask(UUID playerId, ChunkPos pos, long estimatedBytes, long lightBytes,
+                         SendPriority priority, double distance, boolean resend, Runnable sendAction) {
         this.playerId = playerId;
         this.pos = pos;
         this.estimatedBytes = estimatedBytes;
+        this.lightBytes = lightBytes;
         this.priority = priority;
         this.distance = distance;
         this.resend = resend;
         this.enqueueNanos = System.nanoTime();
+        this.sendAction = sendAction;
     }
 
     public UUID playerId() { return playerId; }
     public ChunkPos pos() { return pos; }
     public long estimatedBytes() { return estimatedBytes; }
+    public long lightBytes() { return lightBytes; }
     public SendPriority priority() { return priority; }
     public double distance() { return distance; }
     public boolean resend() { return resend; }
     public long enqueueNanos() { return enqueueNanos; }
+    /** 实际发送动作，由 {@link ChunkSendQuota#drainPlayer} 在主线程执行 */
+    public Runnable sendAction() { return sendAction; }
 
     @Override
     public int compareTo(ChunkSendTask other) {

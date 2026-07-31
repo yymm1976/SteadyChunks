@@ -34,17 +34,20 @@ public final class StageLimiter {
 
     public StageLimiter() {
         // 初始化共享桶（每种 ResourceType 一个桶）
-        registerStage(ChunkStatus.STRUCTURE_STARTS, ResourceType.STRUCTURE_PLANNING, 2, 1);
-        registerStage(ChunkStatus.STRUCTURE_REFERENCES, ResourceType.STRUCTURE_PLANNING, 2, 1);
-        registerStage(ChunkStatus.BIOMES, ResourceType.NOISE_HEAVY, 3, 1);
-        registerStage(ChunkStatus.NOISE, ResourceType.NOISE_HEAVY, 3, 1);
-        registerStage(ChunkStatus.SURFACE, ResourceType.NOISE_HEAVY, 3, 1);
-        registerStage(ChunkStatus.CARVERS, ResourceType.FEATURES_WRITE, 2, 1);
-        registerStage(ChunkStatus.FEATURES, ResourceType.FEATURES_WRITE, 2, 1);
-        registerStage(ChunkStatus.INITIALIZE_LIGHT, ResourceType.LIGHT, 2, 1);
-        registerStage(ChunkStatus.LIGHT, ResourceType.LIGHT, 2, 1);
-        registerStage(ChunkStatus.SPAWN, ResourceType.MAIN_THREAD_COMMIT, 2, 1);
-        registerStage(ChunkStatus.FULL, ResourceType.MAIN_THREAD_COMMIT, 2, 1);
+        // 审查修复：dependencyReserve 全部设为 0。
+        // 在真正实现"依赖关键任务识别"之前，任何任务都不会标记 isDependencyUnlock=true，
+        // 若 reserve>0 且 limit 降至 1，effectiveLimit=0 会导致所有普通任务永久拿不到 permit。
+        registerStage(ChunkStatus.STRUCTURE_STARTS, ResourceType.STRUCTURE_PLANNING, 2, 0);
+        registerStage(ChunkStatus.STRUCTURE_REFERENCES, ResourceType.STRUCTURE_PLANNING, 2, 0);
+        registerStage(ChunkStatus.BIOMES, ResourceType.NOISE_HEAVY, 3, 0);
+        registerStage(ChunkStatus.NOISE, ResourceType.NOISE_HEAVY, 3, 0);
+        registerStage(ChunkStatus.SURFACE, ResourceType.NOISE_HEAVY, 3, 0);
+        registerStage(ChunkStatus.CARVERS, ResourceType.FEATURES_WRITE, 2, 0);
+        registerStage(ChunkStatus.FEATURES, ResourceType.FEATURES_WRITE, 2, 0);
+        registerStage(ChunkStatus.INITIALIZE_LIGHT, ResourceType.LIGHT, 2, 0);
+        registerStage(ChunkStatus.LIGHT, ResourceType.LIGHT, 2, 0);
+        registerStage(ChunkStatus.SPAWN, ResourceType.MAIN_THREAD_COMMIT, 2, 0);
+        registerStage(ChunkStatus.FULL, ResourceType.MAIN_THREAD_COMMIT, 2, 0);
     }
 
     /**
@@ -97,6 +100,23 @@ public final class StageLimiter {
         }
         // 普通任务：单 CAS 同时校验 reserve，消除 check-then-act 竞态
         return bucket.tryAcquireWithReserve(policy.dependencyReserve);
+    }
+
+    /**
+     * 尝试获取指定阶段的 permit，返回 {@link PermitLease}（AutoCloseable）。
+     * <p>
+     * 配合 try-with-resources 保证 permit 在正常、异常、取消路径均被释放。
+     * 保留额度语义与 {@link #tryAcquire(ChunkStatus, boolean)} 一致。
+     */
+    public PermitLease tryAcquireLease(ChunkStatus status, boolean isDependencyUnlock) {
+        StagePolicy policy = policies.get(status);
+        if (policy == null) {
+            return PermitLease.empty();
+        }
+        if (isDependencyUnlock) {
+            return policy.bucket.tryAcquireLease(0);
+        }
+        return policy.bucket.tryAcquireLease(policy.dependencyReserve);
     }
 
     /**

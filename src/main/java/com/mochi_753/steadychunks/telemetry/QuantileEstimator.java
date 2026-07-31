@@ -37,24 +37,24 @@ public final class QuantileEstimator {
     /** 桶上界（纳秒），升序 */
     private static final long[] BUCKET_BOUNDS;
     static {
-        long[] bounds = new long[42];
-        int i = 0;
-        bounds[i++] = 1_000L;          // 1μs
-        long cur = 1_000L;
-        // 1μs → 10ms（2 倍递增，约 14 桶）
-        while (cur < 10_000_000L && i < bounds.length) {
-            cur *= 2;
-            bounds[i++] = cur;
+        // 审查修复：0~200ms 使用 1ms 固定桶，可区分 40ms 目标与 48ms 硬上限。
+        // 旧设计 10ms~1s 区间按 4 倍递增，40ms 与 48ms 落在同一桶（中点约 100ms），
+        // Governor 无法可靠判断是否超过 HARD_MSPT 阈值。
+        // >200ms 继续使用 4 倍递增对数桶控制桶数量。
+        java.util.ArrayList<Long> bounds = new java.util.ArrayList<>(256);
+        for (long ms = 1; ms <= 200; ms++) {
+            bounds.add(ms * 1_000_000L);
         }
-        // 10ms → 1s（4 倍递增，约 8 桶）
-        while (cur < 1_000_000_000L && i < bounds.length) {
+        long cur = 200_000_000L;
+        while (cur < 2_000_000_000L) {
             cur *= 4;
-            bounds[i++] = cur;
+            bounds.add(cur);
         }
-        // 截断到已填入部分
-        long[] trimmed = new long[i];
-        System.arraycopy(bounds, 0, trimmed, 0, i);
-        BUCKET_BOUNDS = trimmed;
+        long[] arr = new long[bounds.size()];
+        for (int i = 0; i < arr.length; i++) {
+            arr[i] = bounds.get(i);
+        }
+        BUCKET_BOUNDS = arr;
     }
 
     /** 滑动窗口节点：每秒一个，记录该秒内的桶计数 */

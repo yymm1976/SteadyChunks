@@ -235,7 +235,8 @@ public final class LifecycleCleanupCoordinator {
      * 强制清理所有模块的状态（停服最后阶段）。
      */
     private void forceClearAll() {
-        ChunkScheduler.getInstance().clearAll();
+        // 审查修复：调度器等待任务必须异常完成代理 Future，避免区块永久等待
+        ChunkScheduler.getInstance().clearAll(new IllegalStateException("Server stopping"));
         FullCommitQueue.getInstance().clear();
         IoQueueController.getInstance().clearAll();
         LightSendCoordinator.getInstance().clearAll();

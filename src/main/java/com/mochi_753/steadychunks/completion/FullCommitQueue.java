@@ -1,7 +1,9 @@
 package com.mochi_753.steadychunks.completion;
 
 import com.mochi_753.steadychunks.SteadyChunks;
+import net.neoforged.neoforge.server.ServerLifecycleHooks;
 
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -77,34 +79,44 @@ public final class FullCommitQueue {
     }
 
     /**
-     * 提交整合任务（P0-3 线程安全修复）。
+     * 提交整合任务（P0-3 线程安全修复 + 审查线程契约修复）。
      * <p>
      * <b>线程安全修复</b>：依赖关键任务不再在提交线程直接执行，
      * 而是入 criticalQueue，由主线程 tick() 优先排空。
-     * 这样 FULL commit 始终在主线程执行，符合线程模型。
      * <p>
-     * 未启用时仍直接执行（无队列开销）。
+     * <b>审查线程契约修复</b>：
+     * <ul>
+     *   <li>禁用时不再于调用线程直接执行 commit，而是通过服务器主线程
+     *       {@code server.execute()} 执行，保持"FULL commit 必须主线程"的类契约。</li>
+     *   <li>关键队列与普通队列共享同一容量上限（queueDepth），防止依赖风暴无限增长。</li>
+     * </ul>
      *
-     * @return true 表示已接受（入队或直接执行），false 表示队列满被拒绝
+     * @return true 表示已接受（入队或已调度执行），false 表示队列满被拒绝
      */
     public boolean submit(FullCommitTask task) {
         if (!enabled.get()) {
-            // 未启用时直接执行，不延迟（审查修复：仍完成 completion Future）
-            executeCommit(task);
+            // 审查修复：禁用时经服务器主线程执行，不改变原版线程语义。
+            // ServerLifecycleHooks.getCurrentServer() 为 null（如单元测试）时退化为直接执行。
+            var server = ServerLifecycleHooks.getCurrentServer();
+            if (server != null) {
+                server.execute(() -> executeCommit(task));
+            } else {
+                executeCommit(task);
+            }
             return true;
         }
-        // 依赖关键任务：入 criticalQueue，由主线程 tick 优先执行（P0-3 线程安全）
-        if (task.dependencyCritical()) {
-            criticalQueue.offer(task);
-            return true;
-        }
-        // 容量检查
+        // 统一容量检查（critical + deferred 共享 queueDepth，审查修复：关键队列不再无限增长）
         if (queueDepth.get() >= queueCapacity) {
             totalRejected.incrementAndGet();
             SteadyChunks.LOGGER.debug("FULL 整合队列已满，拒绝: {} (depth={})", task.pos(), queueDepth.get());
             return false;
         }
-        deferredQueue.offer(task);
+        // 依赖关键任务：入 criticalQueue，由主线程 tick 优先执行（P0-3 线程安全）
+        if (task.dependencyCritical()) {
+            criticalQueue.offer(task);
+        } else {
+            deferredQueue.offer(task);
+        }
         int depth = queueDepth.incrementAndGet();
         peakBacklog.accumulateAndGet(depth, Math::max);
         return true;
@@ -135,6 +147,7 @@ public final class FullCommitQueue {
             if (task == null) {
                 break;
             }
+            queueDepth.decrementAndGet();
             long waitMs = task.queueAgeMs();
             maxWaitMs.accumulateAndGet(waitMs, Math::max);
             executeCommit(task);
@@ -208,11 +221,32 @@ public final class FullCommitQueue {
 
     /**
      * 清空队列（如世界卸载）。
+     * <p>
+     * 审查修复：不静默丢弃任务，对每个任务的 completion Future 给出明确异常，
+     * 避免依赖这些任务完成通知的调用方永久等待。
      */
     public void clear() {
-        deferredQueue.clear();
-        criticalQueue.clear();
+        CancellationException cause = new CancellationException("Server stopping / world unload");
+        FullCommitTask task;
+        while ((task = criticalQueue.poll()) != null) {
+            queueDepth.decrementAndGet();
+            completeWithCancellation(task, cause);
+        }
+        while ((task = deferredQueue.poll()) != null) {
+            queueDepth.decrementAndGet();
+            completeWithCancellation(task, cause);
+        }
         queueDepth.set(0);
+    }
+
+    /**
+     * 异常完成任务的 completion Future（如存在）。
+     */
+    private void completeWithCancellation(FullCommitTask task, CancellationException cause) {
+        CompletableFuture<Void> completion = task.completion();
+        if (completion != null) {
+            completion.completeExceptionally(cause);
+        }
     }
 
     // 配置访问器
