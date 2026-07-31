@@ -24,7 +24,23 @@ import com.mochi_753.steadychunks.scheduler.Watchdog;
  */
 public final class CrashReportContributor {
 
+    /**
+     * P0 修复（类加载时机）：模组是否已完成初始化。
+     * <p>
+     * CrashReport 可能在注册表 bootstrap 前（{@code CrashReport.preload}）生成，
+     * 此时访问 ChunkScheduler 等组件会触发 ChunkStatus/BuiltInRegistries 类加载，
+     * 抛 "Not bootstrapped" 导致 Minecraft 启动失败。就绪前跳过组件状态采集。
+     */
+    private static volatile boolean ready = false;
+
     private CrashReportContributor() {
+    }
+
+    /**
+     * 模组初始化完成后调用（{@code ModuleBootstrap}），此后崩溃报告才采集运行时状态。
+     */
+    public static void markReady() {
+        ready = true;
     }
 
     /**
@@ -33,6 +49,12 @@ public final class CrashReportContributor {
      * @return 格式化的状态字符串
      */
     public static String collectState() {
+        // P0 修复：bootstrap 前不访问任何 Minecraft 注册表依赖组件
+        if (!ready) {
+            return "\n\n-- SteadyChunks 状态 --\n"
+                    + "（模组尚未完成初始化，跳过运行时状态采集）\n"
+                    + "-- SteadyChunks 状态结束 --\n";
+        }
         StringBuilder sb = new StringBuilder();
         sb.append("\n\n-- SteadyChunks 状态 --\n");
         try {

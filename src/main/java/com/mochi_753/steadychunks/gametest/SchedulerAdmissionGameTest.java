@@ -4,18 +4,19 @@ import com.mochi_753.steadychunks.scheduler.ChunkScheduler;
 import com.mochi_753.steadychunks.scheduler.ResourceType;
 import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.gametest.framework.GameTestHelper;
+import net.minecraft.server.level.ChunkMap;
 import net.minecraft.server.level.ChunkResult;
+import net.minecraft.server.level.GenerationChunkHolder;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.neoforged.neoforge.gametest.GameTestHolder;
 
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 
 /**
- * 调度器 NOISE 准入 GameTest（审查建议的第 8 项）。
+ * 调度器 NOISE 准入 GameTest（审查建议第 8 项 + P0-3 修复）。
  * <p>
- * 在真实 Minecraft 运行环境中验证调度器核心链路（无需真实区块生成）：
+ * 在真实 Minecraft 运行环境中验证调度器核心链路：
  * <ol>
  *   <li>NOISE permit=1 时，第二个 controlAdmission 被挂起（进入等待队列）</li>
  *   <li>第一个任务完成后 permit 释放，第二个任务自动恢复并完成</li>
@@ -23,125 +24,142 @@ import java.util.concurrent.TimeUnit;
  *   <li>clearAll 异常完成所有等待任务，无永久未完成 Future</li>
  * </ol>
  * <p>
+ * P0-3 修复：用<b>未完成</b>的 CompletableFuture 占住 permit（已完成 Future 会
+ * 立即触发 whenComplete 释放 permit，无法制造等待）；断言使用
+ * {@link GameTestHelper#succeedWhen} 逐 Tick 轮询，不在服务器线程阻塞等待。
+ * <p>
+ * 并发隔离：三个测试共享全局调度器单例，必须分到不同 batch（NeoForge/vanilla
+ * 的 batch 串行执行），否则并发运行时 clearAll 会清空其他测试的等待队列。
+ * <p>
  * 运行方式：{@code ./gradlew runGameTestServer}（或 IDE run config "gameTestServer"）。
  */
 @GameTestHolder("steadychunks")
 public class SchedulerAdmissionGameTest {
 
-    @GameTest(template = "empty")
-    public void noisePermitOneShouldQueueAndResume(GameTestHelper helper) {
-        ChunkScheduler scheduler = ChunkScheduler.getInstance();
-        scheduler.setEnabled(true);
-        // 强制 NOISE 资源上限为 1（覆盖配置默认值）
-        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, 1);
-        scheduler.setAdmissionPaused(false);
-
-        try {
-            // 已完成的结果（模拟原版 applyStep 同步完成）
-            CompletableFuture<ChunkResult<ChunkAccess>> doneFuture = CompletableFuture.completedFuture(
-                    ChunkResult.of(helper.getLevel().getChunk(0, 0)));
-
-            // 1. 第一个 NOISE 任务：permit=1 可用，立即执行（返回完成 Future）
-            CompletableFuture<ChunkResult<ChunkAccess>> first = scheduler.controlAdmission(
-                    ChunkStatus.NOISE, false, () -> doneFuture);
-            helper.assertTrue(first.isDone(), "第一个 NOISE 任务应获得 permit 并立即执行");
-
-            // 2. 第二个 NOISE 任务：permit 已耗尽，应进入等待队列（代理 Future 未完成）
-            CompletableFuture<ChunkResult<ChunkAccess>> second = scheduler.controlAdmission(
-                    ChunkStatus.NOISE, false, () -> doneFuture);
-            helper.assertFalse(second.isDone(), "第二个 NOISE 任务在 permit=1 时应被挂起");
-            helper.assertTrue(scheduler.pendingCount() == 1, "等待队列深度应为 1，实际: " + scheduler.pendingCount());
-
-            // 3. 等待第一个任务完成（whenComplete 已释放 permit）并恢复第二个任务
-            try {
-                helper.assertTrue(
-                        second.get(30, TimeUnit.SECONDS) != null,
-                        "permit 释放后第二个任务应在 30 秒内恢复完成");
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new RuntimeException("等待第二个任务被中断", e);
-            } catch (java.util.concurrent.ExecutionException e) {
-                throw new RuntimeException("第二个任务异常完成", e.getCause());
-            } catch (java.util.concurrent.TimeoutException e) {
-                throw new RuntimeException("第二个任务 30 秒内未完成（可能永久挂起）", e);
-            }
-            helper.assertTrue(scheduler.pendingCount() == 0, "恢复后等待队列应清空");
-        } finally {
-            // 清理：避免影响其他测试（GameTest 会自动重置结构模板）
-            scheduler.setEnabled(false);
-            scheduler.clearAll(new IllegalStateException("GameTest cleanup"));
+    /**
+     * 获取测试用原版 ChunkMap 与一个可见区块的 GenerationChunkHolder。
+     * <p>
+     * 恢复执行通过原 worldgen mailbox 提交（P0-2），需要真实 map/holder。
+     * <p>
+     * 必须在 {@code setEnabled(true)} 之前调用：getChunk 会强制加载测试区块，
+     * 若调度器已启用，真实区块生成的 NOISE 任务会经 Mixin 进入调度器并占用
+     * permit，干扰测试自身的 controlAdmission 断言。
+     */
+    private static GenerationChunkHolder obtainHolder(GameTestHelper helper) {
+        ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
+        // 强制加载测试区块（GameTest 模板中心）
+        ChunkAccess chunk = helper.getLevel().getChunk(0, 0);
+        GenerationChunkHolder holder = map.getVisibleChunkIfPresent(chunk.getPos().toLong());
+        if (holder == null) {
+            throw new IllegalStateException("测试区块 holder 不存在: " + chunk.getPos());
         }
+        return holder;
     }
 
-    @GameTest(template = "empty")
+    /** 重置调度器全局状态，避免测试间泄漏。 */
+    private static void resetScheduler(ChunkScheduler scheduler) {
+        scheduler.setAdmissionPaused(false);
+        scheduler.setEnabled(false);
+        scheduler.clearAll(new IllegalStateException("GameTest cleanup"));
+    }
+
+    @GameTest(template = "empty", batch = "steady_noise_permit", timeoutTicks = 600)
+    public void noisePermitOneShouldQueueAndResume(GameTestHelper helper) {
+        GenerationChunkHolder holder = obtainHolder(helper);
+        ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
+
+        ChunkScheduler scheduler = ChunkScheduler.getInstance();
+        scheduler.setEnabled(true);
+        scheduler.setAdmissionPaused(false);
+        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, 1);
+
+        // 1. 第一个 NOISE 任务：permit=1 可用，立即执行。
+        // P0-3 修复：使用未完成的 Future 占住 permit（completedFuture 会立即释放 permit）。
+        CompletableFuture<ChunkResult<ChunkAccess>> firstUnderlying = new CompletableFuture<>();
+        CompletableFuture<ChunkResult<ChunkAccess>> first = scheduler.controlAdmission(
+                ChunkStatus.NOISE, false, map, holder, () -> firstUnderlying);
+        helper.assertTrue(!first.isDone(), "第一个任务应占用 permit 并保持进行中");
+
+        // 2. 第二个 NOISE 任务：permit 已耗尽，应进入等待队列（代理 Future 未完成）
+        CompletableFuture<ChunkResult<ChunkAccess>> second = scheduler.controlAdmission(
+                ChunkStatus.NOISE, false, map, holder,
+                () -> CompletableFuture.completedFuture(ChunkResult.of(helper.getLevel().getChunk(0, 0))));
+        helper.assertTrue(!second.isDone(), "第二个 NOISE 任务在 permit=1 时应被挂起");
+        helper.assertTrue(scheduler.pendingCount() == 1, "等待队列深度应为 1，实际: " + scheduler.pendingCount());
+
+        // 3. 完成第一个任务 → whenComplete 释放 permit → 第二个任务经 worldgen mailbox 恢复
+        firstUnderlying.complete(ChunkResult.of(helper.getLevel().getChunk(0, 0)));
+
+        // P0-3 修复：succeedWhen 逐 Tick 轮询，不在服务器线程阻塞等待。
+        // 清理放在回调内，确保链路完全结束后才重置全局状态。
+        helper.succeedWhen(() -> {
+            helper.assertTrue(second.isDone(), "permit 释放后第二个任务应恢复完成");
+            helper.assertTrue(scheduler.pendingCount() == 0, "恢复后等待队列应清空");
+            resetScheduler(scheduler);
+        });
+    }
+
+    @GameTest(template = "empty", batch = "steady_admission_paused", timeoutTicks = 600)
     public void admissionPausedShouldBlockNewTasks(GameTestHelper helper) {
+        GenerationChunkHolder holder = obtainHolder(helper);
+        ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
+
         ChunkScheduler scheduler = ChunkScheduler.getInstance();
         scheduler.setEnabled(true);
         scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, 2);
         scheduler.setAdmissionPaused(true);
 
-        try {
-            CompletableFuture<ChunkResult<ChunkAccess>> doneFuture = CompletableFuture.completedFuture(
-                    ChunkResult.of(helper.getLevel().getChunk(0, 0)));
+        // 暂停状态下新任务应进入等待队列，而不是执行
+        CompletableFuture<ChunkResult<ChunkAccess>> gated = scheduler.controlAdmission(
+                ChunkStatus.NOISE, false, map, holder,
+                () -> CompletableFuture.completedFuture(ChunkResult.of(helper.getLevel().getChunk(0, 0))));
+        helper.assertTrue(!gated.isDone(), "admissionPaused 时任务应被挂起");
+        helper.assertTrue(scheduler.pendingCount() == 1, "暂停时等待队列深度应为 1");
 
-            // 暂停状态下新任务应进入等待队列，而不是执行
-            CompletableFuture<ChunkResult<ChunkAccess>> gated = scheduler.controlAdmission(
-                    ChunkStatus.NOISE, false, () -> doneFuture);
-            helper.assertFalse(gated.isDone(), "admissionPaused 时任务应被挂起");
-            helper.assertTrue(scheduler.pendingCount() == 1, "暂停时等待队列深度应为 1");
-
-            // 即使 tick 多次，暂停任务也不应被 drain 启动
-            for (int i = 0; i < 5; i++) {
-                scheduler.tick();
-            }
-            helper.assertFalse(gated.isDone(), "暂停期间任务不应被 drainPending 启动");
-
-            // 恢复准入后任务应完成
-            scheduler.setAdmissionPaused(false);
-            try {
-                helper.assertTrue(
-                        gated.get(30, TimeUnit.SECONDS) != null,
-                        "恢复准入后任务应在 30 秒内完成");
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new RuntimeException("等待恢复任务被中断", e);
-            } catch (java.util.concurrent.ExecutionException e) {
-                throw new RuntimeException("恢复任务异常完成", e.getCause());
-            } catch (java.util.concurrent.TimeoutException e) {
-                throw new RuntimeException("恢复任务 30 秒内未完成（可能永久挂起）", e);
-            }
-        } finally {
-            scheduler.setEnabled(false);
-            scheduler.setAdmissionPaused(false);
-            scheduler.clearAll(new IllegalStateException("GameTest cleanup"));
+        // 即使 tick 多次，暂停任务也不应被 drain 启动
+        for (int i = 0; i < 5; i++) {
+            scheduler.tick();
         }
-    }
+        helper.assertTrue(!gated.isDone(), "暂停期间任务不应被 drain 启动");
 
-    @GameTest(template = "empty")
-    public void clearAllShouldCompleteWaitingTasks(GameTestHelper helper) {
-        ChunkScheduler scheduler = ChunkScheduler.getInstance();
-        scheduler.setEnabled(true);
-        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, 1);
+        // 恢复准入后任务应经 worldgen mailbox 完成
         scheduler.setAdmissionPaused(false);
 
-        try {
-            CompletableFuture<ChunkResult<ChunkAccess>> doneFuture = CompletableFuture.completedFuture(
-                    ChunkResult.of(helper.getLevel().getChunk(0, 0)));
+        helper.succeedWhen(() -> {
+            helper.assertTrue(gated.isDone(), "恢复准入后任务应完成");
+            helper.assertTrue(scheduler.pendingCount() == 0, "恢复后等待队列应清空");
+            resetScheduler(scheduler);
+        });
+    }
 
-            // 占满 permit，制造一个等待任务
-            scheduler.controlAdmission(ChunkStatus.NOISE, false, () -> doneFuture);
-            CompletableFuture<ChunkResult<ChunkAccess>> waiting = scheduler.controlAdmission(
-                    ChunkStatus.NOISE, false, () -> doneFuture);
-            helper.assertTrue(scheduler.pendingCount() == 1, "应存在 1 个等待任务");
+    @GameTest(template = "empty", batch = "steady_clear_all", timeoutTicks = 600)
+    public void clearAllShouldCompleteWaitingTasks(GameTestHelper helper) {
+        GenerationChunkHolder holder = obtainHolder(helper);
+        ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
 
-            // 模拟维度卸载/停服：clearAll 应异常完成等待任务
-            scheduler.clearAll(new IllegalStateException("Dimension unload"));
-            helper.assertTrue(waiting.isDone(), "clearAll 后等待任务应被完成");
-            helper.assertTrue(waiting.isCompletedExceptionally(), "clearAll 后等待任务应异常完成");
-            helper.assertTrue(scheduler.pendingCount() == 0, "clearAll 后等待队列应清空");
-        } finally {
-            scheduler.setEnabled(false);
-            scheduler.clearAll(new IllegalStateException("GameTest cleanup"));
-        }
+        ChunkScheduler scheduler = ChunkScheduler.getInstance();
+        scheduler.setEnabled(true);
+        scheduler.setAdmissionPaused(false);
+        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, 1);
+
+        // P0-3 修复：用未完成 Future 占满 permit，制造一个真正的等待任务
+        CompletableFuture<ChunkResult<ChunkAccess>> firstUnderlying = new CompletableFuture<>();
+        scheduler.controlAdmission(ChunkStatus.NOISE, false, map, holder, () -> firstUnderlying);
+
+        CompletableFuture<ChunkResult<ChunkAccess>> waiting = scheduler.controlAdmission(
+                ChunkStatus.NOISE, false, map, holder,
+                () -> CompletableFuture.completedFuture(ChunkResult.of(helper.getLevel().getChunk(0, 0))));
+        helper.assertTrue(scheduler.pendingCount() == 1, "应存在 1 个等待任务");
+
+        // 模拟维度卸载/停服：clearAll 应异常完成等待任务
+        scheduler.clearAll(new IllegalStateException("Dimension unload"));
+        helper.assertTrue(waiting.isDone(), "clearAll 后等待任务应被完成");
+        helper.assertTrue(waiting.isCompletedExceptionally(), "clearAll 后等待任务应异常完成");
+        helper.assertTrue(scheduler.pendingCount() == 0, "clearAll 后等待队列应清空");
+
+        // 完成第一个任务，避免其挂起影响后续测试
+        firstUnderlying.complete(ChunkResult.of(helper.getLevel().getChunk(0, 0)));
+        resetScheduler(scheduler);
+        helper.succeed();
     }
 }

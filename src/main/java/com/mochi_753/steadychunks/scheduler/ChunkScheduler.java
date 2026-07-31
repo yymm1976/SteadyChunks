@@ -2,12 +2,18 @@ package com.mochi_753.steadychunks.scheduler;
 
 import com.mochi_753.steadychunks.SteadyChunks;
 import com.mochi_753.steadychunks.config.CommonConfig;
+import com.mochi_753.steadychunks.mixin.server.ChunkMapAccessor;
 import net.minecraft.server.level.ChunkResult;
+import net.minecraft.server.level.ChunkTaskPriorityQueueSorter;
+import net.minecraft.server.level.GeneratingChunkMap;
+import net.minecraft.server.level.GenerationChunkHolder;
+import net.minecraft.util.thread.ProcessorHandle;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
@@ -43,6 +49,18 @@ public final class ChunkScheduler {
     /** NOISE 等待队列：permit 不足时暂存任务 */
     private final ConcurrentLinkedQueue<PendingNoiseTask> pendingNoiseTasks = new ConcurrentLinkedQueue<>();
 
+    /** P0-1 修复：单一 drainer WIP 计数（0=空闲，>0=drain 进行中），序列化所有 peek/poll */
+    private final AtomicInteger drainWip = new AtomicInteger(0);
+    /** P1-3 修复：禁用调度器时的有节奏放行模式（不再一次性同步启动全部积压任务） */
+    private final AtomicBoolean bypassMode = new AtomicBoolean(false);
+    /** P1-3：每 tick 放行的最大 bypass 任务数 */
+    private static final int BYPASS_BATCH_PER_TICK = 16;
+
+    /** P1-2：等待队列上限（防内存膨胀；超过时记录告警，由高水位指标监控） */
+    private volatile int maxPendingNoiseTasks = 512;
+    /** P1-2：等待队列历史峰值（高水位指标） */
+    private final AtomicInteger pendingHighWatermark = new AtomicInteger(0);
+
     private final ResourcePermit cpuGeneralPermit;
     private final AtomicInteger inflightCount = new AtomicInteger(0);
     private final AtomicInteger pendingCount = new AtomicInteger(0);
@@ -68,13 +86,16 @@ public final class ChunkScheduler {
 
     /**
      * 启用或关闭调度器。关闭后行为恢复原版路径。
+     * <p>
+     * P1-3 修复：关闭时不再一次性同步执行全部积压任务（会造成 CPU 与内存洪峰），
+     * 而是进入 bypassMode，由 tick() 每 tick 有节奏地放行一批任务到原 worldgen 上下文。
      */
     public void setEnabled(boolean on) {
         enabled.set(on);
         SteadyChunks.LOGGER.info("SteadyChunks 调度器: {}", on ? "enabled" : "disabled");
-        // 禁用时唤醒所有等待任务（走原版路径）
         if (!on) {
-            drainPendingForce();
+            bypassMode.set(true);
+            requestDrain();
         }
     }
 
@@ -101,9 +122,9 @@ public final class ChunkScheduler {
         if (this.admissionPaused != paused) {
             this.admissionPaused = paused;
             SteadyChunks.LOGGER.info("SteadyChunks 调度器准入: {}", paused ? "paused" : "resumed");
-            // 恢复时唤醒等待队列
+            // 恢复时唤醒等待队列（P0-1：统一走 requestDrain 单一 drainer）
             if (!paused) {
-                drainPending();
+                requestDrain();
             }
         }
     }
@@ -130,12 +151,16 @@ public final class ChunkScheduler {
      *
      * @param targetStatus       目标 ChunkStatus
      * @param isDependencyUnlock 是否为依赖解锁任务（PR1 阶段恒为 false，预留旁路）
+     * @param map                原版 GeneratingChunkMap（P0-2：恢复时提交回 worldgen mailbox）
+     * @param holder             原版 GenerationChunkHolder（P0-2：mailbox 消息按区块优先级调度）
      * @param originalOperation  原版 applyStep 操作（返回原版 Future）
      * @return 代理 Future 或原版 Future
      */
     public CompletableFuture<ChunkResult<ChunkAccess>> controlAdmission(
             ChunkStatus targetStatus,
             boolean isDependencyUnlock,
+            GeneratingChunkMap map,
+            GenerationChunkHolder holder,
             Supplier<CompletableFuture<ChunkResult<ChunkAccess>>> originalOperation) {
 
         // 调度器未启用：直接走原版路径（验收标准 §3）
@@ -150,20 +175,20 @@ public final class ChunkScheduler {
 
         // P0-4 修复：紧急暂停时普通任务进入等待队列，依赖关键任务旁路放行
         if (admissionPaused && !isDependencyUnlock) {
-            return enqueuePending(originalOperation, isDependencyUnlock);
+            return enqueuePending(originalOperation, isDependencyUnlock, map, holder);
         }
 
         // 组合 lease：固定获取顺序 global → stage
         PermitLease global = cpuGeneralPermit.tryAcquireLease();
         if (!global.acquired()) {
             // 全局 permit 不足：入队等待
-            return enqueuePending(originalOperation, isDependencyUnlock);
+            return enqueuePending(originalOperation, isDependencyUnlock, map, holder);
         }
         PermitLease stage = stageLimiter.tryAcquireLease(targetStatus, isDependencyUnlock);
         if (!stage.acquired()) {
             // 阶段 permit 不足：释放全局 permit 后入队等待
             global.close();
-            return enqueuePending(originalOperation, isDependencyUnlock);
+            return enqueuePending(originalOperation, isDependencyUnlock, map, holder);
         }
 
         // 组合 permit 获取成功：执行原版操作，完成后统一释放
@@ -171,14 +196,26 @@ public final class ChunkScheduler {
     }
 
     /**
-     * 创建代理 Future 并将任务放入等待队列。
+     * 创建代理 Future 并将任务放入等待队列（P1-2：高水位指标 + 超限告警）。
      */
     private CompletableFuture<ChunkResult<ChunkAccess>> enqueuePending(
             Supplier<CompletableFuture<ChunkResult<ChunkAccess>>> originalOperation,
-            boolean isDependencyUnlock) {
+            boolean isDependencyUnlock,
+            GeneratingChunkMap map,
+            GenerationChunkHolder holder) {
+        int depth = pendingCount.incrementAndGet();
+        // P1-2：更新高水位（历史峰值，供诊断与报警）
+        pendingHighWatermark.accumulateAndGet(depth, Math::max);
+        if (depth > maxPendingNoiseTasks) {
+            // 队列超限：不能异常完成（原版会视为生成失败）。
+            // 第一版记录告警，由 pendingHighWatermark 指标持续监控。
+            SteadyChunks.LOGGER.warn("NOISE 等待队列超限: depth={} max={}（请检查 permit 配置或跑图速度）",
+                    depth, maxPendingNoiseTasks);
+        }
         CompletableFuture<ChunkResult<ChunkAccess>> proxy = new CompletableFuture<>();
-        pendingNoiseTasks.offer(new PendingNoiseTask(originalOperation, proxy, isDependencyUnlock));
-        pendingCount.incrementAndGet();
+        pendingNoiseTasks.offer(new PendingNoiseTask(originalOperation, proxy, isDependencyUnlock, map, holder));
+        // P0-1：入队后唤醒单一 drainer
+        requestDrain();
         return proxy;
     }
 
@@ -209,7 +246,7 @@ public final class ChunkScheduler {
             stage.close();
             global.close();
             inflightCount.decrementAndGet();
-            drainPending();
+            requestDrain();
             if (proxy != null) {
                 proxy.completeExceptionally(ex);
                 return proxy;
@@ -232,8 +269,8 @@ public final class ChunkScheduler {
                     proxy.complete(result);
                 }
             }
-            // 尝试唤醒等待队列（回调运行于原版任务完成线程 = worldgen 上下文）
-            drainPending();
+            // 尝试唤醒等待队列（P0-1：只发信号，不递归进入 drain）
+            requestDrain();
         });
 
         return proxy != null ? proxy : future;
@@ -241,32 +278,82 @@ public final class ChunkScheduler {
 
     /**
      * 每 tick 调用：处理等待队列中的 NOISE 任务。
+     * <p>
+     * P1-3：禁用调度器（bypassMode）时也在 tick 推进有节奏放行。
      */
     public void tick() {
-        if (!enabled.get()) {
+        if (!enabled.get() && !bypassMode.get()) {
             return;
         }
         tickCounter++;
         watchdog.tick(tickCounter, this);
-        // 处理等待队列
-        drainPending();
+        requestDrain();
+        // bypass 队列清空后退出 bypass 模式
+        if (bypassMode.get() && pendingNoiseTasks.isEmpty() && pendingCount.get() == 0) {
+            bypassMode.set(false);
+        }
     }
 
     /**
-     * 尝试执行等待队列中的任务。
+     * P0-1 修复：请求一次 drain 处理。单一 drainer 序列化模型。
      * <p>
-     * 从队列头部取出任务，获取组合 permit 后执行原版操作。
-     * permit 不足时停止处理，等待下一个 permit 释放时再次触发。
+     * 任何时刻至多一个线程持有 drain 权（drainWip 从 0→1 者）。其他调用方只递增 WIP
+     * 计数（表示"有遗漏的工作"），不进入 drain。持有者处理完一轮后检查遗漏计数，
+     * 非零则继续，直到所有排队触发都被消费。
      * <p>
-     * P0-4 修复：admissionPaused 时直接返回，普通任务不被启动。
-     * 依赖关键任务（当前恒为 false）理论上可旁路，防止依赖饥饿。
+     * 此模型同时解决：
+     * <ul>
+     *   <li>P0-1：peek/poll 并发丢任务（只有持有者在 poll）</li>
+     *   <li>P1-1：同步完成 Future 的 whenComplete 递归 drain（回调只发信号，不递归进入）</li>
+     * </ul>
      */
-    private void drainPending() {
-        while (true) {
-            // P0-4 修复：紧急暂停时禁止启动任何普通任务
-            if (admissionPaused) {
-                return;
+    private void requestDrain() {
+        if (drainWip.getAndIncrement() != 0) {
+            return; // 已有 drainer 在处理，本次触发记入 missed
+        }
+        int missed = 1;
+        do {
+            drainOwnedPass();
+            missed = drainWip.addAndGet(-missed);
+        } while (missed != 0);
+    }
+
+    /**
+     * drain 持有者执行一轮任务处理（仅 requestDrain 的持有者调用，无并发 poll）。
+     * <p>
+     * 两种模式：
+     * <ul>
+     *   <li>正常：获取组合 permit 后，通过 {@code resumeExecutor}（worldgen mailbox）
+     *       异步提交原版操作，恢复回原执行上下文（P0-2）。</li>
+     *   <li>bypass（调度器已禁用）：不获取 permit，每轮最多放行
+     *       {@link #BYPASS_BATCH_PER_TICK} 个任务到原上下文（P1-3 有节奏恢复）。</li>
+     * </ul>
+     */
+    private void drainOwnedPass() {
+        // P0-4：紧急暂停时禁止启动任何普通任务
+        if (admissionPaused) {
+            return;
+        }
+
+        // P1-3：bypass 模式，有节奏放行（不获取 permit）
+        if (bypassMode.get()) {
+            int batch = 0;
+            while (batch < BYPASS_BATCH_PER_TICK) {
+                PendingNoiseTask task = pendingNoiseTasks.poll();
+                if (task == null) {
+                    return;
+                }
+                pendingCount.decrementAndGet();
+                // 通过原 worldgen mailbox 提交，恢复原版线程语义（不获取 permit）
+                task.resumeExecutor().execute(() ->
+                        executeOriginal(ChunkStatus.NOISE, task.operation(), task.proxy(),
+                                PermitLease.empty(), PermitLease.empty()));
+                batch++;
             }
+            return;
+        }
+
+        while (true) {
             PendingNoiseTask task = pendingNoiseTasks.peek();
             if (task == null) {
                 return;
@@ -281,45 +368,19 @@ public final class ChunkScheduler {
                 global.close();
                 return; // 阶段 permit 不足，等待下次触发
             }
-            // 从队列移除（peek + poll 避免 permit 浪费）
-            if (pendingNoiseTasks.poll() != task) {
-                // 被其他线程取走了，释放 permit 重试
+            // 单一 drainer：peek 后 poll 必然取到同一任务（无并发 poller）
+            PendingNoiseTask removed = pendingNoiseTasks.poll();
+            if (removed != task) {
+                // 防御性检查（正常不会发生）：释放 permit 重试
                 stage.close();
                 global.close();
                 continue;
             }
             pendingCount.decrementAndGet();
-            // 执行原版操作，完成后唤醒队列
-            executeOriginal(ChunkStatus.NOISE, task.operation(), task.proxy(), global, stage);
-        }
-    }
-
-    /**
-     * 禁用调度器时强制唤醒所有等待任务（走原版路径）。
-     */
-    private void drainPendingForce() {
-        PendingNoiseTask task;
-        while ((task = pendingNoiseTasks.poll()) != null) {
-            pendingCount.decrementAndGet();
-            final PendingNoiseTask finalTask = task;
-            // 直接执行原版操作，不获取 permit
-            inflightCount.incrementAndGet();
-            CompletableFuture<ChunkResult<ChunkAccess>> future;
-            try {
-                future = finalTask.operation().get();
-            } catch (Throwable ex) {
-                inflightCount.decrementAndGet();
-                finalTask.proxy().completeExceptionally(ex);
-                continue;
-            }
-            future.whenComplete((result, ex) -> {
-                inflightCount.decrementAndGet();
-                if (ex != null) {
-                    finalTask.proxy().completeExceptionally(ex);
-                } else {
-                    finalTask.proxy().complete(result);
-                }
-            });
+            // P0-2：恢复通过原 worldgen mailbox 提交，回到原执行上下文，
+            // 不直接在当前线程（可能为 Server Thread）调用 originalOperation。
+            task.resumeExecutor().execute(() ->
+                    executeOriginal(ChunkStatus.NOISE, task.operation(), task.proxy(), global, stage));
         }
     }
 
@@ -352,6 +413,13 @@ public final class ChunkScheduler {
     public int pendingCount() { return pendingCount.get(); }
     public int cpuPermitsAvailable() { return cpuGeneralPermit.availablePermits(); }
     public int cpuPermitsMax() { return cpuGeneralPermit.maxPermits(); }
+    /** P1-2：等待队列历史峰值（高水位指标，供诊断/报警） */
+    public int pendingHighWatermark() { return pendingHighWatermark.get(); }
+    /** P1-2：等待队列上限 */
+    public int maxPendingNoiseTasks() { return maxPendingNoiseTasks; }
+    public void setMaxPendingNoiseTasks(int max) { this.maxPendingNoiseTasks = Math.max(1, max); }
+    /** P1-3：是否处于有节奏放行模式（调度器已禁用且队列未清空） */
+    public boolean isBypassMode() { return bypassMode.get(); }
 
     /**
      * §9.4 服务器关闭或维度卸载时调用：异常完成所有等待任务并清空队列。
@@ -379,19 +447,29 @@ public final class ChunkScheduler {
     /**
      * 等待中的 NOISE 任务。
      * <p>
-     * resumeExecutor 语义（审查建议）：permit 可用后通过该执行器恢复原版操作。
-     * 当前实现使用 {@link Runnable#run()}（直接执行），因为 applyStep 是纯调度函数、
-     * 不修改任何共享状态，在触发 drainPending 的线程执行是安全的。
-     * 未来接入真正的 worldgen worker executor 后替换此字段即可。
+     * P0-2 修复：保存原版 {@code GeneratingChunkMap} 与 {@code GenerationChunkHolder}，
+     * {@link #resumeExecutor()} 通过原 worldgen mailbox（{@link ChunkMapAccessor}）提交恢复
+     * 操作，严格保留原执行器、原线程模型与原调用链时序。
+     * 恢复动作提交到 mailbox 后由其 worker 线程执行，不再从 Server Thread 直接调用。
      */
     private record PendingNoiseTask(
             Supplier<CompletableFuture<ChunkResult<ChunkAccess>>> operation,
             CompletableFuture<ChunkResult<ChunkAccess>> proxy,
-            boolean isDependencyUnlock
+            boolean isDependencyUnlock,
+            GeneratingChunkMap map,
+            GenerationChunkHolder holder
     ) {
-        /** 恢复执行器：当前直接执行（Runnable::run），预留原执行上下文接入点 */
-        java.util.concurrent.Executor resumeExecutor() {
-            return Runnable::run;
+        /**
+         * P0-2 修复：恢复执行器 = 原版 worldgen mailbox。
+         * <p>
+         * 与原版 {@code ChunkMap.runGenerationTask} 使用完全相同的提交方式：
+         * {@code mailbox.tell(ChunkTaskPriorityQueueSorter.message(holder, runnable))}。
+         * 任务按区块优先级调度，由 worldgen worker 线程执行。
+         */
+        Executor resumeExecutor() {
+            ProcessorHandle<ChunkTaskPriorityQueueSorter.Message<Runnable>> mailbox =
+                    ((ChunkMapAccessor) map).steady$worldgenMailbox();
+            return runnable -> mailbox.tell(ChunkTaskPriorityQueueSorter.message(holder, runnable));
         }
     }
 }

@@ -87,12 +87,14 @@ abstract class MixinChunkGenerationTask {
 
         // 交由调度器准入控制。
         // isDependencyUnlock=false：PR1 简化，不区分依赖解锁任务（保留额度已设为 0）。
-        // original.call 在包装点线程执行，与原版线程语义一致，无递归。
+        // 传入 map/holder 供调度器延迟恢复时通过原 worldgen mailbox 提交（P0-2 修复）。
         // @WrapOperation 返回 CompletableFuture<?>（泛型擦除），经 unchecked cast 适配。
         @SuppressWarnings("unchecked")
         CompletableFuture<ChunkResult<ChunkAccess>> gated = scheduler.controlAdmission(
                 step.targetStatus(),
                 false,
+                map,
+                holder,
                 () -> (CompletableFuture<ChunkResult<ChunkAccess>>) (CompletableFuture<?>) original.call(holder, step, map, cache));
         return gated;
     }

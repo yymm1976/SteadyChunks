@@ -35,10 +35,20 @@ public final class PresetApplier {
      * <b>P0-4 修复</b>：不强制设置 enabled 开关。
      * 仅当组件已被用户启用时，预设的数值参数才生效。
      * 这样用户明确关闭的模块不会被预设重新开启。
+     * <p>
+     * <b>P1-5 修复</b>：数值优先级明确二选一。
+     * {@code use_advanced_overrides=false}（默认）：预设数值覆盖下方高级配置；
+     * {@code use_advanced_overrides=true}：预设仅控制 enabled 开关，
+     * 所有数值以用户的显式配置为准（跳过预设数值应用）。
      *
      * @param preset 目标预设
      */
     public static void apply(CommonConfig.Preset preset) {
+        // P1-5：用户启用高级覆盖时，预设不再覆盖用户显式数值
+        if (CommonConfig.USE_ADVANCED_OVERRIDES.get()) {
+            SteadyChunks.LOGGER.info("SteadyChunks 预设: use_advanced_overrides=true，跳过预设数值应用（用户显式配置优先）");
+            return;
+        }
         PresetParams params = paramsFor(preset);
         // 仅应用数值参数，不改变 enabled 状态
         // enabled 完全由 CommonConfig 中的用户配置决定

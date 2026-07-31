@@ -31,23 +31,47 @@ public final class StageLimiter {
     private final EnumMap<ResourceType, ResourceBucket> buckets = new EnumMap<>(ResourceType.class);
     /** 按 ChunkStatus 索引的阶段策略（引用共享桶 + 每阶段保留额度） */
     private final ConcurrentHashMap<ChunkStatus, StagePolicy> policies = new ConcurrentHashMap<>();
+    /** P0 修复（类加载时机）：是否已完成阶段注册（惰性初始化，见 {@link #ensureInitialized}） */
+    private volatile boolean initialized = false;
 
     public StageLimiter() {
-        // 初始化共享桶（每种 ResourceType 一个桶）
-        // 审查修复：dependencyReserve 全部设为 0。
-        // 在真正实现"依赖关键任务识别"之前，任何任务都不会标记 isDependencyUnlock=true，
-        // 若 reserve>0 且 limit 降至 1，effectiveLimit=0 会导致所有普通任务永久拿不到 permit。
-        registerStage(ChunkStatus.STRUCTURE_STARTS, ResourceType.STRUCTURE_PLANNING, 2, 0);
-        registerStage(ChunkStatus.STRUCTURE_REFERENCES, ResourceType.STRUCTURE_PLANNING, 2, 0);
-        registerStage(ChunkStatus.BIOMES, ResourceType.NOISE_HEAVY, 3, 0);
-        registerStage(ChunkStatus.NOISE, ResourceType.NOISE_HEAVY, 3, 0);
-        registerStage(ChunkStatus.SURFACE, ResourceType.NOISE_HEAVY, 3, 0);
-        registerStage(ChunkStatus.CARVERS, ResourceType.FEATURES_WRITE, 2, 0);
-        registerStage(ChunkStatus.FEATURES, ResourceType.FEATURES_WRITE, 2, 0);
-        registerStage(ChunkStatus.INITIALIZE_LIGHT, ResourceType.LIGHT, 2, 0);
-        registerStage(ChunkStatus.LIGHT, ResourceType.LIGHT, 2, 0);
-        registerStage(ChunkStatus.SPAWN, ResourceType.MAIN_THREAD_COMMIT, 2, 0);
-        registerStage(ChunkStatus.FULL, ResourceType.MAIN_THREAD_COMMIT, 2, 0);
+        // 构造器不引用 ChunkStatus：CrashReport 可能在注册表 bootstrap 前触发
+        // ChunkScheduler.getInstance()，此时访问 ChunkStatus 会触发 BuiltInRegistries
+        // 类初始化并抛 "Not bootstrapped"，导致整个 Minecraft 启动失败。
+        // 阶段注册惰性延迟到首次实际使用（ensureInitialized）。
+    }
+
+    /**
+     * P0 修复（类加载时机）：惰性注册阶段映射。
+     * <p>
+     * 仅在首次需要 ChunkStatus 映射时初始化。初始化后 ChunkStatus 类已加载
+     * （运行期必然在 bootstrap 之后），因此不会触发类初始化错误。
+     */
+    private void ensureInitialized() {
+        if (initialized) {
+            return;
+        }
+        synchronized (this) {
+            if (initialized) {
+                return;
+            }
+            // 初始化共享桶（每种 ResourceType 一个桶）
+            // 审查修复：dependencyReserve 全部设为 0。
+            // 在真正实现"依赖关键任务识别"之前，任何任务都不会标记 isDependencyUnlock=true，
+            // 若 reserve>0 且 limit 降至 1，effectiveLimit=0 会导致所有普通任务永久拿不到 permit。
+            registerStage(ChunkStatus.STRUCTURE_STARTS, ResourceType.STRUCTURE_PLANNING, 2, 0);
+            registerStage(ChunkStatus.STRUCTURE_REFERENCES, ResourceType.STRUCTURE_PLANNING, 2, 0);
+            registerStage(ChunkStatus.BIOMES, ResourceType.NOISE_HEAVY, 3, 0);
+            registerStage(ChunkStatus.NOISE, ResourceType.NOISE_HEAVY, 3, 0);
+            registerStage(ChunkStatus.SURFACE, ResourceType.NOISE_HEAVY, 3, 0);
+            registerStage(ChunkStatus.CARVERS, ResourceType.FEATURES_WRITE, 2, 0);
+            registerStage(ChunkStatus.FEATURES, ResourceType.FEATURES_WRITE, 2, 0);
+            registerStage(ChunkStatus.INITIALIZE_LIGHT, ResourceType.LIGHT, 2, 0);
+            registerStage(ChunkStatus.LIGHT, ResourceType.LIGHT, 2, 0);
+            registerStage(ChunkStatus.SPAWN, ResourceType.MAIN_THREAD_COMMIT, 2, 0);
+            registerStage(ChunkStatus.FULL, ResourceType.MAIN_THREAD_COMMIT, 2, 0);
+            initialized = true;
+        }
     }
 
     /**
@@ -89,6 +113,7 @@ public final class StageLimiter {
      * @return true 表示获取成功
      */
     public boolean tryAcquire(ChunkStatus status, boolean isDependencyUnlock) {
+        ensureInitialized();
         StagePolicy policy = policies.get(status);
         if (policy == null) {
             return false;
@@ -109,6 +134,7 @@ public final class StageLimiter {
      * 保留额度语义与 {@link #tryAcquire(ChunkStatus, boolean)} 一致。
      */
     public PermitLease tryAcquireLease(ChunkStatus status, boolean isDependencyUnlock) {
+        ensureInitialized();
         StagePolicy policy = policies.get(status);
         if (policy == null) {
             return PermitLease.empty();
@@ -123,6 +149,7 @@ public final class StageLimiter {
      * 释放指定阶段的 permit。
      */
     public void release(ChunkStatus status) {
+        ensureInitialized();
         StagePolicy policy = policies.get(status);
         if (policy != null) {
             policy.bucket.release();
@@ -133,6 +160,7 @@ public final class StageLimiter {
      * 获取指定阶段的 permit 信息（诊断用，返回包装 ResourcePermit）。
      */
     public ResourcePermit permit(ChunkStatus status) {
+        ensureInitialized();
         StagePolicy policy = policies.get(status);
         if (policy == null) {
             return null;
@@ -150,6 +178,7 @@ public final class StageLimiter {
      * ChunkStatus 连续写入同一桶导致最终值依赖遍历顺序。
      */
     public void setStageLimit(ChunkStatus status, int max) {
+        ensureInitialized();
         StagePolicy policy = policies.get(status);
         if (policy != null) {
             policy.bucket.setMaxPermits(max);
@@ -164,6 +193,7 @@ public final class StageLimiter {
      * 导致最终值依赖遍历顺序。
      */
     public void setResourceLimit(ResourceType resource, int max) {
+        ensureInitialized();
         ResourceBucket bucket = buckets.get(resource);
         if (bucket != null) {
             bucket.setMaxPermits(max);
@@ -174,6 +204,7 @@ public final class StageLimiter {
      * P0-3 修复：查询 ChunkStatus 对应的 ResourceType（Governor 聚合用）。
      */
     public ResourceType resourceTypeOf(ChunkStatus status) {
+        ensureInitialized();
         StagePolicy policy = policies.get(status);
         return policy != null ? policy.resource : null;
     }
@@ -182,6 +213,7 @@ public final class StageLimiter {
      * 设置阶段依赖保留 permit 数量。
      */
     public void setStageDependencyReserve(ChunkStatus status, int reserve) {
+        ensureInitialized();
         StagePolicy policy = policies.get(status);
         if (policy != null) {
             policy.dependencyReserve = reserve;
@@ -192,6 +224,7 @@ public final class StageLimiter {
      * 返回所有阶段的当前状态快照，供诊断导出。
      */
     public Map<ChunkStatus, int[]> snapshot() {
+        ensureInitialized();
         Map<ChunkStatus, int[]> out = new HashMap<>();
         for (var entry : policies.entrySet()) {
             StagePolicy p = entry.getValue();

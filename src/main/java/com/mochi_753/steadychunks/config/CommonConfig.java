@@ -26,6 +26,8 @@ import net.neoforged.neoforge.common.ModConfigSpec;
 public final class CommonConfig {
     public static final ModConfigSpec.BooleanValue ENABLED;
     public static final ModConfigSpec.EnumValue<Preset> PRESET;
+    /** P1-5 修复：高级覆盖开关。true 时预设不覆盖用户在 [scheduler]/[stage_limits] 等处的显式数值配置。 */
+    public static final ModConfigSpec.BooleanValue USE_ADVANCED_OVERRIDES;
     public static final ModConfigSpec.BooleanValue STRICT_COMPATIBILITY;
 
     public static final ModConfigSpec.EnumValue<CompatMode> FASTNOISE;
@@ -90,6 +92,8 @@ public final class CommonConfig {
                 .define("enabled", true);
         PRESET = builder.comment("预设：smooth_integrated（单人冒险整合包）/ balanced（普通服务器）/ throughput_server（独立服务器或预生成）")
                 .defineEnum("preset", Preset.SMOOTH_INTEGRATED);
+        USE_ADVANCED_OVERRIDES = builder.comment("P1-5：高级数值覆盖。false（默认）= 预设数值覆盖下方高级配置；true = 预设仅控制 enabled 开关，所有数值以你的显式配置为准")
+                .define("use_advanced_overrides", false);
         STRICT_COMPATIBILITY = builder.comment("严格兼容模式：检测到无法确认的兼容性时关闭优化而非猜测")
                 .define("strict_compatibility", true);
         builder.pop();

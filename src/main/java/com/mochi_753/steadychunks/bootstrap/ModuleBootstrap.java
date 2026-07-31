@@ -11,6 +11,7 @@ import com.mochi_753.steadychunks.governor.RunMode;
 import com.mochi_753.steadychunks.network.ChunkSendQuota;
 import com.mochi_753.steadychunks.network.SteadyChunksPayloads;
 import com.mochi_753.steadychunks.config.PresetApplier;
+import com.mochi_753.steadychunks.diagnostics.CrashReportContributor;
 import com.mochi_753.steadychunks.scheduler.ChunkScheduler;
 import com.mochi_753.steadychunks.structure.CacheInvalidationReloadListener;
 import com.mochi_753.steadychunks.telemetry.ChunkFlightRecorder;
@@ -40,6 +41,11 @@ public final class ModuleBootstrap {
      */
     public static void bootstrap(IEventBus modEventBus, ModContainer container) {
         SteadyChunks.LOGGER.info("SteadyChunks bootstrap：开始兼容性探测");
+
+        // 0. P0 修复（类加载时机）：标记崩溃报告采集就绪。
+        // 必须在任何组件可能被 CrashReport.preload 触达之前完成；
+        // 本方法运行于 FML 构造阶段（bootstrap 之后），此时注册表已就绪。
+        CrashReportContributor.markReady();
 
         // 1. 探测兼容性
         ModuleStates states = CompatibilityProbe.probe();

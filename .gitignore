@@ -36,6 +36,7 @@ Desktop.ini
 # Forge / NeoForge
 run/
 runs/
+run-server/
 logs/
 crash-reports/
 saves/

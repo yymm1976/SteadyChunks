@@ -6,6 +6,7 @@
   "mixins": [
     "telemetry.MixinMinecraftServer",
     "diagnostics.MixinCrashReport",
+    "server.ChunkMapAccessor",
     "server.MixinChunkGenerationTask"
   ],
   "client": [

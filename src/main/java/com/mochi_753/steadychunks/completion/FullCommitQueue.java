@@ -58,6 +58,8 @@ public final class FullCommitQueue {
     private final AtomicLong maxWaitMs = new AtomicLong(0);
 
     private final AtomicBoolean enabled = new AtomicBoolean(false);
+    /** P1-4 修复：任务接收开关。clear() 时先置 false，拒绝并发新提交，再清理队列。 */
+    private final AtomicBoolean acceptingTasks = new AtomicBoolean(true);
 
     private FullCommitQueue() {
     }
@@ -94,6 +96,11 @@ public final class FullCommitQueue {
      * @return true 表示已接受（入队或已调度执行），false 表示队列满被拒绝
      */
     public boolean submit(FullCommitTask task) {
+        // P1-4：生命周期屏障 —— clear() 后不再接收新任务
+        if (!acceptingTasks.get()) {
+            totalRejected.incrementAndGet();
+            return false;
+        }
         if (!enabled.get()) {
             // 审查修复：禁用时经服务器主线程执行，不改变原版线程语义。
             // ServerLifecycleHooks.getCurrentServer() 为 null（如单元测试）时退化为直接执行。
@@ -105,21 +112,44 @@ public final class FullCommitQueue {
             }
             return true;
         }
-        // 统一容量检查（critical + deferred 共享 queueDepth，审查修复：关键队列不再无限增长）
-        if (queueDepth.get() >= queueCapacity) {
+        // P1-4 修复：CAS 原子预留容量（消除 check-then-act 竞态，多提交线程不会超限入队）
+        if (!reserveQueueSlot()) {
             totalRejected.incrementAndGet();
             SteadyChunks.LOGGER.debug("FULL 整合队列已满，拒绝: {} (depth={})", task.pos(), queueDepth.get());
             return false;
         }
         // 依赖关键任务：入 criticalQueue，由主线程 tick 优先执行（P0-3 线程安全）
-        if (task.dependencyCritical()) {
-            criticalQueue.offer(task);
-        } else {
-            deferredQueue.offer(task);
+        boolean offered = task.dependencyCritical()
+                ? criticalQueue.offer(task)
+                : deferredQueue.offer(task);
+        if (!offered) {
+            // 入队失败：回滚预留容量
+            queueDepth.decrementAndGet();
+            totalRejected.incrementAndGet();
+            return false;
         }
-        int depth = queueDepth.incrementAndGet();
-        peakBacklog.accumulateAndGet(depth, Math::max);
+        peakBacklog.accumulateAndGet(queueDepth.get(), Math::max);
         return true;
+    }
+
+    /**
+     * P1-4 修复：CAS 原子预留一个队列槽位。
+     * <p>
+     * 旧实现"检查 queueDepth >= capacity 后再 incrementAndGet"存在 check-then-act 竞态：
+     * 多个提交线程可同时通过检查后全部入队，导致队列超过上限。
+     *
+     * @return true 表示预留成功（调用方必须随后入队并计入实际深度）
+     */
+    private boolean reserveQueueSlot() {
+        while (true) {
+            int current = queueDepth.get();
+            if (current >= queueCapacity) {
+                return false;
+            }
+            if (queueDepth.compareAndSet(current, current + 1)) {
+                return true;
+            }
+        }
     }
 
     /**
@@ -224,8 +254,13 @@ public final class FullCommitQueue {
      * <p>
      * 审查修复：不静默丢弃任务，对每个任务的 completion Future 给出明确异常，
      * 避免依赖这些任务完成通知的调用方永久等待。
+     * <p>
+     * P1-4 修复：先置 acceptingTasks=false 拒绝并发新提交（生命周期屏障），
+     * 再清理队列，避免清理后并发提交被 queueDepth.set(0) 错误覆盖计数。
      */
     public void clear() {
+        // 生命周期屏障：拒绝新任务（停服/卸载场景语义正确）
+        acceptingTasks.set(false);
         CancellationException cause = new CancellationException("Server stopping / world unload");
         FullCommitTask task;
         while ((task = criticalQueue.poll()) != null) {
@@ -237,6 +272,8 @@ public final class FullCommitQueue {
             completeWithCancellation(task, cause);
         }
         queueDepth.set(0);
+        // 停服清理完成：允许后续提交（如单测/世界重载场景）
+        acceptingTasks.set(true);
     }
 
     /**
