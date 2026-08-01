@@ -2,6 +2,7 @@ package com.mochi_753.steadychunks.scheduler;
 
 import com.mochi_753.steadychunks.SteadyChunks;
 import com.mochi_753.steadychunks.config.CommonConfig;
+import com.mochi_753.steadychunks.io.LifecycleCleanupCoordinator;
 import com.mochi_753.steadychunks.mixin.server.ChunkMapAccessor;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.level.ChunkMap;
@@ -16,6 +17,7 @@ import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
@@ -95,6 +97,13 @@ public final class ChunkScheduler {
      * 入队后二次校验代数，捕获"清理期间并发入队"的任务并异常完成。
      */
     private final AtomicLong lifecycleGeneration = new AtomicLong(0);
+    /**
+     * P0 修复（第 7 轮）：每维度生命周期状态（独立于全局 generation）。
+     * 维度卸载时关闭该维度接收并递增维度代数，使已出队/已提交 mailbox 但未运行的
+     * 任务在运行前被 {@link #lifecycleValid} 拒绝；不影响其他维度的任务。
+     * {@link #openDimension} 在维度重新加载时恢复。
+     */
+    private final ConcurrentHashMap<ResourceKey<Level>, DimensionLifecycle> dimensionLifecycles = new ConcurrentHashMap<>();
 
     /** P1 修复（第 4 轮）：Mixin 拦截计数（controlAdmission 接管 NOISE 的次数，真实生成测试断言用） */
     private final AtomicLong mixinInterceptCount = new AtomicLong(0);
@@ -237,6 +246,14 @@ public final class ChunkScheduler {
             return originalOperation.get();
         }
 
+        // P1 修复（第 7 轮）：无法从生成上下文解析维度时 fail-open 走原版。
+        // 不抛异常（会破坏 Mixin 调用链），也不错误归入默认维度（卸载时无法定向取消、
+        // 诊断归类错误）。正常实现为 ChunkMap，此分支仅防御第三方/测试替换实现。
+        ResourceKey<Level> dimension = dimensionOf(map, holder);
+        if (dimension == null) {
+            return originalOperation.get();
+        }
+
         // P1 修复（第 5 轮）：生命周期关闭时不接受新任务。排队路径（enqueuePending）
         // 已有检查，此处覆盖"直接获 permit 立即执行"的路径，保证 closeForShutdown
         // 后不再启动新任务。
@@ -275,20 +292,20 @@ public final class ChunkScheduler {
 
         // P0-4 修复：紧急暂停时普通任务进入等待队列，依赖关键任务旁路放行
         if (admissionPaused && !isDependencyUnlock) {
-            return enqueuePending(originalOperation, isDependencyUnlock, map, holder);
+            return enqueuePending(originalOperation, isDependencyUnlock, map, holder, dimension);
         }
 
         // 组合 lease：固定获取顺序 global → stage
         PermitLease global = cpuGeneralPermit.tryAcquireLease();
         if (!global.acquired()) {
             // 全局 permit 不足：入队等待
-            return enqueuePending(originalOperation, isDependencyUnlock, map, holder);
+            return enqueuePending(originalOperation, isDependencyUnlock, map, holder, dimension);
         }
         PermitLease stage = stageLimiter.tryAcquireLease(targetStatus, isDependencyUnlock);
         if (!stage.acquired()) {
             // 阶段 permit 不足：释放全局 permit 后入队等待
             global.close();
-            return enqueuePending(originalOperation, isDependencyUnlock, map, holder);
+            return enqueuePending(originalOperation, isDependencyUnlock, map, holder, dimension);
         }
 
         // 组合 permit 获取成功：执行原版操作，完成后统一释放
@@ -345,14 +362,23 @@ public final class ChunkScheduler {
             Supplier<CompletableFuture<ChunkResult<ChunkAccess>>> originalOperation,
             boolean isDependencyUnlock,
             GeneratingChunkMap map,
-            GenerationChunkHolder holder) {
+            GenerationChunkHolder holder,
+            ResourceKey<Level> dimension) {
         // P0 修复（第 4 轮）：生命周期停止接收时拒绝入队（停服/卸载场景，原版同步关闭中，
         // 返回 error result 等价于生成失败但不触发致命异常，不会残留永久等待的代理 Future）。
         if (!acceptingTasks.get()) {
             return CompletableFuture.completedFuture(
                     ChunkResult.error("SteadyChunks 调度器已停止接收任务"));
         }
+        // P0 修复（第 7 轮）：维度卸载期间拒绝该维度新任务入队。
+        DimensionLifecycle dimensionState =
+                dimensionLifecycles.computeIfAbsent(dimension, ignored -> new DimensionLifecycle());
+        if (!dimensionState.accepting.get()) {
+            return CompletableFuture.completedFuture(
+                    ChunkResult.error("SteadyChunks 维度正在卸载"));
+        }
         long generation = lifecycleGeneration.get();
+        long dimensionGeneration = dimensionState.generation.get();
         int depth = pendingCount.incrementAndGet();
         // P1-2：更新高水位（历史峰值，供诊断与报警）
         pendingHighWatermark.accumulateAndGet(depth, Math::max);
@@ -377,14 +403,20 @@ public final class ChunkScheduler {
         CompletableFuture<ChunkResult<ChunkAccess>> proxy = new CompletableFuture<>();
         PendingNoiseTask task = new PendingNoiseTask(
                 originalOperation, proxy, isDependencyUnlock, map, holder,
-                dimensionOf(map), generation);
+                dimension, generation, dimensionGeneration);
         pendingNoiseTasks.offer(task);
+        // 注册维度待办计数（泄漏检测：维度卸载后该维度待办任务应全部取消）。
+        // shutdownMode 下 registerTask 返回 false（不计数），对应后续不注销。
+        boolean registered = LifecycleCleanupCoordinator.getInstance().registerTask(dimension);
         // P0 修复（第 4 轮）：入队后二次校验生命周期。若清理已在入队与检查之间发生
         // （generation 变化或停止接收），移除任务并以 error result 正常完成（第 5 轮修复：
         // 异常完成会让原版 setFatalException，破坏真实区块生成链），避免残留。
         if (!acceptingTasks.get() || generation != lifecycleGeneration.get()) {
             if (pendingNoiseTasks.remove(task)) {
                 pendingCount.updateAndGet(v -> Math.max(0, v - 1));
+                if (registered) {
+                    LifecycleCleanupCoordinator.getInstance().unregisterTask(dimension);
+                }
                 proxy.complete(ChunkResult.error("SteadyChunks 调度器生命周期已变化"));
             }
         }
@@ -533,6 +565,8 @@ public final class ChunkScheduler {
                 return;
             }
             pendingCount.decrementAndGet();
+            // 任务离开等待队列：注销维度待办计数（不再属于"待办"）
+            LifecycleCleanupCoordinator.getInstance().unregisterTask(task.dimension());
             // 通过原 worldgen mailbox 提交，恢复原版线程语义（不获取 permit）。
             // P0-1 修复（第 5 轮）：提交失败由 submitResumed 统一兜底。
             submitResumed(task, PermitLease.empty(), PermitLease.empty());
@@ -572,6 +606,8 @@ public final class ChunkScheduler {
                 return;
             }
             pendingCount.decrementAndGet();
+            // 任务离开等待队列：注销维度待办计数（不再属于"待办"）
+            LifecycleCleanupCoordinator.getInstance().unregisterTask(removed.dimension());
             // P0-2：恢复通过原 worldgen mailbox 提交，回到原执行上下文，
             // 不直接在当前线程（可能为 Server Thread）调用 originalOperation。
             submitResumed(removed, global, stage);
@@ -629,10 +665,24 @@ public final class ChunkScheduler {
     }
 
     /**
-     * P0-2 修复（第 6 轮）：生命周期有效性判断——调度器仍在接收任务且任务入队代数未过期。
+     * P0-2 修复（第 6 轮）+ P0（第 7 轮）：生命周期有效性判断。
+     * <p>
+     * 第 7 轮起同时校验全局与维度两层生命周期：
+     * <ul>
+     *   <li>全局：调度器仍在接收任务且任务入队代数未过期（closeForShutdown/resetForReload）；</li>
+     *   <li>维度：维度仍在接收且任务入队时的维度代数未过期（维度卸载 cancelDimension 会
+     *       关闭该维度接收并递增维度代数）。</li>
+     * </ul>
+     * 这样维度卸载发生在"任务已 poll 出队/已提交 mailbox 但未运行"时，任务仍会被拒绝，
+     * 不依赖全局 generation（避免连带取消其他维度的任务）。
      */
     private boolean lifecycleValid(PendingNoiseTask task) {
-        return acceptingTasks.get() && task.lifecycleGeneration() == lifecycleGeneration.get();
+        if (!acceptingTasks.get() || task.globalGeneration() != lifecycleGeneration.get()) {
+            return false;
+        }
+        DimensionLifecycle state = dimensionLifecycles.get(task.dimension());
+        return state != null && state.accepting.get()
+                && task.dimensionGeneration() == state.generation.get();
     }
 
     /**
@@ -656,42 +706,69 @@ public final class ChunkScheduler {
     }
 
     /**
-     * P1-1 修复（第 6 轮）：从生成上下文提取维度（用于维度级定向取消）。
-     * GeneratingChunkMap 接口不暴露 level，实际实现为 ChunkMap，其 level 字段
-     * 为包私有，经 {@link ChunkMapAccessor#steady$level()} 访问。
+     * P1 修复（第 7 轮）：从任务所属的生成上下文提取维度（用于维度级定向取消）。
+     * <p>
+     * 优先从 map（实际实现为 {@link ChunkMap}）取 level：真实 NOISE applyStep 阶段
+     * holder 尚未持有 chunk（{@code getLatestChunk()} 返回 null），ChunkMap 的 level
+     * 始终可用。非 ChunkMap 实现回退到 holder 的 chunk。无法识别时返回 {@code null}
+     * （调用方 fail-open 走原版）——不抛异常（破坏 Mixin 调用链）、也不错误归入默认维度。
      */
-    private static ResourceKey<Level> dimensionOf(GeneratingChunkMap map) {
+    private static ResourceKey<Level> dimensionOf(GeneratingChunkMap map, GenerationChunkHolder holder) {
         if (map instanceof ChunkMap) {
             ServerLevel level = ((ChunkMapAccessor) map).steady$level();
             if (level != null) {
                 return level.dimension();
             }
         }
-        return Level.OVERWORLD; // 兜底：无法识别维度时归入主世界
+        if (holder != null) {
+            ChunkAccess chunk = holder.getLatestChunk();
+            if (chunk != null && chunk.getLevel() != null) {
+                return chunk.getLevel().dimension();
+            }
+        }
+        return null;
     }
 
     /**
-     * P1-1 修复（第 6 轮）：维度卸载时定向取消该维度的所有等待任务。
+     * P1-1 修复（第 6/7 轮）：维度卸载时定向取消该维度的所有等待任务。
      * <p>
-     * 等待任务持有 {@code GeneratingChunkMap} / {@code GenerationChunkHolder} / 原始操作 /
-     * 代理 Future。若维度已卸载仍留在队列，会持续持有已卸载维度的生成上下文，且 mailbox
-     * 恢复可能发生在维度卸载之后。逐任务按维度过滤并以 error result 正常完成（避免 fatal）。
-     * 已出队（inflight/mailbox 中）的任务不在队列中，由 {@link #submitResumed} 的生命周期
-     * 校验在运行前拒绝。
+     * 第 7 轮修复：先关闭该维度生命周期（{@code accepting=false} + 递增维度代数），
+     * 使<b>已 poll 出队 / 已提交 mailbox 但尚未运行</b>的任务在运行前被
+     * {@link #lifecycleValid} 拒绝（该窗口不依赖全局 generation，避免连带取消
+     * 其他维度的任务）。仍在等待队列中的任务被直接移除并以 error result 正常完成
+     * （避免 fatal）。已进入 {@code executeOriginal} 的任务不强制中断，自然结束。
      *
      * @param dimension 目标维度
      * @param reason    取消原因（error result 文案）
      */
     public void cancelDimension(ResourceKey<Level> dimension, String reason) {
+        DimensionLifecycle state =
+                dimensionLifecycles.computeIfAbsent(dimension, ignored -> new DimensionLifecycle());
+        state.accepting.set(false);
+        state.generation.incrementAndGet();
         pendingNoiseTasks.removeIf(task -> {
             if (!dimension.equals(task.dimension())) {
                 return false;
             }
             pendingCount.updateAndGet(v -> Math.max(0, v - 1));
+            LifecycleCleanupCoordinator.getInstance().unregisterTask(dimension);
             task.proxy().complete(ChunkResult.error(reason));
             return true;
         });
         requestDrain();
+    }
+
+    /**
+     * P0 修复（第 7 轮）：维度重新加载时恢复该维度的生命周期（维度加载事件调用）。
+     * <p>
+     * 递增维度代数使卸载前入队、已出队但未运行的任务全部失效（运行前被拒绝）；
+     * 恢复接收标志允许该维度新任务入队。
+     */
+    public void openDimension(ResourceKey<Level> dimension) {
+        DimensionLifecycle state =
+                dimensionLifecycles.computeIfAbsent(dimension, ignored -> new DimensionLifecycle());
+        state.generation.incrementAndGet();
+        state.accepting.set(true);
     }
 
     /**
@@ -806,6 +883,8 @@ public final class ChunkScheduler {
         PendingNoiseTask task;
         while ((task = pendingNoiseTasks.poll()) != null) {
             pendingCount.updateAndGet(v -> Math.max(0, v - 1));
+            // 任务被清理：注销维度待办计数
+            LifecycleCleanupCoordinator.getInstance().unregisterTask(task.dimension());
             // P2 修复（第 5 轮）：以 error result 正常完成（而非异常完成）。
             // 原版 GenerationChunkHolder.lambda$applyStep$0 的 handle 会把异常完成视为
             // 致命错误（MinecraftServer.setFatalException），导致真实区块生成链中断、
@@ -832,9 +911,12 @@ public final class ChunkScheduler {
             GenerationChunkHolder holder,
             // P1-1 修复（第 6 轮）：任务所属维度，用于维度级定向取消（cancelDimension）。
             ResourceKey<Level> dimension,
-            // P0-2 修复（第 6 轮）：任务入队时的生命周期代数。出队/提交/运行前校验
+            // P0-2 修复（第 6 轮）：任务入队时的全局生命周期代数。出队/提交/运行前校验
             // 代数未变化，关闭或重置后拒绝执行，防止已出队任务在关闭后启动。
-            long lifecycleGeneration
+            long globalGeneration,
+            // P0 修复（第 7 轮）：任务入队时的维度生命周期代数。维度卸载会递增维度代数
+            // 并关闭接收，已出队/已提交但未运行的任务经 lifecycleValid 拒绝（不依赖全局）。
+            long dimensionGeneration
     ) {
         /**
          * P0-2 修复：恢复执行器 = 原版 worldgen mailbox。
@@ -848,5 +930,16 @@ public final class ChunkScheduler {
                     ((ChunkMapAccessor) map).steady$worldgenMailbox();
             return runnable -> mailbox.tell(ChunkTaskPriorityQueueSorter.message(holder, runnable));
         }
+    }
+
+    /**
+     * P0 修复（第 7 轮）：单维度生命周期状态。
+     * <p>
+     * {@code accepting} 表示维度是否接收新任务（维度卸载置 false，重新加载置 true）；
+     * {@code generation} 为维度代数，每次卸载/重新加载递增，使旧代数的任务失效。
+     */
+    private static final class DimensionLifecycle {
+        final AtomicLong generation = new AtomicLong();
+        final AtomicBoolean accepting = new AtomicBoolean(true);
     }
 }

@@ -9,6 +9,7 @@ import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.level.ChunkMap;
 import net.minecraft.server.level.ChunkResult;
 import net.minecraft.server.level.GenerationChunkHolder;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.chunk.ChunkAccess;
@@ -58,9 +59,17 @@ public class SchedulerAdmissionGameTest {
      * permit，干扰测试自身的 controlAdmission 断言。
      */
     private static GenerationChunkHolder obtainHolder(GameTestHelper helper) {
-        ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
-        // 强制加载测试区块（GameTest 模板中心）
-        ChunkAccess chunk = helper.getLevel().getChunk(0, 0);
+        return obtainHolderForLevel(helper.getLevel());
+    }
+
+    /**
+     * 获取指定维度（ServerLevel）的测试用 ChunkMap 与 (0,0) 区块的 GenerationChunkHolder。
+     * 必须在 {@code setEnabled(true)} 之前调用（真实生成会被调度器拦截并占用 permit）。
+     */
+    private static GenerationChunkHolder obtainHolderForLevel(ServerLevel level) {
+        ChunkMap map = level.getChunkSource().chunkMap;
+        // 强制加载测试区块
+        ChunkAccess chunk = level.getChunk(0, 0);
         GenerationChunkHolder holder = map.getVisibleChunkIfPresent(chunk.getPos().toLong());
         if (holder == null) {
             throw new IllegalStateException("测试区块 holder 不存在: " + chunk.getPos());
@@ -499,6 +508,9 @@ public class SchedulerAdmissionGameTest {
         helper.assertTrue(!waitingB.join().isSuccess(), "任务 B 应以 error result 完成");
         helper.assertTrue(scheduler.pendingCount() == 0, "目标维度取消后队列应清空");
 
+        // 恢复目标维度生命周期（cancelDimension 关闭了该维度接收，后续测试仍使用主世界）
+        scheduler.openDimension(overworld);
+
         // 完成第一个任务，避免其挂起影响后续测试
         firstUnderlying.complete(ChunkResult.of(helper.getLevel().getChunk(0, 0)));
         resetScheduler(scheduler);
@@ -543,5 +555,144 @@ public class SchedulerAdmissionGameTest {
         limiter.setResourceLimit(ResourceType.NOISE_HEAVY, 3);
         resetScheduler(scheduler);
         helper.succeed();
+    }
+
+    /**
+     * P1-1 修复验证（第 7 轮）：真实双维度隔离——卸载下界只取消下界任务，
+     * 主世界任务不受影响并正常完成。
+     */
+    @GameTest(template = "empty", batch = "steady_dim_isolation", timeoutTicks = 600)
+    public void dimensionUnloadShouldCancelOnlyTargetDimension(GameTestHelper helper) {
+        ServerLevel overworld = helper.getLevel();
+        ServerLevel nether = overworld.getServer().getLevel(Level.NETHER);
+        helper.assertTrue(nether != null, "下界应已加载");
+
+        // setEnabled 前获取各维度 holder 与区块引用（避免调度器拦截真实生成）
+        GenerationChunkHolder overworldHolder = obtainHolderForLevel(overworld);
+        GenerationChunkHolder netherHolder = obtainHolderForLevel(nether);
+        ChunkMap overworldMap = overworld.getChunkSource().chunkMap;
+        ChunkMap netherMap = nether.getChunkSource().chunkMap;
+        ChunkAccess overworldChunk = overworld.getChunk(0, 0);
+        ChunkAccess netherChunk = nether.getChunk(0, 0);
+
+        ChunkScheduler scheduler = ChunkScheduler.getInstance();
+        scheduler.setEnabled(true);
+        scheduler.setAdmissionPaused(false);
+        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, 1);
+
+        // 占唯一 NOISE permit 的任务（主世界，未完成）
+        CompletableFuture<ChunkResult<ChunkAccess>> firstUnderlying = new CompletableFuture<>();
+        scheduler.controlAdmission(ChunkStatus.NOISE, false, overworldMap, overworldHolder, () -> firstUnderlying);
+
+        // A：主世界等待任务；B：下界等待任务
+        CompletableFuture<ChunkResult<ChunkAccess>> waitingA = scheduler.controlAdmission(
+                ChunkStatus.NOISE, false, overworldMap, overworldHolder,
+                () -> CompletableFuture.completedFuture(ChunkResult.of(overworldChunk)));
+        CompletableFuture<ChunkResult<ChunkAccess>> waitingB = scheduler.controlAdmission(
+                ChunkStatus.NOISE, false, netherMap, netherHolder,
+                () -> CompletableFuture.completedFuture(ChunkResult.of(netherChunk)));
+        helper.assertTrue(scheduler.pendingCount() == 2, "应存在 2 个等待任务");
+
+        // 卸载下界：B 被取消，A 保留
+        scheduler.cancelDimension(Level.NETHER, "Dimension unloaded");
+        helper.assertTrue(!waitingA.isDone(), "主世界任务 A 不应受影响");
+        helper.assertTrue(waitingB.isDone() && !waitingB.join().isSuccess(),
+                "下界任务 B 应以 error result 完成");
+        helper.assertTrue(scheduler.pendingCount() == 1, "卸载下界后队列深度应为 1");
+
+        // 完成第一个任务 → permit 释放 → drain 恢复 A → 正常完成
+        firstUnderlying.complete(ChunkResult.of(overworldChunk));
+
+        helper.succeedWhen(() -> {
+            helper.assertTrue(waitingA.isDone() && waitingA.join().isSuccess(),
+                    "主世界任务 A 应正常完成");
+            helper.assertTrue(scheduler.pendingCount() == 0, "A 完成后队列应清空");
+            helper.assertTrue(scheduler.inflightCount() == 0, "A 完成后无在途任务");
+            // 恢复下界维度生命周期（后续测试可能使用）
+            scheduler.openDimension(Level.NETHER);
+            resetScheduler(scheduler);
+        });
+    }
+
+    /**
+     * P0 修复验证（第 7 轮）：维度卸载发生在"任务已 poll 出队、已提交 mailbox 但未运行"
+     * 的窗口时，任务应在运行前被维度生命周期校验拒绝（不依赖全局 generation）。
+     * <p>
+     * 与全局 {@link #closeAfterPollBeforeSubmitShouldRejectTask} 的区别：触发条件是
+     * 单维度卸载（cancelDimension），主世界任务不受影响。
+     */
+    @GameTest(template = "empty", batch = "steady_dim_poll_window", timeoutTicks = 600)
+    public void dimensionUnloadAfterPollBeforeSubmitShouldReject(GameTestHelper helper) {
+        ServerLevel overworld = helper.getLevel();
+        ServerLevel nether = overworld.getServer().getLevel(Level.NETHER);
+        helper.assertTrue(nether != null, "下界应已加载");
+
+        GenerationChunkHolder overworldHolder = obtainHolderForLevel(overworld);
+        GenerationChunkHolder netherHolder = obtainHolderForLevel(nether);
+        ChunkMap overworldMap = overworld.getChunkSource().chunkMap;
+        ChunkMap netherMap = nether.getChunkSource().chunkMap;
+        ChunkAccess overworldChunk = overworld.getChunk(0, 0);
+        ChunkAccess netherChunk = nether.getChunk(0, 0);
+
+        ChunkScheduler scheduler = ChunkScheduler.getInstance();
+        scheduler.setEnabled(true);
+        scheduler.setAdmissionPaused(false);
+        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, 1);
+
+        // 占唯一 NOISE permit 的任务（主世界，未完成）
+        CompletableFuture<ChunkResult<ChunkAccess>> firstUnderlying = new CompletableFuture<>();
+        scheduler.controlAdmission(ChunkStatus.NOISE, false, overworldMap, overworldHolder, () -> firstUnderlying);
+
+        // 下界任务：NOISE permit 被占 → 入队等待
+        CompletableFuture<ChunkResult<ChunkAccess>> netherTask = scheduler.controlAdmission(
+                ChunkStatus.NOISE, false, netherMap, netherHolder,
+                () -> CompletableFuture.completedFuture(ChunkResult.of(netherChunk)));
+        helper.assertTrue(!netherTask.isDone(), "下界任务应入队等待");
+        helper.assertTrue(scheduler.pendingCount() == 1, "等待队列深度应为 1");
+
+        // 带屏障的恢复执行器：捕获 runnable，等待主线程 cancelDimension 后再放行
+        CountDownLatch submitted = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        scheduler.setResumeExecutorOverride(runnable -> {
+            submitted.countDown();
+            try {
+                release.await(); // 阻塞在提交线程（后台完成回调线程），主线程不阻塞
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            runnable.run(); // cancelDimension 后运行 → runnable 内维度 lifecycleValid 失败
+        });
+
+        // 后台线程完成第一个任务 → whenComplete → requestDrain → poll 下界任务 → 阻塞在提交
+        Thread completer = new Thread(() -> firstUnderlying.complete(ChunkResult.of(overworldChunk)),
+                "steady-dim-completer");
+        completer.setDaemon(true);
+        completer.start();
+
+        // 等待 drain 已 poll 下界任务并阻塞在提交（维度 ADMITTED_NOT_SUBMITTED 窗口）
+        try {
+            helper.assertTrue(submitted.await(5, TimeUnit.SECONDS),
+                    "drain 应已 poll 下界任务并阻塞在提交");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        // 卸载下界（关闭下界生命周期 + 递增维度代数）——下界任务已出队，队列无法再找到它
+        scheduler.cancelDimension(Level.NETHER, "Dimension unloaded");
+
+        // 放行屏障 → runnable 校验维度 lifecycleValid 失败 → error 完成 + 释放 permit
+        release.countDown();
+
+        helper.succeedWhen(() -> {
+            helper.assertTrue(netherTask.isDone(), "卸载后已出队下界任务应以 error result 完成");
+            helper.assertTrue(!netherTask.join().isSuccess(), "下界任务不应执行原操作（error result）");
+            helper.assertTrue(scheduler.pendingCount() == 0, "关闭后队列应清空");
+            helper.assertTrue(scheduler.inflightCount() == 0, "关闭后无在途任务");
+            helper.assertTrue(scheduler.cpuPermitsAvailable() == scheduler.cpuPermitsMax(),
+                    "关闭后全局 permit 应全部释放");
+            scheduler.setResumeExecutorOverride(null);
+            scheduler.openDimension(Level.NETHER);
+            resetScheduler(scheduler);
+        });
     }
 }

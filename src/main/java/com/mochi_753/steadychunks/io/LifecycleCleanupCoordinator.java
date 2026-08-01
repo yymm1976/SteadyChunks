@@ -70,13 +70,16 @@ public final class LifecycleCleanupCoordinator {
 
     /**
      * 注册新任务（任务创建时调用）。
+     *
+     * @return 是否注册成功（停服模式拒绝新任务时返回 false，调用方应跳过对应注销）
      */
-    public void registerTask(ResourceKey<Level> dimension) {
+    public boolean registerTask(ResourceKey<Level> dimension) {
         if (shutdownMode.get()) {
-            return; // 停服模式拒绝新任务
+            return false; // 停服模式拒绝新任务
         }
         globalTaskCount.incrementAndGet();
         dimensionTaskCounts.computeIfAbsent(dimension, k -> new AtomicInteger(0)).incrementAndGet();
+        return true;
     }
 
     /**
@@ -146,12 +149,12 @@ public final class LifecycleCleanupCoordinator {
      */
     public void onDimensionUnload(ResourceKey<Level> dimension, int dimensionId) {
         totalDimensionsUnloaded.incrementAndGet();
-        int remainingTasks = dimensionTaskCounts.getOrDefault(dimension, new AtomicInteger(0)).get();
 
-        // P1-1 修复（第 6 轮）：维度卸载时定向取消该维度的等待任务。
+        // P1-1 修复（第 6/7 轮）：维度卸载时定向取消该维度的等待任务。
         // 等待任务持有 GeneratingChunkMap / GenerationChunkHolder / 原操作 / 代理 Future，
         // 若维度已卸载仍留在队列会持续持有已卸载维度的生成上下文；且 mailbox 恢复可能
-        // 发生在维度卸载之后，需在卸载时主动取消（error result 正常完成，避免 fatal）。
+        // 发生在维度卸载之后。第 7 轮起 cancelDimension 同时关闭该维度生命周期，
+        // 已出队/已提交但未运行的任务在运行前被拒绝。
         ChunkScheduler.getInstance().cancelDimension(dimension, "Dimension unloaded");
 
         // §17.2 统一通知注册缓存失效（PlacementCandidateCache / TemplateMetadataCache / StructureStartIndex）
@@ -161,7 +164,10 @@ public final class LifecycleCleanupCoordinator {
         CrossChunkAccessCache.current().clear();
         LightTaskBudget.getInstance().clearDimension(dimension);
 
-        // 检测泄漏：卸载后仍有任务引用
+        // P1 修复（第 7 轮）：泄漏检测移到清理后读取。
+        // 旧实现在清理前读计数：维度卸载开始时待办任务仍非零（尚未取消），
+        // 即便清理全部成功也会被误报为泄漏。清理后读取才反映真实残留。
+        int remainingTasks = dimensionTaskCounts.getOrDefault(dimension, new AtomicInteger(0)).get();
         if (remainingTasks > 0) {
             totalLeaksDetected.addAndGet(remainingTasks);
             SteadyChunks.LOGGER.warn("SteadyChunks 维度卸载泄漏: dim={} 残留任务={}", dimension.location(), remainingTasks);
