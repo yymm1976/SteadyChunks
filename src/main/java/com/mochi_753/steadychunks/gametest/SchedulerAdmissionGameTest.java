@@ -1,5 +1,6 @@
 package com.mochi_753.steadychunks.gametest;
 
+import com.mochi_753.steadychunks.io.LifecycleCleanupCoordinator;
 import com.mochi_753.steadychunks.scheduler.ChunkScheduler;
 import com.mochi_753.steadychunks.scheduler.ResourceType;
 import com.mochi_753.steadychunks.scheduler.StageLimiter;
@@ -691,6 +692,96 @@ public class SchedulerAdmissionGameTest {
             helper.assertTrue(scheduler.cpuPermitsAvailable() == scheduler.cpuPermitsMax(),
                     "关闭后全局 permit 应全部释放");
             scheduler.setResumeExecutorOverride(null);
+            scheduler.openDimension(Level.NETHER);
+            resetScheduler(scheduler);
+        });
+    }
+
+    /**
+     * 第 8 轮 P1 修复验证：维度卸载发生在 enqueuePending 已通过维度检查、读取维度代数
+     * 之后、任务入队之前的窗口（比"poll 后卸载"更早一个竞态窗口）。
+     * <p>
+     * 旧实现入队后二次校验只复查全局 lifecycleGeneration：此时全局代数未变，
+     * 任务以旧维度代数入队并残留等待队列，继续持有已卸载维度的 ChunkMap/Holder/
+     * 原操作/代理 Future。修复后二次校验调用完整 lifecycleValid（全局 accepting +
+     * 全局代数 + 维度 accepting + 维度代数），任务立即被移除并以 error result 完成。
+     * <p>
+     * 竞态窗口由 enqueueProbeHook（测试专用探针）制造：enqueuer 线程停在
+     * "维度检查已通过、尚未入队"，主线程 cancelDimension，再放行入队。
+     */
+    @GameTest(template = "empty", batch = "steady_dim_enqueue_window", timeoutTicks = 600)
+    public void dimensionUnloadDuringEnqueueShouldReject(GameTestHelper helper) {
+        ServerLevel overworld = helper.getLevel();
+        ServerLevel nether = overworld.getServer().getLevel(Level.NETHER);
+        helper.assertTrue(nether != null, "下界应已加载");
+
+        GenerationChunkHolder overworldHolder = obtainHolderForLevel(overworld);
+        GenerationChunkHolder netherHolder = obtainHolderForLevel(nether);
+        ChunkMap overworldMap = overworld.getChunkSource().chunkMap;
+        ChunkMap netherMap = nether.getChunkSource().chunkMap;
+        ChunkAccess overworldChunk = overworld.getChunk(0, 0);
+        ChunkAccess netherChunk = nether.getChunk(0, 0);
+
+        ChunkScheduler scheduler = ChunkScheduler.getInstance();
+        scheduler.setEnabled(true);
+        scheduler.setAdmissionPaused(false);
+        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, 1);
+
+        // 占唯一 NOISE permit 的任务（主世界，未完成）——下界任务将走 enqueuePending 等待
+        CompletableFuture<ChunkResult<ChunkAccess>> firstUnderlying = new CompletableFuture<>();
+        scheduler.controlAdmission(ChunkStatus.NOISE, false, overworldMap, overworldHolder, () -> firstUnderlying);
+
+        // 竞态窗口探针：enqueuer 线程通过维度检查、读取维度代数后阻塞在入队前
+        CountDownLatch reached = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        scheduler.setEnqueueProbeHook(() -> {
+            reached.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+
+        AtomicReference<CompletableFuture<ChunkResult<ChunkAccess>>> netherTask = new AtomicReference<>();
+        Thread enqueuer = new Thread(() -> {
+            netherTask.set(scheduler.controlAdmission(
+                    ChunkStatus.NOISE, false, netherMap, netherHolder,
+                    () -> CompletableFuture.completedFuture(ChunkResult.of(netherChunk))));
+        }, "steady-dim-enqueuer");
+        enqueuer.setDaemon(true);
+        enqueuer.start();
+
+        try {
+            helper.assertTrue(reached.await(5, TimeUnit.SECONDS),
+                    "enqueuePending 应已通过维度检查并阻塞在入队前");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        // 卸载下界：关闭生命周期 + 递增维度代数。任务尚未入队，队列 removeIf 找不到它；
+        // 放行后入队时二次校验（完整 lifecycleValid 含维度）必须将其立即移除。
+        scheduler.cancelDimension(Level.NETHER, "Dimension unloaded");
+
+        release.countDown();
+        try {
+            enqueuer.join(5000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        scheduler.setEnqueueProbeHook(null);
+
+        CompletableFuture<ChunkResult<ChunkAccess>> task = netherTask.get();
+        helper.assertTrue(task != null && task.isDone(), "入队后应立即被二次校验移除并完成");
+        helper.assertTrue(!task.join().isSuccess(), "维度已卸载的任务应以 error result 完成");
+        helper.assertTrue(scheduler.pendingCount() == 0, "任务不应残留等待队列");
+        helper.assertTrue(LifecycleCleanupCoordinator.getInstance().dimensionTaskCount(Level.NETHER) == 0,
+                "下界维度任务计数应归零（注册后立即被拒绝关闭 lease）");
+
+        // 完成占位任务，收尾恢复
+        firstUnderlying.complete(ChunkResult.of(overworldChunk));
+        helper.succeedWhen(() -> {
+            helper.assertTrue(scheduler.inflightCount() == 0, "占位任务完成后无在途任务");
             scheduler.openDimension(Level.NETHER);
             resetScheduler(scheduler);
         });

@@ -128,6 +128,10 @@ public final class ChunkScheduler {
      * mailbox 提交失败。生产环境保持 null（走原版 worldgen mailbox）。
      */
     private volatile Executor resumeExecutorOverride = null;
+    // 第 8 轮 P1 修复：测试专用探针——enqueuePending 通过维度检查、读取维度代数之后、
+    // 入队之前调用（默认 null，生产零开销）。GameTest 用它制造"维度检查后、offer 前
+    // cancelDimension"的竞态窗口，验证入队后完整生命周期校验（含维度）。
+    private volatile Runnable enqueueProbeHook = null;
 
     private final ResourcePermit cpuGeneralPermit;
     private final AtomicInteger inflightCount = new AtomicInteger(0);
@@ -308,8 +312,8 @@ public final class ChunkScheduler {
             return enqueuePending(originalOperation, isDependencyUnlock, map, holder, dimension);
         }
 
-        // 组合 permit 获取成功：执行原版操作，完成后统一释放
-        return executeOriginal(targetStatus, originalOperation, null, global, stage);
+        // 组合 permit 获取成功：执行原版操作，完成后统一释放（direct 路径无注册 lease）
+        return executeOriginal(targetStatus, originalOperation, null, global, stage, null);
     }
 
     /**
@@ -379,6 +383,12 @@ public final class ChunkScheduler {
         }
         long generation = lifecycleGeneration.get();
         long dimensionGeneration = dimensionState.generation.get();
+        // 第 8 轮 P1 修复：测试专用探针（仅 GameTest 设置）——停在"维度检查已通过、
+        // 尚未入队"的窗口，供测试在该窗口内 cancelDimension 制造竞态。
+        Runnable probe = enqueueProbeHook;
+        if (probe != null) {
+            probe.run();
+        }
         int depth = pendingCount.incrementAndGet();
         // P1-2：更新高水位（历史峰值，供诊断与报警）
         pendingHighWatermark.accumulateAndGet(depth, Math::max);
@@ -401,22 +411,30 @@ public final class ChunkScheduler {
             SteadyChunks.LOGGER.info("NOISE 等待队列回落至告警阈值以下（pending={}）", depth);
         }
         CompletableFuture<ChunkResult<ChunkAccess>> proxy = new CompletableFuture<>();
+        // 第 8 轮 P0 修复：先注册、再发布（lease 从入队持有到代理 Future 终态，方案 B：
+        // 完整任务生命周期计数）。修复旧 registerTask 的两个发布竞态：
+        // ① 旧实现 offer 之后才注册，drainer 可能在注册前 poll 并注销，计数短暂为负；
+        // ② 旧实现停服模式下注册失败（false）后任务仍入队，出队时无条件注销，计数永久变负。
+        // 注册失败（停服模式）：直接拒绝，不入队、不创建代理 Future。
+        LifecycleCleanupCoordinator.TaskRegistration registration =
+                LifecycleCleanupCoordinator.getInstance().tryRegisterTask(dimension);
+        if (!registration.registered()) {
+            return CompletableFuture.completedFuture(
+                    ChunkResult.error("SteadyChunks 服务器正在关闭"));
+        }
         PendingNoiseTask task = new PendingNoiseTask(
                 originalOperation, proxy, isDependencyUnlock, map, holder,
-                dimension, generation, dimensionGeneration);
+                dimension, generation, dimensionGeneration, registration);
         pendingNoiseTasks.offer(task);
-        // 注册维度待办计数（泄漏检测：维度卸载后该维度待办任务应全部取消）。
-        // shutdownMode 下 registerTask 返回 false（不计数），对应后续不注销。
-        boolean registered = LifecycleCleanupCoordinator.getInstance().registerTask(dimension);
-        // P0 修复（第 4 轮）：入队后二次校验生命周期。若清理已在入队与检查之间发生
-        // （generation 变化或停止接收），移除任务并以 error result 正常完成（第 5 轮修复：
-        // 异常完成会让原版 setFatalException，破坏真实区块生成链），避免残留。
-        if (!acceptingTasks.get() || generation != lifecycleGeneration.get()) {
+        // 第 8 轮 P1 修复：入队后二次校验完整生命周期（全局 + 维度），替代旧实现只复查
+        // 全局 lifecycleGeneration。旧实现漏掉"维度检查后、offer 前 cancelDimension"窗口：
+        // 维度已卸载但任务仍以旧维度代数入队，且全局代数未变、二次检查通过。
+        // 若清理已在检查与入队之间发生，移除任务并 close lease、以 error result 正常完成
+        // （异常完成会让原版 setFatalException，破坏真实区块生成链），避免残留。
+        if (!lifecycleValid(task)) {
             if (pendingNoiseTasks.remove(task)) {
                 pendingCount.updateAndGet(v -> Math.max(0, v - 1));
-                if (registered) {
-                    LifecycleCleanupCoordinator.getInstance().unregisterTask(dimension);
-                }
+                registration.close();
                 proxy.complete(ChunkResult.error("SteadyChunks 调度器生命周期已变化"));
             }
         }
@@ -441,7 +459,11 @@ public final class ChunkScheduler {
             Supplier<CompletableFuture<ChunkResult<ChunkAccess>>> originalOperation,
             CompletableFuture<ChunkResult<ChunkAccess>> proxy,
             PermitLease global,
-            PermitLease stage) {
+            PermitLease stage,
+            // 第 8 轮 P0 修复（方案 B）：任务注册 lease，随代理 Future 终态关闭
+            // （direct 路径无注册，传 null）。poll 出队不再注销，保证协调器计数
+            // 覆盖完整任务生命周期（等待/已出队/已提交/运行中）。
+            LifecycleCleanupCoordinator.TaskRegistration registration) {
 
         // P1 修复（第 4 轮）：记录 NOISE 在途任务峰值（真实生成测试验证并发上限）。
         int active = inflightCount.incrementAndGet();
@@ -456,6 +478,9 @@ public final class ChunkScheduler {
             stage.close();
             global.close();
             inflightCount.decrementAndGet();
+            if (registration != null) {
+                registration.close();
+            }
             requestDrain();
             if (proxy != null) {
                 proxy.completeExceptionally(ex);
@@ -471,6 +496,11 @@ public final class ChunkScheduler {
             stage.close();
             global.close();
             inflightCount.decrementAndGet();
+            // 第 8 轮 P0 修复（方案 B）：任务进入终态才关闭注册 lease。
+            // 已出队/运行中任务保持计数，停服等待与维度泄漏检测覆盖完整生命周期。
+            if (registration != null) {
+                registration.close();
+            }
             if (proxy != null) {
                 // 完成代理 Future
                 if (ex != null) {
@@ -565,8 +595,9 @@ public final class ChunkScheduler {
                 return;
             }
             pendingCount.decrementAndGet();
-            // 任务离开等待队列：注销维度待办计数（不再属于"待办"）
-            LifecycleCleanupCoordinator.getInstance().unregisterTask(task.dimension());
+            // 第 8 轮 P0 修复（方案 B）：任务离开等待队列不注销注册 lease——
+            // 计数覆盖完整任务生命周期，直到代理 Future 终态（executeOriginal
+            // whenComplete / completeLifecycleRejected / mailbox 失败路径）才关闭。
             // 通过原 worldgen mailbox 提交，恢复原版线程语义（不获取 permit）。
             // P0-1 修复（第 5 轮）：提交失败由 submitResumed 统一兜底。
             submitResumed(task, PermitLease.empty(), PermitLease.empty());
@@ -606,8 +637,8 @@ public final class ChunkScheduler {
                 return;
             }
             pendingCount.decrementAndGet();
-            // 任务离开等待队列：注销维度待办计数（不再属于"待办"）
-            LifecycleCleanupCoordinator.getInstance().unregisterTask(removed.dimension());
+            // 第 8 轮 P0 修复（方案 B）：任务离开等待队列不注销注册 lease——
+            // 计数覆盖完整任务生命周期，直到代理 Future 终态才关闭（同上）。
             // P0-2：恢复通过原 worldgen mailbox 提交，回到原执行上下文，
             // 不直接在当前线程（可能为 Server Thread）调用 originalOperation。
             submitResumed(removed, global, stage);
@@ -643,7 +674,8 @@ public final class ChunkScheduler {
                     completeLifecycleRejected(task, global, stage);
                     return;
                 }
-                executeOriginal(ChunkStatus.NOISE, task.operation(), task.proxy(), global, stage);
+                executeOriginal(ChunkStatus.NOISE, task.operation(), task.proxy(), global, stage,
+                        task.registration());
             });
         } catch (RejectedExecutionException exception) {
             // P0-1 修复（第 6 轮）：预期的生命周期拒绝（mailbox 停止接收）→ error result 正常完成。
@@ -651,12 +683,16 @@ public final class ChunkScheduler {
             // 与第 5 轮"取消/清理路径统一 error result"的语义保持一致。
             stage.close();
             global.close();
+            // 第 8 轮 P0 修复（方案 B）：任务终态统一关闭注册 lease
+            task.registration().close();
             task.proxy().complete(ChunkResult.error("SteadyChunks worldgen mailbox 已停止接收"));
             requestDrain();
         } catch (Throwable throwable) {
             // P0-1 修复（第 6 轮）：非预期错误 → 记录日志 + error result 正常完成（同样避免 fatal）。
             stage.close();
             global.close();
+            // 第 8 轮 P0 修复（方案 B）：任务终态统一关闭注册 lease
+            task.registration().close();
             SteadyChunks.LOGGER.error("提交 NOISE 恢复任务时发生非预期错误", throwable);
             task.proxy().complete(ChunkResult.error(
                     "SteadyChunks 无法恢复 NOISE 任务: " + throwable.getClass().getSimpleName()));
@@ -691,6 +727,8 @@ public final class ChunkScheduler {
     private void completeLifecycleRejected(PendingNoiseTask task, PermitLease global, PermitLease stage) {
         stage.close();
         global.close();
+        // 第 8 轮 P0 修复（方案 B）：任务被拒绝即进入终态，关闭注册 lease
+        task.registration().close();
         task.proxy().complete(ChunkResult.error("SteadyChunks 调度器生命周期已变化，任务被拒绝"));
         requestDrain();
     }
@@ -751,7 +789,8 @@ public final class ChunkScheduler {
                 return false;
             }
             pendingCount.updateAndGet(v -> Math.max(0, v - 1));
-            LifecycleCleanupCoordinator.getInstance().unregisterTask(dimension);
+            // 第 8 轮 P0 修复：队列中任务被取消即进入终态，关闭其注册 lease
+            task.registration().close();
             task.proxy().complete(ChunkResult.error(reason));
             return true;
         });
@@ -819,6 +858,8 @@ public final class ChunkScheduler {
     public boolean isFailOpen() { return failOpen.get(); }
     /** P0-1 修复（第 5 轮）：测试注入恢复执行器（null 表示使用原版 worldgen mailbox） */
     public void setResumeExecutorOverride(Executor executor) { this.resumeExecutorOverride = executor; }
+    // 第 8 轮 P1 修复：测试专用探针（GameTest 制造入队竞态窗口，生产不设置）
+    public void setEnqueueProbeHook(Runnable probe) { this.enqueueProbeHook = probe; }
     /** P1 修复（第 4 轮）：重置测试期诊断计数（GameTest 隔离用） */
     public void resetDiagnostics() {
         mixinInterceptCount.set(0);
@@ -883,8 +924,8 @@ public final class ChunkScheduler {
         PendingNoiseTask task;
         while ((task = pendingNoiseTasks.poll()) != null) {
             pendingCount.updateAndGet(v -> Math.max(0, v - 1));
-            // 任务被清理：注销维度待办计数
-            LifecycleCleanupCoordinator.getInstance().unregisterTask(task.dimension());
+            // 第 8 轮 P0 修复：队列中任务被清理即进入终态，关闭其注册 lease
+            task.registration().close();
             // P2 修复（第 5 轮）：以 error result 正常完成（而非异常完成）。
             // 原版 GenerationChunkHolder.lambda$applyStep$0 的 handle 会把异常完成视为
             // 致命错误（MinecraftServer.setFatalException），导致真实区块生成链中断、
@@ -916,7 +957,11 @@ public final class ChunkScheduler {
             long globalGeneration,
             // P0 修复（第 7 轮）：任务入队时的维度生命周期代数。维度卸载会递增维度代数
             // 并关闭接收，已出队/已提交但未运行的任务经 lifecycleValid 拒绝（不依赖全局）。
-            long dimensionGeneration
+            long dimensionGeneration,
+            // 第 8 轮 P0 修复：注册 lease——从入队持有到代理 Future 终态（方案 B：
+            // 完整任务生命周期计数）。poll 出队不注销，停服等待/维度泄漏检测覆盖
+            // 等待、已出队、已提交、运行中全部状态；终态路径统一 close()。
+            LifecycleCleanupCoordinator.TaskRegistration registration
     ) {
         /**
          * P0-2 修复：恢复执行器 = 原版 worldgen mailbox。

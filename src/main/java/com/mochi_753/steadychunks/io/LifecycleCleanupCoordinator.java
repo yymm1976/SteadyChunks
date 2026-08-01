@@ -69,28 +69,75 @@ public final class LifecycleCleanupCoordinator {
     }
 
     /**
-     * 注册新任务（任务创建时调用）。
-     *
-     * @return 是否注册成功（停服模式拒绝新任务时返回 false，调用方应跳过对应注销）
+     * 任务注册 lease（第 8 轮 P0 修复）：从任务创建持有到代理 Future 终态。
+     * <p>
+     * 替换旧 registerTask/unregisterTask 的两个发布竞态：
+     * <ol>
+     *   <li>旧实现先入队后注册，drainer 可能在注册前 poll 并注销，计数短暂为负；
+     *       lease 先注册、再发布，poll 时计数必然已计入。</li>
+     *   <li>旧实现停服模式下注册失败（返回 false）后任务仍入队，出队时无条件注销，
+     *       计数永久变负；lease 失败时调用方直接拒绝任务，不入队。</li>
+     * </ol>
+     * 计数语义（第 8 轮方案 B）：统计完整任务生命周期——等待队列、已出队未提交、
+     * 已提交未运行、运行中均计入，直到代理 Future 进入终态才 close。
+     * 因此停服等待 {@link #globalTaskCount()} 归零 = 真正等待所有活跃任务完成，
+     * 维度卸载泄漏检测也覆盖运行中任务。
      */
-    public boolean registerTask(ResourceKey<Level> dimension) {
+    public interface TaskRegistration extends AutoCloseable {
+        /** 注册是否生效（停服模式下为 false，调用方必须拒绝任务）。 */
+        boolean registered();
+
+        /** 幂等注销：仅首次调用递减计数。 */
+        @Override
+        void close();
+    }
+
+    /** 停服模式下的空 lease：未注册，close 无操作。 */
+    private static final TaskRegistration UNREGISTERED = new TaskRegistration() {
+        @Override
+        public boolean registered() {
+            return false;
+        }
+
+        @Override
+        public void close() {
+        }
+    };
+
+    /**
+     * 注册新任务（先注册、再发布到队列）。
+     *
+     * @return 注册 lease；{@code registered()==false} 表示停服模式，调用方必须拒绝任务
+     */
+    public TaskRegistration tryRegisterTask(ResourceKey<Level> dimension) {
         if (shutdownMode.get()) {
-            return false; // 停服模式拒绝新任务
+            return UNREGISTERED; // 停服模式拒绝新任务
         }
         globalTaskCount.incrementAndGet();
         dimensionTaskCounts.computeIfAbsent(dimension, k -> new AtomicInteger(0)).incrementAndGet();
-        return true;
-    }
+        return new TaskRegistration() {
+            private final AtomicBoolean closed = new AtomicBoolean(false);
 
-    /**
-     * 注销任务（任务完成或取消时调用）。
-     */
-    public void unregisterTask(ResourceKey<Level> dimension) {
-        globalTaskCount.decrementAndGet();
-        AtomicInteger dimCount = dimensionTaskCounts.get(dimension);
-        if (dimCount != null) {
-            dimCount.decrementAndGet();
-        }
+            @Override
+            public boolean registered() {
+                return true;
+            }
+
+            @Override
+            public void close() {
+                // 幂等：仅首次 close 递减。维度计数归零即移除 entry：
+                // 与 onDimensionUnload 的 remove 并发时 computeIfPresent 为无操作，
+                // 不会重建负数 entry（旧 unregisterTask 在 entry 被 remove 后
+                // 会重建 0 → -1，永久污染计数）。
+                if (closed.compareAndSet(false, true)) {
+                    globalTaskCount.decrementAndGet();
+                    dimensionTaskCounts.computeIfPresent(dimension, (ignored, count) -> {
+                        int remaining = count.decrementAndGet();
+                        return remaining == 0 ? null : count;
+                    });
+                }
+            }
+        };
     }
 
     /**
@@ -167,12 +214,18 @@ public final class LifecycleCleanupCoordinator {
         // P1 修复（第 7 轮）：泄漏检测移到清理后读取。
         // 旧实现在清理前读计数：维度卸载开始时待办任务仍非零（尚未取消），
         // 即便清理全部成功也会被误报为泄漏。清理后读取才反映真实残留。
+        // 第 8 轮方案 B 语义：维度计数覆盖完整任务生命周期（等待/已出队/已提交/运行中）。
+        // cancelDimension 同步取消队列任务并 close 其 lease；已出队/运行中任务
+        // 在代理 Future 终态才 close。因此清理后残留 = 正在收尾的任务（正常，最终归零）
+        // 或永不终结的任务（真泄漏，如原版生成 Future 随维度卸载被丢弃）。
         int remainingTasks = dimensionTaskCounts.getOrDefault(dimension, new AtomicInteger(0)).get();
         if (remainingTasks > 0) {
             totalLeaksDetected.addAndGet(remainingTasks);
             SteadyChunks.LOGGER.warn("SteadyChunks 维度卸载泄漏: dim={} 残留任务={}", dimension.location(), remainingTasks);
         }
 
+        // 移除维度计数 entry；此后该维度任务 close 时 computeIfPresent 为无操作
+        // （不会重建 0 → -1 的负数 entry，修复旧 unregisterTask 的永久负计数污染）。
         dimensionTaskCounts.remove(dimension);
         SteadyChunks.LOGGER.info("SteadyChunks 维度卸载完成: {}", dimension.location());
     }
