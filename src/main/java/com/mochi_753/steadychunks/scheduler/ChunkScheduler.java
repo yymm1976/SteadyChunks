@@ -389,6 +389,20 @@ public final class ChunkScheduler {
         if (probe != null) {
             probe.run();
         }
+        // 第 8 轮 P0 修复：先注册、再发布（lease 从入队持有到代理 Future 终态，方案 B：
+        // 完整任务生命周期计数）。修复旧 registerTask 的两个发布竞态：
+        // ① 旧实现 offer 之后才注册，drainer 可能在注册前 poll 并注销，计数短暂为负；
+        // ② 旧实现停服模式下注册失败（false）后任务仍入队，出队时无条件注销，计数永久变负。
+        // 注册失败（停服模式）：直接拒绝，不入队、不创建代理 Future。
+        // 第 8 轮 review 修复：tryRegisterTask 必须位于 pendingCount 递增之前——
+        // 停服窗口（shutdownMode=true 后、forceClearAll 前）acceptingTasks 仍为 true，
+        // 若先递增后拒绝，每次拒绝都会泄漏 pendingCount +1 且永不归还。
+        LifecycleCleanupCoordinator.TaskRegistration registration =
+                LifecycleCleanupCoordinator.getInstance().tryRegisterTask(dimension);
+        if (!registration.registered()) {
+            return CompletableFuture.completedFuture(
+                    ChunkResult.error("SteadyChunks 服务器正在关闭"));
+        }
         int depth = pendingCount.incrementAndGet();
         // P1-2：更新高水位（历史峰值，供诊断与报警）
         pendingHighWatermark.accumulateAndGet(depth, Math::max);
@@ -411,17 +425,6 @@ public final class ChunkScheduler {
             SteadyChunks.LOGGER.info("NOISE 等待队列回落至告警阈值以下（pending={}）", depth);
         }
         CompletableFuture<ChunkResult<ChunkAccess>> proxy = new CompletableFuture<>();
-        // 第 8 轮 P0 修复：先注册、再发布（lease 从入队持有到代理 Future 终态，方案 B：
-        // 完整任务生命周期计数）。修复旧 registerTask 的两个发布竞态：
-        // ① 旧实现 offer 之后才注册，drainer 可能在注册前 poll 并注销，计数短暂为负；
-        // ② 旧实现停服模式下注册失败（false）后任务仍入队，出队时无条件注销，计数永久变负。
-        // 注册失败（停服模式）：直接拒绝，不入队、不创建代理 Future。
-        LifecycleCleanupCoordinator.TaskRegistration registration =
-                LifecycleCleanupCoordinator.getInstance().tryRegisterTask(dimension);
-        if (!registration.registered()) {
-            return CompletableFuture.completedFuture(
-                    ChunkResult.error("SteadyChunks 服务器正在关闭"));
-        }
         PendingNoiseTask task = new PendingNoiseTask(
                 originalOperation, proxy, isDependencyUnlock, map, holder,
                 dimension, generation, dimensionGeneration, registration);
