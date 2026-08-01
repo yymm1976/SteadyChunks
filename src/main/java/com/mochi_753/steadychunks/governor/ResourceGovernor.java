@@ -8,7 +8,6 @@ import com.mochi_753.steadychunks.telemetry.ChunkFlightRecorder;
 import com.mochi_753.steadychunks.telemetry.QuantileEstimator;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 
-import java.util.EnumMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -149,9 +148,15 @@ public final class ResourceGovernor {
     /**
      * 将 AIMD 输出应用到调度器的阶段限制。
      * <p>
-     * P0-3 修复：按 ResourceType 聚合后再写入共享桶，避免同资源组的多个
-     * ChunkStatus（如 BIOMES/NOISE/SURFACE）连续写入同一桶导致最终值依赖遍历顺序。
-     * 聚合策略：同资源组取最小值（最保守）。
+     * P1-2 修复（第 6 轮）：过渡期<b>只控制 NOISE_HEAVY 资源组</b>，不再按 ChunkStatus
+     * 聚合写共享桶。旧实现按 ResourceType 聚合（同组取最小值）后写入共享桶，而
+     * BIOMES/NOISE/SURFACE 共享 NOISE_HEAVY 桶：AIMD 乘性下降会降低 BIOMES/SURFACE，
+     * 加性增长轮换列表却不含它们，导致共享桶被旧值永久压住（min 聚合后额度卡死，
+     * 继续增加 NOISE 也无效）。
+     * <p>
+     * 目前仅 NOISE 阶段真实接入调度器，因此只应用 {@code ChunkStatus.NOISE} 对应的
+     * permit，不维护还未真实接入阶段的 AIMD 状态。后续接入 STRUCTURE_STARTS/FEATURES
+     * 时再恢复按 {@link ResourceType} 的完整控制。
      * <p>
      * P0-4 修复：紧急模式使用 admissionPaused 标志而非 permit=0。
      * 旧实现 setMaxPermits(0) 被 ResourceBucket 钳制为 1，实际仍允许 1 个任务。
@@ -162,27 +167,15 @@ public final class ResourceGovernor {
         boolean shouldPause = modeState.emergency() && !modeState.recovering();
         scheduler.setAdmissionPaused(shouldPause);
 
-        // P0-3 修复：按 ResourceType 聚合，同资源组取最小值
-        EnumMap<ResourceType, Integer> resourcePermits = new EnumMap<>(ResourceType.class);
-        for (var entry : permits.entrySet()) {
-            ResourceType rt = scheduler.stageLimiter().resourceTypeOf(entry.getKey());
-            if (rt == null) {
-                continue;
-            }
-            int permit = entry.getValue();
-            if (modeState.recovering()) {
-                permit = (int) Math.max(1, permit * modeState.recoveryRatio());
-            }
-            // 同资源组取最小值（最保守）
-            Integer existing = resourcePermits.get(rt);
-            if (existing == null || permit < existing) {
-                resourcePermits.put(rt, permit);
-            }
+        // P1-2 修复（第 6 轮）：只应用 NOISE 的 permit 到 NOISE_HEAVY 桶
+        Integer noisePermit = permits.get(ChunkStatus.NOISE);
+        if (noisePermit == null) {
+            return;
         }
-        // 按 ResourceType 写入共享桶
-        for (var entry : resourcePermits.entrySet()) {
-            scheduler.stageLimiter().setResourceLimit(entry.getKey(), entry.getValue());
+        if (modeState.recovering()) {
+            noisePermit = (int) Math.max(1, noisePermit * modeState.recoveryRatio());
         }
+        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, noisePermit);
     }
 
     /**

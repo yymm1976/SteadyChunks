@@ -148,8 +148,11 @@ public final class LifecycleCleanupCoordinator {
         totalDimensionsUnloaded.incrementAndGet();
         int remainingTasks = dimensionTaskCounts.getOrDefault(dimension, new AtomicInteger(0)).get();
 
-        // 审查修复：ChunkScheduler 不再有 onDimensionUnload（删除了 ChunkTaskGraph）
-        // 维度卸载时等待队列中的任务会随 permit 释放自然完成
+        // P1-1 修复（第 6 轮）：维度卸载时定向取消该维度的等待任务。
+        // 等待任务持有 GeneratingChunkMap / GenerationChunkHolder / 原操作 / 代理 Future，
+        // 若维度已卸载仍留在队列会持续持有已卸载维度的生成上下文；且 mailbox 恢复可能
+        // 发生在维度卸载之后，需在卸载时主动取消（error result 正常完成，避免 fatal）。
+        ChunkScheduler.getInstance().cancelDimension(dimension, "Dimension unloaded");
 
         // §17.2 统一通知注册缓存失效（PlacementCandidateCache / TemplateMetadataCache / StructureStartIndex）
         DatapackGenerationRegistry.getInstance().fireDimensionUnload(dimension);

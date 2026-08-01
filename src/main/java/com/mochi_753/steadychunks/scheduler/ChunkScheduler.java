@@ -3,17 +3,22 @@ package com.mochi_753.steadychunks.scheduler;
 import com.mochi_753.steadychunks.SteadyChunks;
 import com.mochi_753.steadychunks.config.CommonConfig;
 import com.mochi_753.steadychunks.mixin.server.ChunkMapAccessor;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.server.level.ChunkMap;
 import net.minecraft.server.level.ChunkResult;
 import net.minecraft.server.level.ChunkTaskPriorityQueueSorter;
 import net.minecraft.server.level.GeneratingChunkMap;
 import net.minecraft.server.level.GenerationChunkHolder;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.thread.ProcessorHandle;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -101,6 +106,12 @@ public final class ChunkScheduler {
     private final AtomicInteger maxTotalNoiseActive = new AtomicInteger(0);
     /** P1 修复（第 5 轮）：fail-open 持续状态下的日志节流时间戳（每 10 秒最多一条摘要） */
     private volatile long lastFailOpenLogMillis = 0L;
+    /** P2 修复（第 6 轮）：warning 状态切换节流标志（进入超阈值 WARN 一次/回落 INFO 一次） */
+    private final AtomicBoolean pendingWarningActive = new AtomicBoolean(false);
+    /** P2 修复（第 6 轮）：warning 持续状态摘要日志的最小间隔（毫秒） */
+    private volatile long lastWarningSummaryMillis = 0L;
+    /** P2 修复（第 6 轮）：warning 持续状态摘要日志间隔 */
+    private static final long WARNING_SUMMARY_INTERVAL_MILLIS = 10_000L;
 
     /**
      * P0-1 修复（第 5 轮）：恢复执行器测试注入点。
@@ -294,7 +305,8 @@ public final class ChunkScheduler {
     private CompletableFuture<ChunkResult<ChunkAccess>> runUncontrolled(
             Supplier<CompletableFuture<ChunkResult<ChunkAccess>>> originalOperation) {
         int active = uncontrolledNoiseActive.incrementAndGet();
-        maxTotalNoiseActive.accumulateAndGet(active, Math::max);
+        // P1-4 修复（第 6 轮）：总并发峰值 = 受控 + 非受控之和
+        updateTotalNoisePeak();
         CompletableFuture<ChunkResult<ChunkAccess>> future;
         try {
             future = originalOperation.get();
@@ -344,13 +356,28 @@ public final class ChunkScheduler {
         int depth = pendingCount.incrementAndGet();
         // P1-2：更新高水位（历史峰值，供诊断与报警）
         pendingHighWatermark.accumulateAndGet(depth, Math::max);
+        // P2 修复（第 6 轮）：warning 日志状态切换节流——进入超阈值 WARN 一次、
+        // 持续超阈值每 10 秒一条摘要、回落阈值以下 INFO 一次。避免队列从
+        // 512 增长到 1024 时连续输出约五百条警告（洪峰）。
         if (depth > pendingWarningThreshold) {
-            // 超过告警阈值：仅记录告警（不是硬上限，见 controlAdmission 的 critical fail-open 软保护）。
-            SteadyChunks.LOGGER.warn("NOISE 等待队列超告警阈值: depth={} warning={}（请检查 permit 配置或跑图速度）",
-                    depth, pendingWarningThreshold);
+            if (pendingWarningActive.compareAndSet(false, true)) {
+                lastWarningSummaryMillis = System.currentTimeMillis();
+                SteadyChunks.LOGGER.warn("NOISE 等待队列超告警阈值: depth={} warning={}（请检查 permit 配置或跑图速度）",
+                        depth, pendingWarningThreshold);
+            } else {
+                long now = System.currentTimeMillis();
+                if (now - lastWarningSummaryMillis >= WARNING_SUMMARY_INTERVAL_MILLIS) {
+                    lastWarningSummaryMillis = now;
+                    SteadyChunks.LOGGER.warn("NOISE 等待队列持续超告警阈值: depth={}（请检查 permit 配置或跑图速度）", depth);
+                }
+            }
+        } else if (pendingWarningActive.getAndSet(false)) {
+            SteadyChunks.LOGGER.info("NOISE 等待队列回落至告警阈值以下（pending={}）", depth);
         }
         CompletableFuture<ChunkResult<ChunkAccess>> proxy = new CompletableFuture<>();
-        PendingNoiseTask task = new PendingNoiseTask(originalOperation, proxy, isDependencyUnlock, map, holder);
+        PendingNoiseTask task = new PendingNoiseTask(
+                originalOperation, proxy, isDependencyUnlock, map, holder,
+                dimensionOf(map), generation);
         pendingNoiseTasks.offer(task);
         // P0 修复（第 4 轮）：入队后二次校验生命周期。若清理已在入队与检查之间发生
         // （generation 变化或停止接收），移除任务并以 error result 正常完成（第 5 轮修复：
@@ -387,6 +414,8 @@ public final class ChunkScheduler {
         // P1 修复（第 4 轮）：记录 NOISE 在途任务峰值（真实生成测试验证并发上限）。
         int active = inflightCount.incrementAndGet();
         maxActiveNoise.accumulateAndGet(active, Math::max);
+        // P1-4 修复（第 6 轮）：总并发峰值 = 受控 + 非受控之和
+        updateTotalNoisePeak();
         CompletableFuture<ChunkResult<ChunkAccess>> future;
         try {
             future = originalOperation.get();
@@ -562,16 +591,107 @@ public final class ChunkScheduler {
      * bypass 路径传入空 lease，释放为空操作。
      */
     private void submitResumed(PendingNoiseTask task, PermitLease global, PermitLease stage) {
+        // P0-2 修复（第 6 轮）：提交前生命周期校验（覆盖"poll 出队后"与"提交 mailbox 前"）。
+        // 任务出队后若 closeForShutdown/resetForReload 已发生（generation 变化或停止接收），
+        // 拒绝恢复执行，避免"已出队但未提交"（ADMITTED_NOT_SUBMITTED）的任务在关闭后仍启动。
+        if (!lifecycleValid(task)) {
+            completeLifecycleRejected(task, global, stage);
+            return;
+        }
         try {
             Executor executor = resumeExecutorOverride != null ? resumeExecutorOverride : task.resumeExecutor();
-            executor.execute(() ->
-                    executeOriginal(ChunkStatus.NOISE, task.operation(), task.proxy(), global, stage));
-        } catch (Throwable throwable) {
+            executor.execute(() -> {
+                // P0-2 修复（第 6 轮）：mailbox Runnable 真正运行前再次校验。
+                // mailbox 排队期间关闭/重置可能已发生，此时拒绝执行原版操作。
+                if (!lifecycleValid(task)) {
+                    completeLifecycleRejected(task, global, stage);
+                    return;
+                }
+                executeOriginal(ChunkStatus.NOISE, task.operation(), task.proxy(), global, stage);
+            });
+        } catch (RejectedExecutionException exception) {
+            // P0-1 修复（第 6 轮）：预期的生命周期拒绝（mailbox 停止接收）→ error result 正常完成。
+            // 异常完成会被原版 lambda$applyStep$0 视为致命（MinecraftServer.setFatalException），
+            // 与第 5 轮"取消/清理路径统一 error result"的语义保持一致。
             stage.close();
             global.close();
-            task.proxy().completeExceptionally(throwable);
+            task.proxy().complete(ChunkResult.error("SteadyChunks worldgen mailbox 已停止接收"));
+            requestDrain();
+        } catch (Throwable throwable) {
+            // P0-1 修复（第 6 轮）：非预期错误 → 记录日志 + error result 正常完成（同样避免 fatal）。
+            stage.close();
+            global.close();
+            SteadyChunks.LOGGER.error("提交 NOISE 恢复任务时发生非预期错误", throwable);
+            task.proxy().complete(ChunkResult.error(
+                    "SteadyChunks 无法恢复 NOISE 任务: " + throwable.getClass().getSimpleName()));
             requestDrain();
         }
+    }
+
+    /**
+     * P0-2 修复（第 6 轮）：生命周期有效性判断——调度器仍在接收任务且任务入队代数未过期。
+     */
+    private boolean lifecycleValid(PendingNoiseTask task) {
+        return acceptingTasks.get() && task.lifecycleGeneration() == lifecycleGeneration.get();
+    }
+
+    /**
+     * P0-2 修复（第 6 轮）：生命周期变化导致任务被拒绝时：释放组合 permit + error result 正常完成。
+     */
+    private void completeLifecycleRejected(PendingNoiseTask task, PermitLease global, PermitLease stage) {
+        stage.close();
+        global.close();
+        task.proxy().complete(ChunkResult.error("SteadyChunks 调度器生命周期已变化，任务被拒绝"));
+        requestDrain();
+    }
+
+    /**
+     * P1-4 修复（第 6 轮）：更新 NOISE 总活动峰值（受控 + 非受控之和）。
+     * 受控任务（executeOriginal）与非受控任务（runUncontrolled）开始执行时都调用，
+     * 避免 maxTotalNoiseActive 只记录非受控数量而低估真实并发。
+     */
+    private void updateTotalNoisePeak() {
+        int total = inflightCount.get() + uncontrolledNoiseActive.get();
+        maxTotalNoiseActive.accumulateAndGet(total, Math::max);
+    }
+
+    /**
+     * P1-1 修复（第 6 轮）：从生成上下文提取维度（用于维度级定向取消）。
+     * GeneratingChunkMap 接口不暴露 level，实际实现为 ChunkMap，其 level 字段
+     * 为包私有，经 {@link ChunkMapAccessor#steady$level()} 访问。
+     */
+    private static ResourceKey<Level> dimensionOf(GeneratingChunkMap map) {
+        if (map instanceof ChunkMap) {
+            ServerLevel level = ((ChunkMapAccessor) map).steady$level();
+            if (level != null) {
+                return level.dimension();
+            }
+        }
+        return Level.OVERWORLD; // 兜底：无法识别维度时归入主世界
+    }
+
+    /**
+     * P1-1 修复（第 6 轮）：维度卸载时定向取消该维度的所有等待任务。
+     * <p>
+     * 等待任务持有 {@code GeneratingChunkMap} / {@code GenerationChunkHolder} / 原始操作 /
+     * 代理 Future。若维度已卸载仍留在队列，会持续持有已卸载维度的生成上下文，且 mailbox
+     * 恢复可能发生在维度卸载之后。逐任务按维度过滤并以 error result 正常完成（避免 fatal）。
+     * 已出队（inflight/mailbox 中）的任务不在队列中，由 {@link #submitResumed} 的生命周期
+     * 校验在运行前拒绝。
+     *
+     * @param dimension 目标维度
+     * @param reason    取消原因（error result 文案）
+     */
+    public void cancelDimension(ResourceKey<Level> dimension, String reason) {
+        pendingNoiseTasks.removeIf(task -> {
+            if (!dimension.equals(task.dimension())) {
+                return false;
+            }
+            pendingCount.updateAndGet(v -> Math.max(0, v - 1));
+            task.proxy().complete(ChunkResult.error(reason));
+            return true;
+        });
+        requestDrain();
     }
 
     /**
@@ -709,7 +829,12 @@ public final class ChunkScheduler {
             CompletableFuture<ChunkResult<ChunkAccess>> proxy,
             boolean isDependencyUnlock,
             GeneratingChunkMap map,
-            GenerationChunkHolder holder
+            GenerationChunkHolder holder,
+            // P1-1 修复（第 6 轮）：任务所属维度，用于维度级定向取消（cancelDimension）。
+            ResourceKey<Level> dimension,
+            // P0-2 修复（第 6 轮）：任务入队时的生命周期代数。出队/提交/运行前校验
+            // 代数未变化，关闭或重置后拒绝执行，防止已出队任务在关闭后启动。
+            long lifecycleGeneration
     ) {
         /**
          * P0-2 修复：恢复执行器 = 原版 worldgen mailbox。
