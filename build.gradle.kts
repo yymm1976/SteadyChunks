@@ -86,13 +86,11 @@ neoForge {
     }
 }
 
-sourceSets.main.get().resources {
-    srcDir("src/generated/resources")
-}
+the<org.gradle.api.tasks.SourceSetContainer>().getByName("main").resources.srcDir("src/generated/resources")
 
 val localRuntime: Configuration by configurations.creating
 configurations {
-    runtimeClasspath {
+    named("runtimeClasspath") {
         extendsFrom(localRuntime)
     }
 }
@@ -109,19 +107,19 @@ repositories {
 
 dependencies {
     // Gson：报告导出 JSON 格式（NeoForge 已内置，此处声明为 compileOnly 以便 IDE 解析）
-    compileOnly("com.google.code.gson:gson:2.10.1")
+    add("compileOnly", "com.google.code.gson:gson:2.10.1")
     // Mixin API：IMixinConfigPlugin 等扩展点需要（NeoForge 运行时内置，编译期需显式声明）
-    compileOnly("org.spongepowered:mixin:0.8.5")
+    add("compileOnly", "org.spongepowered:mixin:0.8.5")
 
     // P2-19：单元测试依赖（JUnit 5 + 平台启动器）
-    testImplementation(platform("org.junit:junit-bom:5.10.2"))
-    testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
-    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
+    add("testImplementation", platform("org.junit:junit-bom:5.10.2"))
+    add("testImplementation", "org.junit.jupiter:junit-jupiter:5.10.2")
+    add("testRuntimeOnly", "org.junit.platform:junit-platform-launcher")
 
     // P2-19：测试运行期需要 SLF4J（被测类引用 SteadyChunks.LOGGER 触发 SLF4J 类加载）
     // NeoForge 运行时内置 SLF4J，但单元测试不启动 NeoForge，需显式提供
-    testRuntimeOnly("org.slf4j:slf4j-api:2.0.7")
-    testRuntimeOnly("org.slf4j:slf4j-simple:2.0.7")
+    add("testRuntimeOnly", "org.slf4j:slf4j-api:2.0.7")
+    add("testRuntimeOnly", "org.slf4j:slf4j-simple:2.0.7")
     // 注：MC/NeoForge 类不放入 testCompileOnly/testRuntimeOnly。
     // 原因：neoforge fat jar 会破坏 Gradle test worker 的 bootstrap classloader，
     // 导致 ClassNotFoundException: GradleWorkerMain。
@@ -151,12 +149,7 @@ val generateModMetadata = tasks.register<ProcessResources>("generateModMetadata"
     from("src/main/templates")
     into("build/generated/sources/modMetadata")
 }
-sourceSets.main.get().resources.srcDir(generateModMetadata)
-neoForge.ideSyncTask(generateModMetadata)
-
-tasks.compileJava {
-    options.encoding = "UTF-8"
-}
+the<org.gradle.api.tasks.SourceSetContainer>().getByName("main").resources.srcDir(generateModMetadata)
 
 // P2-19：单元测试配置
 // 依赖 MC 类的测试（StructureStartIndexTest/FullCommitQueueTest）排除：
@@ -164,28 +157,20 @@ tasks.compileJava {
 // 应迁入 NeoForge GameTest 运行环境（待 CI 闭环建立后处理）。
 sourceSets {
     test {
-        java {
-            exclude("com/mochi_753/steadychunks/structure/StructureStartIndexTest.java")
-            exclude("com/mochi_753/steadychunks/completion/FullCommitQueueTest.java")
-        }
+        java.exclude("com/mochi_753/steadychunks/structure/StructureStartIndexTest.java")
+        java.exclude("com/mochi_753/steadychunks/completion/FullCommitQueueTest.java")
     }
 }
 
-tasks.test {
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
     useJUnitPlatform()
     testLogging {
         events("passed", "skipped", "failed")
         showStandardStreams = false
     }
+    // 中文用户名 + Windows：Gradle 9 的 worker 用 UTF-8 写 argfile，
+    // 但 JVM 读 argfile 按 sun.jnu.encoding（Windows 默认 GBK），导致测试类路径乱码
+    // （ClassNotFoundException: ...Test）。强制 worker JVM 用 UTF-8 读取。
+    jvmArgs("-Dsun.jnu.encoding=UTF-8")
 }
 
-tasks.compileTestJava {
-    options.encoding = "UTF-8"
-}
-
-idea {
-    module {
-        isDownloadSources = true
-        isDownloadJavadoc = true
-    }
-}

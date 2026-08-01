@@ -3,6 +3,7 @@ package com.mochi_753.steadychunks.scheduler;
 import com.mochi_753.steadychunks.SteadyChunks;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.chunk.status.ChunkStatus;
 
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -91,11 +92,25 @@ public final class Watchdog {
 
         // 等待队列积压检测
         if (pending > 0 && scheduler.cpuPermitsAvailable() > 0) {
-            // permit 可用但有等待任务：drainPending 可能卡住
-            SteadyChunks.LOGGER.warn(
-                    "SteadyChunks Watchdog: 等待队列积压 pending={} 但 permitsAvailable={}（调度异常）",
-                    pending, scheduler.cpuPermitsAvailable());
-            anomalies++;
+            int noiseAvail = -1;
+            int noiseLimit = -1;
+            var noisePermit = scheduler.stageLimiter().permit(ChunkStatus.NOISE);
+            if (noisePermit != null) {
+                noiseAvail = noisePermit.availablePermits();
+                noiseLimit = noisePermit.maxPermits();
+            }
+            // P2 修复（第 5 轮）：NOISE 阶段 permit 被占时 pending>0 是正常等待
+            // （任务在等 NOISE_HEAVY 桶），不算调度异常。仅当 NOISE permit 也可用
+            // （noiseAvail > 0）或未限流（-1）却仍有积压时，才是真正的调度停摆。
+            if (noiseAvail != 0) {
+                SteadyChunks.LOGGER.warn(
+                        "SteadyChunks Watchdog: 等待队列积压 pending={} 但 permitsAvailable={}（调度异常）"
+                                + " drainWip={} inflight={} noiseAvail={}/{} bypass={} paused={} failOpen={}",
+                        pending, scheduler.cpuPermitsAvailable(), scheduler.drainWipValue(),
+                        inflight, noiseAvail, noiseLimit,
+                        scheduler.isBypassMode(), scheduler.isAdmissionPaused(), scheduler.isFailOpen());
+                anomalies++;
+            }
         }
 
         if (anomalies > 0) {
