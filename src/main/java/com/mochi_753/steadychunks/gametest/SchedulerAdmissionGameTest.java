@@ -1,5 +1,6 @@
 package com.mochi_753.steadychunks.gametest;
 
+import com.mochi_753.steadychunks.config.CommonConfig;
 import com.mochi_753.steadychunks.io.LifecycleCleanupCoordinator;
 import com.mochi_753.steadychunks.scheduler.ChunkScheduler;
 import com.mochi_753.steadychunks.scheduler.ResourceType;
@@ -84,6 +85,10 @@ public class SchedulerAdmissionGameTest {
         scheduler.setEnabled(false);
         scheduler.clearAll(new IllegalStateException("GameTest cleanup"));
         scheduler.resetDiagnostics();
+        // 第 9 轮卡死修复：测试内部把 NOISE_HEAVY 桶压到 1（验证准入排队），若不恢复，
+        // 后续批次的结构区块加载/真实生成全部在 NOISE 并发=1 下排队滞留 → 生成任务
+        // 长期不终结（refCount 不归零）→ toDrop 滞留 → processUnloads 忙转螺旋。
+        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, CommonConfig.LIMIT_NOISE.get());
     }
 
     /**
@@ -785,5 +790,184 @@ public class SchedulerAdmissionGameTest {
             scheduler.openDimension(Level.NETHER);
             resetScheduler(scheduler);
         });
+    }
+
+    /**
+     * 第 9 轮 P0-1 修复验证：直接获准（permit 充足，不入队）的 NOISE 任务
+     * 同样计入完整生命周期计数——注册点已前移到 NOISE 准入入口（controlAdmission），
+     * direct、排队（enqueuePending）与 fail-open（runUncontrolled）三条路径共享同一 lease。
+     * <p>
+     * 旧实现只在 enqueuePending 内注册：direct 任务 inflightCount 增加但
+     * globalTaskCount/dimensionTaskCounts 不增加——停服等待 globalTaskCount 归零
+     * 会漏掉正在运行的直接获准任务。本测试断言：direct 任务从注册到原 Future
+     * 完成期间计数保持 +1，完成后归零。
+     */
+    @GameTest(template = "empty", batch = "steady_direct_count", timeoutTicks = 600)
+    public void directAdmissionShouldBeCountedUntilCompletion(GameTestHelper helper) {
+        GenerationChunkHolder holder = obtainHolder(helper);
+        ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
+        ChunkAccess chunk = helper.getLevel().getChunk(0, 0);
+
+        ChunkScheduler scheduler = ChunkScheduler.getInstance();
+        scheduler.setEnabled(true);
+        scheduler.setAdmissionPaused(false);
+        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, 8);
+        scheduler.resetDiagnostics();
+
+        LifecycleCleanupCoordinator coordinator = LifecycleCleanupCoordinator.getInstance();
+        ResourceKey<Level> overworld = helper.getLevel().dimension();
+        int before = coordinator.globalTaskCount();
+        int dimBefore = coordinator.dimensionTaskCount(overworld);
+
+        // permit 充足 → direct 路径（不入队）
+        CompletableFuture<ChunkResult<ChunkAccess>> underlying = new CompletableFuture<>();
+        CompletableFuture<ChunkResult<ChunkAccess>> task = scheduler.controlAdmission(
+                ChunkStatus.NOISE, false, map, holder, () -> underlying);
+
+        helper.assertTrue(scheduler.pendingCount() == 0, "permit 充足的任务不应入队");
+        helper.assertTrue(!task.isDone(), "原 Future 未完成时直接获准任务应保持进行中");
+        helper.assertTrue(coordinator.globalTaskCount() == before + 1,
+                "直接获准任务应计入全局任务计数（完整生命周期）");
+        helper.assertTrue(coordinator.dimensionTaskCount(overworld) == dimBefore + 1,
+                "直接获准任务应计入维度任务计数");
+
+        // 原 Future 完成：计数应归零（direct 路径 lease 绑定原 Future 终态）
+        underlying.complete(ChunkResult.of(chunk));
+        helper.assertTrue(task.isDone(), "原 Future 完成后任务应完成");
+        helper.assertTrue(coordinator.globalTaskCount() == before,
+                "任务完成后全局任务计数应归零");
+        helper.assertTrue(coordinator.dimensionTaskCount(overworld) == dimBefore,
+                "任务完成后维度任务计数应归零");
+
+        resetScheduler(scheduler);
+        helper.succeed();
+    }
+
+    /**
+     * 第 9 轮 P0-2 修复验证：旧 generation 的迟到 lease 不得串改维度重新加载后
+     * 新 generation 的任务计数。
+     * <p>
+     * 旧实现 lease.close 按维度 key 重新 computeIfPresent 递减：维度卸载
+     * （onDimensionUnload 无条件 remove entry）后重载产生的新 counter，会被旧任务
+     * A 的迟到 close 误减（新任务 B 的计数被清掉）。修复后 lease 捕获注册时的
+     * 实际 counter 对象，close 用 {@code remove(dimension, counter)} 只删除自己
+     * 对应的 counter——key 已映射新对象时不匹配，删除无操作。
+     */
+    @GameTest(template = "empty", batch = "steady_dim_lease_generation", timeoutTicks = 600)
+    public void oldDimensionLeaseMustNotDecrementReloadedDimension(GameTestHelper helper) {
+        ServerLevel overworld = helper.getLevel();
+        ServerLevel nether = overworld.getServer().getLevel(Level.NETHER);
+        helper.assertTrue(nether != null, "下界应已加载");
+        GenerationChunkHolder netherHolder = obtainHolderForLevel(nether);
+        ChunkMap netherMap = nether.getChunkSource().chunkMap;
+        ChunkAccess netherChunk = nether.getChunk(0, 0);
+
+        ChunkScheduler scheduler = ChunkScheduler.getInstance();
+        scheduler.setEnabled(true);
+        scheduler.setAdmissionPaused(false);
+        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, 8);
+
+        LifecycleCleanupCoordinator coordinator = LifecycleCleanupCoordinator.getInstance();
+
+        // 旧 generation 任务 A：permit 充足 → direct 执行（注册旧 counter，计数=1）
+        CompletableFuture<ChunkResult<ChunkAccess>> aUnderlying = new CompletableFuture<>();
+        CompletableFuture<ChunkResult<ChunkAccess>> taskA = scheduler.controlAdmission(
+                ChunkStatus.NOISE, false, netherMap, netherHolder, () -> aUnderlying);
+        helper.assertTrue(coordinator.dimensionTaskCount(Level.NETHER) == 1,
+                "任务 A 注册后下界维度计数应为 1");
+
+        // 维度卸载：cancelDimension + 移除 counter entry（模拟生产 LevelEvent.Unload）
+        coordinator.onDimensionUnload(Level.NETHER, 0);
+        helper.assertTrue(coordinator.dimensionTaskCount(Level.NETHER) == 0,
+                "维度卸载后旧 counter entry 应被移除");
+
+        // 维度重新加载：恢复接收（模拟生产 LevelEvent.Load）
+        scheduler.openDimension(Level.NETHER);
+
+        // 新 generation 任务 B：注册新 counter（计数=1）
+        CompletableFuture<ChunkResult<ChunkAccess>> bUnderlying = new CompletableFuture<>();
+        CompletableFuture<ChunkResult<ChunkAccess>> taskB = scheduler.controlAdmission(
+                ChunkStatus.NOISE, false, netherMap, netherHolder, () -> bUnderlying);
+        helper.assertTrue(coordinator.dimensionTaskCount(Level.NETHER) == 1,
+                "维度重载后新任务 B 注册计数应为 1（新 counter）");
+
+        // 旧任务 A 完成：迟到 lease 关闭——不得误减 B 的新 counter
+        aUnderlying.complete(ChunkResult.of(netherChunk));
+        helper.assertTrue(taskA.isDone(), "旧任务 A 应已完成");
+        helper.assertTrue(coordinator.dimensionTaskCount(Level.NETHER) == 1,
+                "旧 lease 关闭不得串改重载后新 generation 的计数（B 的计数应保持 1）");
+
+        // 新任务 B 完成：计数归零并移除
+        bUnderlying.complete(ChunkResult.of(netherChunk));
+        helper.assertTrue(taskB.isDone(), "新任务 B 应已完成");
+        helper.assertTrue(coordinator.dimensionTaskCount(Level.NETHER) == 0,
+                "新任务完成后维度计数应归零并移除");
+
+        resetScheduler(scheduler);
+        helper.succeed();
+    }
+
+    /**
+     * 第 9 轮 P1 修复验证：停服超时强制清理后不再清零任务计数——运行中任务的迟到
+     * lease 会把计数正确递减到零（不产生负数）；新服务器生命周期通过 onServerStart()
+     * 恢复接收（集成服务器回主菜单后再开新世界的场景）。
+     * <p>
+     * 旧实现 forceClearAll 执行 dimensionTaskCounts.clear() + globalTaskCount.set(0)：
+     * 已运行任务完成后 decrementAndGet 产生负数；且 shutdownMode 无恢复入口，
+     * 静态单例永久拒绝后续世界注册。修复后：计数保留由迟到 lease 归零，
+     * onServerStart() 恢复 shutdownMode、调度器 accepting 与 I/O 队列状态。
+     */
+    @GameTest(template = "empty", batch = "steady_server_restart", timeoutTicks = 600)
+    public void serverRestartShouldUseNewLifecycleGeneration(GameTestHelper helper) {
+        GenerationChunkHolder holder = obtainHolder(helper);
+        ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
+        ChunkAccess chunk = helper.getLevel().getChunk(0, 0);
+
+        ChunkScheduler scheduler = ChunkScheduler.getInstance();
+        scheduler.setEnabled(true);
+        scheduler.setAdmissionPaused(false);
+        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, 8);
+
+        LifecycleCleanupCoordinator coordinator = LifecycleCleanupCoordinator.getInstance();
+
+        // 生命周期 1：运行中的任务 A（未完成）
+        CompletableFuture<ChunkResult<ChunkAccess>> aUnderlying = new CompletableFuture<>();
+        CompletableFuture<ChunkResult<ChunkAccess>> taskA = scheduler.controlAdmission(
+                ChunkStatus.NOISE, false, map, holder, () -> aUnderlying);
+        helper.assertTrue(coordinator.globalTaskCount() == 1, "任务 A 注册后全局计数应为 1");
+
+        // 停服：等待超时（A 未完成）→ 强制清理。修复后保留计数供迟到 lease 归零
+        coordinator.onServerShutdown(50L);
+        helper.assertTrue(coordinator.isShutdownMode(), "停服后应处于停服模式");
+        helper.assertTrue(coordinator.globalTaskCount() == 1,
+                "停服超时强制清理不得清零仍有 lease 的全局计数");
+        helper.assertTrue(scheduler.pendingCount() == 0, "停服清理后等待队列应清空");
+
+        // 服务器重启：恢复接收（修复前 shutdownMode 无恢复入口，永久拒绝新世界）
+        coordinator.onServerStart();
+        helper.assertTrue(!coordinator.isShutdownMode(), "服务器重启后应退出停服模式");
+
+        // 生命周期 2：新任务 B 注册成功
+        CompletableFuture<ChunkResult<ChunkAccess>> bUnderlying = new CompletableFuture<>();
+        CompletableFuture<ChunkResult<ChunkAccess>> taskB = scheduler.controlAdmission(
+                ChunkStatus.NOISE, false, map, holder, () -> bUnderlying);
+        helper.assertTrue(!taskB.isDone(), "重启后新任务 B 应被接受（原 Future 未完成）");
+        helper.assertTrue(coordinator.globalTaskCount() == 2,
+                "重启后全局计数应为 2（旧任务 A 残留 + 新任务 B）");
+
+        // 旧任务 A 迟到完成：计数递减（不产生负数）
+        aUnderlying.complete(ChunkResult.of(chunk));
+        helper.assertTrue(taskA.isDone(), "旧任务 A 应已完成");
+        helper.assertTrue(coordinator.globalTaskCount() == 1,
+                "迟到 lease 关闭后全局计数应为 1（不得为负数）");
+
+        // 新任务 B 完成：计数归零
+        bUnderlying.complete(ChunkResult.of(chunk));
+        helper.assertTrue(taskB.isDone(), "新任务 B 应已完成");
+        helper.assertTrue(coordinator.globalTaskCount() == 0,
+                "全部任务完成后全局计数应归零");
+
+        resetScheduler(scheduler);
+        helper.succeed();
     }
 }

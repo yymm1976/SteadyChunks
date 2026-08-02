@@ -105,6 +105,15 @@ public final class IoQueueController {
     }
 
     /**
+     * 第 9 轮 P1 修复：退出停服模式（服务器重新启动时恢复接受读取任务）。
+     * 与 {@link #enterShutdownMode()} 配对，供 {@code LifecycleCleanupCoordinator.onServerStart()} 调用。
+     */
+    public void exitShutdownMode() {
+        shutdownMode.set(false);
+        SteadyChunks.LOGGER.info("SteadyChunks I/O 退出停服模式");
+    }
+
+    /**
      * 提交读取任务。
      * <p>
      * 停服模式下拒绝新读取（除依赖关键任务外）。

@@ -61,6 +61,13 @@ public final class ChunkScheduler {
     private final AtomicInteger drainWip = new AtomicInteger(0);
     /** 诊断：drain WIP 当前值（Watchdog 用，判断 drain 是否泄漏） */
     public int drainWipValue() { return drainWip.get(); }
+    /**
+     * 第 9 轮卡死修复：drain 成功 poll 计数（Watchdog 恢复线程用）。
+     * drain 每处理一个排队任务递增——忙转死锁时 Server thread 卡在
+     * processUnloads、drain 停滞，此值不变；恢复线程据此判定停摆。
+     */
+    private final AtomicLong drainProgress = new AtomicLong(0);
+    public long drainProgress() { return drainProgress.get(); }
     /** P1-3 修复：禁用调度器时的有节奏放行模式（不再一次性同步启动全部积压任务） */
     private final AtomicBoolean bypassMode = new AtomicBoolean(false);
     /** P1-3：每 tick 放行的最大 bypass 任务数 */
@@ -270,6 +277,19 @@ public final class ChunkScheduler {
                     ChunkResult.error("SteadyChunks 调度器已关闭"));
         }
 
+        // 第 9 轮 P0-1 修复：注册点前移到 NOISE 准入入口——direct（permit 立即满足）、
+        // 排队（enqueuePending）与 fail-open（runUncontrolled）三条路径共享同一 lease，
+        // 使 globalTaskCount/dimensionTaskCounts 覆盖全部受控 NOISE 任务（完整生命周期）。
+        // 旧实现只在 enqueuePending 内注册：直接获准任务与 fail-open 透传不在计数中，
+        // 停服等待 globalTaskCount 归零会漏掉正在运行的任务。注册失败（停服模式）：
+        // 直接拒绝，不入队、不执行。
+        LifecycleCleanupCoordinator.TaskRegistration registration =
+                LifecycleCleanupCoordinator.getInstance().tryRegisterTask(dimension);
+        if (!registration.registered()) {
+            return CompletableFuture.completedFuture(
+                    ChunkResult.error("SteadyChunks 服务器正在关闭"));
+        }
+
         // P1 修复（第 4 轮）：Mixin 真实拦截计数（供真实生成 GameTest 断言）。
         mixinInterceptCount.incrementAndGet();
 
@@ -284,36 +304,36 @@ public final class ChunkScheduler {
                         pendingCount.get());
             } else {
                 logFailOpenThrottled();
-                return runUncontrolled(originalOperation);
+                return runUncontrolled(originalOperation, registration);
             }
         }
         if (pendingCount.get() >= pendingCriticalThreshold) {
             failOpen.set(true);
             SteadyChunks.LOGGER.warn("NOISE 等待队列超过紧急阈值 {}，进入 fail-open 透传（pending={}）",
                     pendingCriticalThreshold, pendingCount.get());
-            return runUncontrolled(originalOperation);
+            return runUncontrolled(originalOperation, registration);
         }
 
         // P0-4 修复：紧急暂停时普通任务进入等待队列，依赖关键任务旁路放行
         if (admissionPaused && !isDependencyUnlock) {
-            return enqueuePending(originalOperation, isDependencyUnlock, map, holder, dimension);
+            return enqueuePending(originalOperation, isDependencyUnlock, map, holder, dimension, registration);
         }
 
         // 组合 lease：固定获取顺序 global → stage
         PermitLease global = cpuGeneralPermit.tryAcquireLease();
         if (!global.acquired()) {
             // 全局 permit 不足：入队等待
-            return enqueuePending(originalOperation, isDependencyUnlock, map, holder, dimension);
+            return enqueuePending(originalOperation, isDependencyUnlock, map, holder, dimension, registration);
         }
         PermitLease stage = stageLimiter.tryAcquireLease(targetStatus, isDependencyUnlock);
         if (!stage.acquired()) {
             // 阶段 permit 不足：释放全局 permit 后入队等待
             global.close();
-            return enqueuePending(originalOperation, isDependencyUnlock, map, holder, dimension);
+            return enqueuePending(originalOperation, isDependencyUnlock, map, holder, dimension, registration);
         }
 
-        // 组合 permit 获取成功：执行原版操作，完成后统一释放（direct 路径无注册 lease）
-        return executeOriginal(targetStatus, originalOperation, null, global, stage, null);
+        // 组合 permit 获取成功：执行原版操作，完成后统一释放（direct 路径共享准入入口的注册 lease）
+        return executeOriginal(targetStatus, originalOperation, null, global, stage, registration);
     }
 
     /**
@@ -324,7 +344,10 @@ public final class ChunkScheduler {
      * 为受控 + 非受控总峰值，避免诊断指标低估。
      */
     private CompletableFuture<ChunkResult<ChunkAccess>> runUncontrolled(
-            Supplier<CompletableFuture<ChunkResult<ChunkAccess>>> originalOperation) {
+            Supplier<CompletableFuture<ChunkResult<ChunkAccess>>> originalOperation,
+            // 第 9 轮 P0-1 修复：fail-open 任务同样纳入完整生命周期计数——
+            // 停服等待/维度泄漏检测不遗漏透传任务；原 Future 终态关闭 lease。
+            LifecycleCleanupCoordinator.TaskRegistration registration) {
         int active = uncontrolledNoiseActive.incrementAndGet();
         // P1-4 修复（第 6 轮）：总并发峰值 = 受控 + 非受控之和
         updateTotalNoisePeak();
@@ -333,11 +356,15 @@ public final class ChunkScheduler {
             future = originalOperation.get();
         } catch (Throwable ex) {
             uncontrolledNoiseActive.decrementAndGet();
+            registration.close();
             CompletableFuture<ChunkResult<ChunkAccess>> failed = new CompletableFuture<>();
             failed.completeExceptionally(ex);
             return failed;
         }
-        future.whenComplete((result, ex) -> uncontrolledNoiseActive.decrementAndGet());
+        future.whenComplete((result, ex) -> {
+            uncontrolledNoiseActive.decrementAndGet();
+            registration.close();
+        });
         return future;
     }
 
@@ -367,10 +394,15 @@ public final class ChunkScheduler {
             boolean isDependencyUnlock,
             GeneratingChunkMap map,
             GenerationChunkHolder holder,
-            ResourceKey<Level> dimension) {
+            ResourceKey<Level> dimension,
+            // 第 9 轮 P0-1 修复：注册 lease 由准入入口（controlAdmission）创建并传入，
+            // 本方法不再内部注册——direct/排队/fail-open 共享同一 lease，计数覆盖
+            // 全部受控 NOISE 任务。所有拒绝路径必须关闭该 lease。
+            LifecycleCleanupCoordinator.TaskRegistration registration) {
         // P0 修复（第 4 轮）：生命周期停止接收时拒绝入队（停服/卸载场景，原版同步关闭中，
         // 返回 error result 等价于生成失败但不触发致命异常，不会残留永久等待的代理 Future）。
         if (!acceptingTasks.get()) {
+            registration.close();
             return CompletableFuture.completedFuture(
                     ChunkResult.error("SteadyChunks 调度器已停止接收任务"));
         }
@@ -378,6 +410,7 @@ public final class ChunkScheduler {
         DimensionLifecycle dimensionState =
                 dimensionLifecycles.computeIfAbsent(dimension, ignored -> new DimensionLifecycle());
         if (!dimensionState.accepting.get()) {
+            registration.close();
             return CompletableFuture.completedFuture(
                     ChunkResult.error("SteadyChunks 维度正在卸载"));
         }
@@ -388,20 +421,6 @@ public final class ChunkScheduler {
         Runnable probe = enqueueProbeHook;
         if (probe != null) {
             probe.run();
-        }
-        // 第 8 轮 P0 修复：先注册、再发布（lease 从入队持有到代理 Future 终态，方案 B：
-        // 完整任务生命周期计数）。修复旧 registerTask 的两个发布竞态：
-        // ① 旧实现 offer 之后才注册，drainer 可能在注册前 poll 并注销，计数短暂为负；
-        // ② 旧实现停服模式下注册失败（false）后任务仍入队，出队时无条件注销，计数永久变负。
-        // 注册失败（停服模式）：直接拒绝，不入队、不创建代理 Future。
-        // 第 8 轮 review 修复：tryRegisterTask 必须位于 pendingCount 递增之前——
-        // 停服窗口（shutdownMode=true 后、forceClearAll 前）acceptingTasks 仍为 true，
-        // 若先递增后拒绝，每次拒绝都会泄漏 pendingCount +1 且永不归还。
-        LifecycleCleanupCoordinator.TaskRegistration registration =
-                LifecycleCleanupCoordinator.getInstance().tryRegisterTask(dimension);
-        if (!registration.registered()) {
-            return CompletableFuture.completedFuture(
-                    ChunkResult.error("SteadyChunks 服务器正在关闭"));
         }
         int depth = pendingCount.incrementAndGet();
         // P1-2：更新高水位（历史峰值，供诊断与报警）
@@ -425,6 +444,11 @@ public final class ChunkScheduler {
             SteadyChunks.LOGGER.info("NOISE 等待队列回落至告警阈值以下（pending={}）", depth);
         }
         CompletableFuture<ChunkResult<ChunkAccess>> proxy = new CompletableFuture<>();
+        // 第 9 轮 P1 修复：注册 lease 与代理 Future 终态统一绑定——此后所有终态路径
+        // 只需 proxy.complete(...)，close 由本绑定自动触发（幂等 CAS 兜底）。
+        // 旧实现八处手工 close：lease 关闭时机略早于代理终态（globalTaskCount 已归零
+        // 但 proxy 未完成），且新增错误路径时易遗漏。
+        proxy.whenComplete((result, ex) -> registration.close());
         PendingNoiseTask task = new PendingNoiseTask(
                 originalOperation, proxy, isDependencyUnlock, map, holder,
                 dimension, generation, dimensionGeneration, registration);
@@ -432,12 +456,12 @@ public final class ChunkScheduler {
         // 第 8 轮 P1 修复：入队后二次校验完整生命周期（全局 + 维度），替代旧实现只复查
         // 全局 lifecycleGeneration。旧实现漏掉"维度检查后、offer 前 cancelDimension"窗口：
         // 维度已卸载但任务仍以旧维度代数入队，且全局代数未变、二次检查通过。
-        // 若清理已在检查与入队之间发生，移除任务并 close lease、以 error result 正常完成
-        // （异常完成会让原版 setFatalException，破坏真实区块生成链），避免残留。
+        // 若清理已在检查与入队之间发生，移除任务并以 error result 正常完成
+        // （异常完成会让原版 setFatalException，破坏真实区块生成链），避免残留；
+        // proxy 完成触发上方绑定，lease 自动关闭。
         if (!lifecycleValid(task)) {
             if (pendingNoiseTasks.remove(task)) {
                 pendingCount.updateAndGet(v -> Math.max(0, v - 1));
-                registration.close();
                 proxy.complete(ChunkResult.error("SteadyChunks 调度器生命周期已变化"));
             }
         }
@@ -463,9 +487,10 @@ public final class ChunkScheduler {
             CompletableFuture<ChunkResult<ChunkAccess>> proxy,
             PermitLease global,
             PermitLease stage,
-            // 第 8 轮 P0 修复（方案 B）：任务注册 lease，随代理 Future 终态关闭
-            // （direct 路径无注册，传 null）。poll 出队不再注销，保证协调器计数
-            // 覆盖完整任务生命周期（等待/已出队/已提交/运行中）。
+            // 第 9 轮 P0-1/P1 修复：注册 lease 由准入入口（controlAdmission）创建，
+            // direct 与排队路径共享（direct 不再传 null）；本方法内与终态 Future
+            // 统一绑定（proxy 或原 Future 的 whenComplete → close），此后所有终态
+            // 路径只需完成 proxy，不再手工 close。
             LifecycleCleanupCoordinator.TaskRegistration registration) {
 
         // P1 修复（第 4 轮）：记录 NOISE 在途任务峰值（真实生成测试验证并发上限）。
@@ -477,11 +502,9 @@ public final class ChunkScheduler {
         try {
             future = originalOperation.get();
         } catch (Throwable ex) {
-            // 原版操作抛异常：释放组合 permit 并传播异常（审查修复：统一 close 路径）
-            stage.close();
-            global.close();
-            inflightCount.decrementAndGet();
-            if (registration != null) {
+            // 第 9 轮 P1 修复：direct 异常路径无 proxy 可触发终态绑定，手工关闭 lease
+            // （排队路径 proxy.completeExceptionally 会触发绑定，无需此处关闭）。
+            if (proxy == null && registration != null) {
                 registration.close();
             }
             requestDrain();
@@ -494,18 +517,24 @@ public final class ChunkScheduler {
             return failed;
         }
 
+        // 第 9 轮 P1 修复：注册 lease 与任务终态 Future 统一绑定——排队路径绑定代理
+        // Future（此后所有终态路径只需 proxy.complete），direct 路径绑定原 Future。
+        // close 严格发生在任务对外可见终态之后（proxy.complete 同步触发绑定回调），
+        // 消除"计数已归零但代理未终态"的窗口；幂等 CAS 仍作为最后保护。
+        if (registration != null) {
+            CompletableFuture<ChunkResult<ChunkAccess>> terminal =
+                    proxy != null ? proxy : future;
+            terminal.whenComplete((result, ex) -> registration.close());
+        }
+
         future.whenComplete((result, ex) -> {
             // 释放顺序与获取顺序相反：stage → global
             stage.close();
             global.close();
             inflightCount.decrementAndGet();
-            // 第 8 轮 P0 修复（方案 B）：任务进入终态才关闭注册 lease。
-            // 已出队/运行中任务保持计数，停服等待与维度泄漏检测覆盖完整生命周期。
-            if (registration != null) {
-                registration.close();
-            }
             if (proxy != null) {
-                // 完成代理 Future
+                // 完成代理 Future（完成顺序：先释放 permit，再完成 proxy——
+                // proxy 完成时触发上方绑定回调关闭注册 lease）
                 if (ex != null) {
                     proxy.completeExceptionally(ex);
                 } else {
@@ -598,6 +627,7 @@ public final class ChunkScheduler {
                 return;
             }
             pendingCount.decrementAndGet();
+            drainProgress.incrementAndGet();
             // 第 8 轮 P0 修复（方案 B）：任务离开等待队列不注销注册 lease——
             // 计数覆盖完整任务生命周期，直到代理 Future 终态（executeOriginal
             // whenComplete / completeLifecycleRejected / mailbox 失败路径）才关闭。
@@ -640,6 +670,7 @@ public final class ChunkScheduler {
                 return;
             }
             pendingCount.decrementAndGet();
+            drainProgress.incrementAndGet();
             // 第 8 轮 P0 修复（方案 B）：任务离开等待队列不注销注册 lease——
             // 计数覆盖完整任务生命周期，直到代理 Future 终态才关闭（同上）。
             // P0-2：恢复通过原 worldgen mailbox 提交，回到原执行上下文，
@@ -686,16 +717,14 @@ public final class ChunkScheduler {
             // 与第 5 轮"取消/清理路径统一 error result"的语义保持一致。
             stage.close();
             global.close();
-            // 第 8 轮 P0 修复（方案 B）：任务终态统一关闭注册 lease
-            task.registration().close();
+            // 第 9 轮 P1 修复：不再手工 close——proxy.complete 触发终态绑定自动关闭
             task.proxy().complete(ChunkResult.error("SteadyChunks worldgen mailbox 已停止接收"));
             requestDrain();
         } catch (Throwable throwable) {
             // P0-1 修复（第 6 轮）：非预期错误 → 记录日志 + error result 正常完成（同样避免 fatal）。
             stage.close();
             global.close();
-            // 第 8 轮 P0 修复（方案 B）：任务终态统一关闭注册 lease
-            task.registration().close();
+            // 第 9 轮 P1 修复：不再手工 close——proxy.complete 触发终态绑定自动关闭
             SteadyChunks.LOGGER.error("提交 NOISE 恢复任务时发生非预期错误", throwable);
             task.proxy().complete(ChunkResult.error(
                     "SteadyChunks 无法恢复 NOISE 任务: " + throwable.getClass().getSimpleName()));
@@ -730,8 +759,7 @@ public final class ChunkScheduler {
     private void completeLifecycleRejected(PendingNoiseTask task, PermitLease global, PermitLease stage) {
         stage.close();
         global.close();
-        // 第 8 轮 P0 修复（方案 B）：任务被拒绝即进入终态，关闭注册 lease
-        task.registration().close();
+        // 第 9 轮 P1 修复：不再手工 close——proxy.complete 触发终态绑定自动关闭
         task.proxy().complete(ChunkResult.error("SteadyChunks 调度器生命周期已变化，任务被拒绝"));
         requestDrain();
     }
@@ -792,8 +820,7 @@ public final class ChunkScheduler {
                 return false;
             }
             pendingCount.updateAndGet(v -> Math.max(0, v - 1));
-            // 第 8 轮 P0 修复：队列中任务被取消即进入终态，关闭其注册 lease
-            task.registration().close();
+            // 第 9 轮 P1 修复：不再手工 close——proxy.complete 触发终态绑定自动关闭
             task.proxy().complete(ChunkResult.error(reason));
             return true;
         });
@@ -901,6 +928,20 @@ public final class ChunkScheduler {
     }
 
     /**
+     * 第 9 轮 P1 修复：仅恢复任务接收，<b>不清空等待队列</b>（服务器启动场景专用）。
+     * <p>
+     * {@link #resetForReload(Throwable)} 会以 error result 清空队列——服务器启动
+     * （ServerStarting）时队列可能仍有 spawn 区域真实生成残留任务在排空，被清空后
+     * 这些区块卡在 NOISE 之前；随后任何强制同步加载（如信标 BE tick 的
+     * getBlockState → Level.getChunk 死等未达 FULL 的区块）会在 Server thread 上
+     * 自我死锁（drain 依赖 Server thread tick 推进）。启动场景应让残留任务自然完成，
+     * 仅恢复接收。测试/运行期 reload 仍使用 {@link #resetForReload(Throwable)}。
+     */
+    public void resumeAccepting() {
+        acceptingTasks.set(true);
+    }
+
+    /**
      * P1 修复（第 5 轮）：清空等待队列并<b>恢复接收</b>（运行期 reload / GameTest 重置）。
      */
     public void resetForReload(Throwable cause) {
@@ -919,6 +960,35 @@ public final class ChunkScheduler {
     }
 
     /**
+     * 第 9 轮卡死修复：drain 停摆恢复——以 error result 完成所有排队任务。
+     * <p>
+     * 忙转死锁场景（卸载竞态 → scheduleUnload 重入风暴 → Server thread 卡在
+     * processUnloads → drain 停滞 → 排队任务永不终结 → refCount 不归零 → 风暴加剧）
+     * 的唯一破环点：让排队任务终结（原版 runUntilWait 收到 error result 后
+     * markForCancellation → releaseClaim → refCount 归零 → isReadyForSaving 恢复
+     * true → 保存/卸载完成 → 忙转自愈）。error result 走原版 completeFuture 正常
+     * 路径，区块状态可恢复，之后由原版自愈重新生成。
+     * <p>
+     * 与 {@link #stopAcceptingAndClear(Throwable)} 的区别：不动生命周期状态
+     * （accepting/代数），只清空等待队列——调用方（Watchdog 恢复线程）判定
+     * 调度停摆后用于破环，不改变调度器其余状态。
+     *
+     * @return 释放的排队任务数
+     */
+    public int failOpenAllPending() {
+        int n = 0;
+        PendingNoiseTask task;
+        while ((task = pendingNoiseTasks.poll()) != null) {
+            pendingCount.updateAndGet(v -> Math.max(0, v - 1));
+            // 终态绑定（proxy.whenComplete → registration.close()）自动关闭 lease；
+            // error result 与 stopAcceptingAndClear 同语义（第 5 轮 P2 修复）。
+            task.proxy().complete(ChunkResult.error("SteadyChunks drain 停摆恢复"));
+            n++;
+        }
+        return n;
+    }
+
+    /**
      * P0/P1 修复（第 4/5 轮）：生命周期屏障，先停止接收并递增代数，再清空队列。
      */
     private void stopAcceptingAndClear(Throwable cause) {
@@ -927,8 +997,7 @@ public final class ChunkScheduler {
         PendingNoiseTask task;
         while ((task = pendingNoiseTasks.poll()) != null) {
             pendingCount.updateAndGet(v -> Math.max(0, v - 1));
-            // 第 8 轮 P0 修复：队列中任务被清理即进入终态，关闭其注册 lease
-            task.registration().close();
+            // 第 9 轮 P1 修复：不再手工 close——proxy.complete 触发终态绑定自动关闭
             // P2 修复（第 5 轮）：以 error result 正常完成（而非异常完成）。
             // 原版 GenerationChunkHolder.lambda$applyStep$0 的 handle 会把异常完成视为
             // 致命错误（MinecraftServer.setFatalException），导致真实区块生成链中断、
@@ -961,9 +1030,9 @@ public final class ChunkScheduler {
             // P0 修复（第 7 轮）：任务入队时的维度生命周期代数。维度卸载会递增维度代数
             // 并关闭接收，已出队/已提交但未运行的任务经 lifecycleValid 拒绝（不依赖全局）。
             long dimensionGeneration,
-            // 第 8 轮 P0 修复：注册 lease——从入队持有到代理 Future 终态（方案 B：
-            // 完整任务生命周期计数）。poll 出队不注销，停服等待/维度泄漏检测覆盖
-            // 等待、已出队、已提交、运行中全部状态；终态路径统一 close()。
+            // 第 9 轮 P0-1/P1 修复：注册 lease 由准入入口（controlAdmission）创建，
+            // 经本 record 从入队持有到代理 Future 终态——排队路径在 enqueuePending
+            // 绑定 proxy.whenComplete → close；poll 出队不注销，终态统一由绑定触发。
             LifecycleCleanupCoordinator.TaskRegistration registration
     ) {
         /**

@@ -12,7 +12,9 @@ import com.mochi_753.steadychunks.network.ChunkSendQuota;
 import com.mochi_753.steadychunks.network.SteadyChunksPayloads;
 import com.mochi_753.steadychunks.config.PresetApplier;
 import com.mochi_753.steadychunks.diagnostics.CrashReportContributor;
+import com.mochi_753.steadychunks.io.LifecycleCleanupCoordinator;
 import com.mochi_753.steadychunks.scheduler.ChunkScheduler;
+import com.mochi_753.steadychunks.scheduler.Watchdog;
 import com.mochi_753.steadychunks.structure.CacheInvalidationReloadListener;
 import com.mochi_753.steadychunks.telemetry.ChunkFlightRecorder;
 import com.mochi_753.steadychunks.telemetry.TelemetryListeners;
@@ -22,8 +24,13 @@ import net.neoforged.fml.event.lifecycle.FMLCommonSetupEvent;
 import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.AddReloadListenerEvent;
 import net.neoforged.neoforge.event.RegisterCommandsEvent;
+import net.neoforged.neoforge.event.level.LevelEvent;
 import net.neoforged.neoforge.event.server.ServerStartingEvent;
+import net.neoforged.neoforge.event.server.ServerStoppingEvent;
 import net.neoforged.neoforge.event.tick.ServerTickEvent;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.Level;
 
 /**
  * 启动引导：探测兼容性 → 初始化 MixinGate → 注册配置 → 注册命令 → 同步诊断 → 输出所有权表。
@@ -62,10 +69,16 @@ public final class ModuleBootstrap {
         // 5. 订阅事件
         modEventBus.addListener(ModuleBootstrap::onCommonSetup);
         NeoForge.EVENT_BUS.addListener(ModuleBootstrap::onServerStarting);
+        // 第 9 轮生产接线：服务器停止 → 生命周期停服排空（与 onServerStarting 配对）
+        NeoForge.EVENT_BUS.addListener(ModuleBootstrap::onServerStopping);
         NeoForge.EVENT_BUS.addListener(ModuleBootstrap::onRegisterCommands);
         NeoForge.EVENT_BUS.addListener(ModuleBootstrap::onServerTick);
         // §17.2 订阅数据包重载事件，触发缓存统一失效
         NeoForge.EVENT_BUS.addListener(ModuleBootstrap::onAddReloadListener);
+        // 第 9 轮生产接线：维度加载/卸载 → 每维度生命周期开关（openDimension/onDimensionUnload），
+        // 使 cancelDimension 定向取消与维度计数在实际游戏中生效（此前仅 GameTest/FaultInjector 调用）
+        NeoForge.EVENT_BUS.addListener(ModuleBootstrap::onLevelLoad);
+        NeoForge.EVENT_BUS.addListener(ModuleBootstrap::onLevelUnload);
 
         // 5.1 注册网络包（Phase 5）
         SteadyChunksPayloads.register(modEventBus);
@@ -111,6 +124,14 @@ public final class ModuleBootstrap {
      * 服务端启动时同步诊断开关，确保配置已加载。
      */
     private static void onServerStarting(ServerStartingEvent event) {
+        // 第 9 轮 P1 修复：恢复任务接收（集成服务器回主菜单后再开新世界，
+        // 会再次触发 ServerStarting——shutdownMode 必须复位，否则静态单例
+        // 永久拒绝新世界任务注册）。
+        LifecycleCleanupCoordinator.getInstance().onServerStart();
+
+        // 第 9 轮卡死修复：启动独立 drain 停摆恢复线程（忙转死锁破环，见 Watchdog）。
+        Watchdog.getInstance().startRecoveryThread(ChunkScheduler.getInstance());
+
         ChunkFlightRecorder.syncFromConfig();
         SteadyChunks.LOGGER.info("SteadyChunks 诊断已同步配置：enabled={}", ChunkFlightRecorder.isEnabled());
 
@@ -152,6 +173,43 @@ public final class ModuleBootstrap {
                 scheduler.isEnabled(), governor.isEnabled(),
                 isDedicated ? "DEDICATED" : "INTEGRATED",
                 fullQueue.isEnabled(), sendQuota.isEnabled());
+    }
+
+    /**
+     * 第 9 轮生产接线：服务器停止时执行停服清理（拒绝新任务、等待活跃任务完成、
+     * 强制清理残留）。与 {@link #onServerStarting(ServerStartingEvent)} 配对，
+     * 支持集成服务器回主菜单后再开新世界的完整生命周期。
+     * <p>
+     * 等待上限 5 秒：超过即强制清理缓存/队列（任务计数保留，由迟到 lease 归零，
+     * 见 {@link LifecycleCleanupCoordinator#onServerShutdown(long)}）。
+     */
+    private static void onServerStopping(ServerStoppingEvent event) {
+        // 第 9 轮卡死修复：停止独立恢复线程（幂等，daemon 线程不阻塞停服）。
+        Watchdog.getInstance().stopRecoveryThread();
+        LifecycleCleanupCoordinator.getInstance().onServerShutdown(5000L);
+    }
+
+    /**
+     * 第 9 轮生产接线：维度加载 → 打开该维度的任务接收（accepting + generation++）。
+     * 与 {@link #onLevelUnload(LevelEvent.Unload)} 配对，使每维度生命周期在实际游戏中生效。
+     */
+    private static void onLevelLoad(LevelEvent.Load event) {
+        if (event.getLevel() instanceof ServerLevel serverLevel) {
+            ChunkScheduler.getInstance().openDimension(serverLevel.dimension());
+        }
+    }
+
+    /**
+     * 第 9 轮生产接线：维度卸载 → 定向取消该维度等待任务、递增维度代数、清理维度
+     * 残留（计数保留给已出队/运行中任务的迟到 lease）。
+     * <p>
+     * dimensionId 已不再被使用（Registry 统一通知后部分缓存不再使用该参数），传 0 保留兼容。
+     */
+    private static void onLevelUnload(LevelEvent.Unload event) {
+        if (event.getLevel() instanceof ServerLevel serverLevel) {
+            ResourceKey<Level> dimension = serverLevel.dimension();
+            LifecycleCleanupCoordinator.getInstance().onDimensionUnload(dimension, 0);
+        }
     }
 
     /**

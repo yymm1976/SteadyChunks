@@ -37,6 +37,108 @@ public final class Watchdog {
     /** 累计报告的异常数 */
     private final AtomicLong totalAnomalies = new AtomicLong(0);
 
+    // ---- 第 9 轮卡死修复：drain 停摆恢复线程 ----
+    /** 恢复线程是否已启动（幂等） */
+    private volatile boolean recoveryStarted = false;
+    /** 恢复线程停止标志 */
+    private volatile boolean stopRecovery = false;
+    /** 上次检测时的 drain 进度（ChunkScheduler.drainProgress） */
+    private long lastDrainProgress = -1;
+    /** 连续停滞检测计数（≥3 次 = 3 秒未 drain，判定停摆） */
+    private int stallCount = 0;
+    /** 累计恢复次数 */
+    private final AtomicLong totalRecoveries = new AtomicLong(0);
+
+    /**
+     * 启动独立 drain 停摆恢复线程（ModuleBootstrap 服务器启动时调用）。
+     * <p>
+     * 忙转死锁（卸载竞态 → scheduleUnload 重入风暴 → Server thread 卡在
+     * processUnloads）时 Server thread 的 tick 不再运行，tick 内 Watchdog 扫描
+     * 随之失效——排队任务永远等不到 drain，refCount 不归零、风暴加剧。独立
+     * daemon 线程每 1 秒检测一次：pending>0 且 permit 可用且 drain 进度连续
+     * 3 个周期未变（drain 停摆）→ {@link ChunkScheduler#failOpenAllPending()}
+     * 以 error result 完成排队任务 → 原版任务终结（releaseClaim → refCount 归零
+     * → isReadyForSaving 恢复 → 卸载完成 → 忙转自愈，Server thread 恢复 tick）。
+     * <p>
+     * 触发条件刻意严格（排除 paused/disabled/permit 不足），避免误伤正常排队
+     * 等待；释放后区块由原版自愈重新生成，调度器其余状态不动。
+     */
+    public synchronized void startRecoveryThread(ChunkScheduler scheduler) {
+        if (recoveryStarted) {
+            return;
+        }
+        recoveryStarted = true;
+        stopRecovery = false;
+        Thread thread = new Thread(() -> {
+            while (!stopRecovery) {
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e) {
+                    break;
+                }
+                try {
+                    checkDrainStall(scheduler);
+                } catch (Throwable t) {
+                    SteadyChunks.LOGGER.warn("SteadyChunks Watchdog 恢复检查异常", t);
+                }
+            }
+        }, "SteadyChunks-DrainRecovery");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    /** 停止恢复线程（服务器停止时调用，幂等） */
+    public void stopRecoveryThread() {
+        stopRecovery = true;
+    }
+
+    private void checkDrainStall(ChunkScheduler scheduler) {
+        int pending = scheduler.pendingCount();
+        long progress = scheduler.drainProgress();
+        if (pending == 0
+                || scheduler.isAdmissionPaused()
+                || !scheduler.isEnabled()
+                || scheduler.isFailOpen()
+                || scheduler.drainWipValue() != 0
+                || scheduler.cpuPermitsAvailable() <= 0) {
+            // 正常等待（paused/disabled/permit 不足）或队列空：复位停滞计数
+            stallCount = 0;
+            lastDrainProgress = progress;
+            return;
+        }
+        var noisePermit = scheduler.stageLimiter().permit(ChunkStatus.NOISE);
+        if (noisePermit != null && noisePermit.availablePermits() == 0) {
+            // NOISE 阶段 permit 被占：排队等待正常（P2 修复，第 5 轮）
+            stallCount = 0;
+            lastDrainProgress = progress;
+            return;
+        }
+        if (progress == lastDrainProgress) {
+            stallCount++;
+            // 第 9 轮卡死修复：停滞 2 秒后输出诊断（含排除项状态），便于定位
+            // "在途型"忙转（pending==0 但 refCount 滞留——恢复线程覆盖不到）。
+            if (stallCount == 2) {
+                SteadyChunks.LOGGER.warn(
+                        "SteadyChunks Watchdog: drain 停滞观察中 pending={} inflight={} drainWip={} "
+                                + "bypass={} paused={} failOpen={}（若持续 3 秒将 fail-open 排队任务）",
+                        pending, scheduler.inflightCount(), scheduler.drainWipValue(),
+                        scheduler.isBypassMode(), scheduler.isAdmissionPaused(), scheduler.isFailOpen());
+            }
+            if (stallCount >= 3) {
+                stallCount = 0;
+                int released = scheduler.failOpenAllPending();
+                totalRecoveries.incrementAndGet();
+                SteadyChunks.LOGGER.warn(
+                        "SteadyChunks Watchdog: drain 停摆检测（3 秒无进度，pending={}），"
+                                + "fail-open 释放排队任务 {} 个，打破卸载重入风暴死锁",
+                        pending, released);
+            }
+        } else {
+            stallCount = 0;
+        }
+        lastDrainProgress = progress;
+    }
+
     private Watchdog() {
     }
 

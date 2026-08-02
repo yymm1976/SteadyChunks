@@ -106,6 +106,11 @@ public final class LifecycleCleanupCoordinator {
 
     /**
      * 注册新任务（先注册、再发布到队列）。
+     * <p>
+     * 第 9 轮 P0-2 修复：lease 捕获注册时的实际维度 counter 对象，close 时通过
+     * {@code remove(dimension, counter)} 只删除自己对应的 counter。旧实现按维度 key
+     * 重新 computeIfPresent 递减：维度卸载 remove entry 后重载产生的新 counter 会被
+     * 旧 generation 的迟到 lease 误减（串代污染）。
      *
      * @return 注册 lease；{@code registered()==false} 表示停服模式，调用方必须拒绝任务
      */
@@ -114,7 +119,9 @@ public final class LifecycleCleanupCoordinator {
             return UNREGISTERED; // 停服模式拒绝新任务
         }
         globalTaskCount.incrementAndGet();
-        dimensionTaskCounts.computeIfAbsent(dimension, k -> new AtomicInteger(0)).incrementAndGet();
+        AtomicInteger dimensionCounter =
+                dimensionTaskCounts.computeIfAbsent(dimension, k -> new AtomicInteger(0));
+        dimensionCounter.incrementAndGet();
         return new TaskRegistration() {
             private final AtomicBoolean closed = new AtomicBoolean(false);
 
@@ -125,16 +132,16 @@ public final class LifecycleCleanupCoordinator {
 
             @Override
             public void close() {
-                // 幂等：仅首次 close 递减。维度计数归零即移除 entry：
-                // 与 onDimensionUnload 的 remove 并发时 computeIfPresent 为无操作，
-                // 不会重建负数 entry（旧 unregisterTask 在 entry 被 remove 后
-                // 会重建 0 → -1，永久污染计数）。
+                // 幂等：仅首次 close 递减。维度计数归零即移除 entry。
+                // remove(key, value) 仅在 key 仍映射到注册时捕获的 counter 时删除：
+                // 维度卸载 remove 后重载产生的新 counter 不会被旧 lease 误删；
+                // 与 onDimensionUnload 的 remove 并发时为无操作，不会重建负数 entry。
                 if (closed.compareAndSet(false, true)) {
                     globalTaskCount.decrementAndGet();
-                    dimensionTaskCounts.computeIfPresent(dimension, (ignored, count) -> {
-                        int remaining = count.decrementAndGet();
-                        return remaining == 0 ? null : count;
-                    });
+                    int remaining = dimensionCounter.decrementAndGet();
+                    if (remaining == 0) {
+                        dimensionTaskCounts.remove(dimension, dimensionCounter);
+                    }
                 }
             }
         };
@@ -250,6 +257,31 @@ public final class LifecycleCleanupCoordinator {
     }
 
     /**
+     * 服务器（重新）启动时调用：恢复接收新任务。
+     * <p>
+     * 第 9 轮 P1 修复：集成服务器玩家退出世界回到主菜单后，同一 JVM 可能再开新世界——
+     * 停服时 shutdownMode 置位且无恢复入口，静态单例会永久拒绝后续世界的任务注册。
+     * 本方法配合 ServerStartingEvent 恢复：
+     * <ul>
+     *   <li>关闭停服模式（恢复接受新任务注册）</li>
+     *   <li>调度器 resetForReload（恢复全局 accepting，清空可能残留的队列）</li>
+     *   <li>I/O 队列退出停服模式</li>
+     * </ul>
+     * 计数不清零：旧服务器生命周期的迟到 lease 会在任务终态自行递减到零
+     * （forceClearAll 已不再强制归零，见 {@link #forceClearAll()}）。
+     */
+    public void onServerStart() {
+        SteadyChunks.LOGGER.info("SteadyChunks 服务器启动：恢复任务接收");
+        shutdownMode.set(false);
+        // 第 9 轮 P1 修复：启动场景不清空队列（resetForReload 会以 error result 清空
+        // spawn 区域真实生成残留任务，导致区块卡在 NOISE 之前、后续强制同步加载死锁）。
+        // 队列残留（若有）由维度卸载清理（LevelEvent.Unload → cancelDimension）兜底，
+        // 启动时自然排空即可。
+        ChunkScheduler.getInstance().resumeAccepting();
+        IoQueueController.getInstance().exitShutdownMode();
+    }
+
+    /**
      * 服务器关闭时调用：拒绝新任务，安全排空。
      * <p>
      * 步骤：
@@ -259,6 +291,10 @@ public final class LifecycleCleanupCoordinator {
      *   <li>等待活跃任务完成（有限时间）</li>
      *   <li>强制清理所有缓存和队列</li>
      * </ol>
+     * <p>
+     * 第 9 轮 P1 修复：等待超时后仍保留任务计数（不强制归零）——运行中的任务
+     * 仍持有注册 lease，超时强制清零会让它们的迟到 close 把计数减成负数。
+     * 保留计数由迟到 lease 自行递减到零；新服务器生命周期由 {@link #onServerStart()} 恢复。
      *
      * @param maxWaitMs 最大等待时间（毫秒）
      */
@@ -308,9 +344,11 @@ public final class LifecycleCleanupCoordinator {
         StructureStartIndex.getInstance().clear();
         TemplateMetadataCache.getInstance().clear();
         CrossChunkAccessCache.current().clear();
-        dimensionTaskCounts.clear();
+        // 第 9 轮 P1 修复：不再强制清零任务计数（dimensionTaskCounts.clear() +
+        // globalTaskCount.set(0)）。已进入执行的任务仍持有注册 lease，超时强制清零
+        // 会让它们的迟到 close 产生负数；保留计数由迟到 lease 在任务终态自行递减到零，
+        // 新服务器生命周期通过 onServerStart() 恢复接收（不复用被清零的旧计数）。
         playerReferences.clear();
-        globalTaskCount.set(0);
     }
 
     /**
