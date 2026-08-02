@@ -57,6 +57,16 @@ public final class LifecycleCleanupCoordinator {
     private final AtomicLong totalLeaksDetected = new AtomicLong(0);
     /** 停服模式标志 */
     private final AtomicBoolean shutdownMode = new AtomicBoolean(false);
+    /**
+     * 第 10 轮 P0-2 修复：服务器生命周期注册门。
+     * <p>
+     * 与 {@link #shutdownMode} 配合关闭 check-then-act 窗口：停服必须先关注册门
+     * （acceptingRegistrations=false + serverGeneration++）再等待/清理，注册后
+     * 二次校验失败立即回退计数，杜绝"停服越过等待屏障后新任务仍注册"。
+     */
+    private final AtomicBoolean acceptingRegistrations = new AtomicBoolean(true);
+    /** 服务器生命周期代数：每次开/关门递增，注册后二次校验用 */
+    private final AtomicLong serverGeneration = new AtomicLong(0);
 
     private LifecycleCleanupCoordinator() {
     }
@@ -118,10 +128,25 @@ public final class LifecycleCleanupCoordinator {
         if (shutdownMode.get()) {
             return UNREGISTERED; // 停服模式拒绝新任务
         }
+        // 第 10 轮 P0-2 修复：读门状态与代数（注册后二次校验用）
+        long generation = serverGeneration.get();
+        if (!acceptingRegistrations.get()) {
+            return UNREGISTERED;
+        }
         globalTaskCount.incrementAndGet();
         AtomicInteger dimensionCounter =
                 dimensionTaskCounts.computeIfAbsent(dimension, k -> new AtomicInteger(0));
         dimensionCounter.incrementAndGet();
+        // 第 10 轮 P0-2 修复：注册后二次校验——停服在"检查门与递增"之间越过时回退计数，
+        // 不返回有效 lease（调用方将拒绝任务，任务不会以旧服务器生命周期运行）。
+        if (!acceptingRegistrations.get() || generation != serverGeneration.get()) {
+            globalTaskCount.decrementAndGet();
+            int remaining = dimensionCounter.decrementAndGet();
+            if (remaining == 0) {
+                dimensionTaskCounts.remove(dimension, dimensionCounter);
+            }
+            return UNREGISTERED;
+        }
         return new TaskRegistration() {
             private final AtomicBoolean closed = new AtomicBoolean(false);
 
@@ -273,6 +298,10 @@ public final class LifecycleCleanupCoordinator {
     public void onServerStart() {
         SteadyChunks.LOGGER.info("SteadyChunks 服务器启动：恢复任务接收");
         shutdownMode.set(false);
+        // 第 10 轮 P0-2 修复：打开注册门并递增服务器代数（旧服务器生命周期的迟到
+        // 注册二次校验会因代数不匹配而回退）
+        acceptingRegistrations.set(true);
+        serverGeneration.incrementAndGet();
         // 第 9 轮 P1 修复：启动场景不清空队列（resetForReload 会以 error result 清空
         // spawn 区域真实生成残留任务，导致区块卡在 NOISE 之前、后续强制同步加载死锁）。
         // 队列残留（若有）由维度卸载清理（LevelEvent.Unload → cancelDimension）兜底，
@@ -298,33 +327,60 @@ public final class LifecycleCleanupCoordinator {
      *
      * @param maxWaitMs 最大等待时间（毫秒）
      */
-    public void onServerShutdown(long maxWaitMs) {
+    /**
+     * 服务器关闭时调用（ServerStoppingEvent）：拒绝新任务并立即清空等待队列。
+     * <p>
+     * 第 10 轮 P0-3 修复：不再在 Server Thread 上 sleep 等待任务归零——
+     * <ul>
+     *   <li>旧实现在等待循环里 sleep，而 pending 任务需要 scheduler tick / mailbox
+     *       恢复推进，Server Thread 睡眠时两者都不动 → 必然等到超时（5 秒）；</li>
+     *   <li>新顺序：先关注册门（P0-2）→ 立即 closeForShutdown 以 error result 完成
+     *       所有 pending → 已运行任务由原 Future 自然终结（迟到 lease 归零）；</li>
+     *   <li>最终缓存清理与泄漏报告移到 {@link #onServerStopped()}（ServerStoppedEvent），
+     *       此时运行中任务应已结束。</li>
+     * </ul>
+     */
+    public void onServerShutdown() {
         SteadyChunks.LOGGER.info("SteadyChunks 开始停服清理");
+        // 1. 先关注册门（P0-2：check-then-act 窗口收窄——此后新注册二次校验失败回退）
         shutdownMode.set(true);
+        acceptingRegistrations.set(false);
+        serverGeneration.incrementAndGet();
 
-        // 1. I/O 队列进入停服模式
+        // 2. I/O 队列进入停服模式（提升写入预算）
         IoQueueController.getInstance().enterShutdownMode();
 
-        // 2. 等待活跃任务完成
-        long deadline = System.currentTimeMillis() + maxWaitMs;
-        while (globalTaskCount.get() > 0 && System.currentTimeMillis() < deadline) {
-            try {
-                Thread.sleep(50);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-        }
+        // 3. 立即以 error result 完成所有 pending（不再等待——等待会阻塞 Server
+        //    Thread 导致 pending 无法推进，见 javadoc）
+        ChunkScheduler.getInstance().closeForShutdown(new IllegalStateException("Server stopping"));
 
         int remaining = globalTaskCount.get();
         if (remaining > 0) {
-            totalLeaksDetected.addAndGet(remaining);
-            SteadyChunks.LOGGER.warn("SteadyChunks 停服超时残留任务: {}", remaining);
+            SteadyChunks.LOGGER.info("SteadyChunks 停服：等待 {} 个运行中任务自然结束（迟到 lease 自行归零）",
+                    remaining);
         }
+    }
 
-        // 3. 强制清理所有缓存和队列
+    /**
+     * 服务器已停止时调用（ServerStoppedEvent）：最终清理缓存与泄漏报告。
+     * <p>
+     * 第 10 轮 P0-3 修复：从 {@link #onServerShutdown()} 拆出的后半段——此时
+     * Server Thread 已停止，运行中任务应已终结（迟到 lease 递减计数），残留计数
+     * 即真泄漏。
+     */
+    public void onServerStopped() {
         forceClearAll();
-
+        int remaining = globalTaskCount.get();
+        if (remaining > 0) {
+            totalLeaksDetected.addAndGet(remaining);
+            SteadyChunks.LOGGER.warn("SteadyChunks 停服完成残留任务: {}（记为泄漏）", remaining);
+        }
+        // 第 10 轮修复：服务器已永久停止，旧生命周期任务不可能再注册/close（原 Future
+        // 随世界销毁，executor 已关闭）——记录泄漏后清零，防止残留计数污染下一个
+        // 服务器生命周期（集成服务器回主菜单再开新世界时从 0 开始，否则计数永不归零
+        // 导致停服等待与泄漏检测长期误报）。
+        globalTaskCount.set(0);
+        dimensionTaskCounts.clear();
         SteadyChunks.LOGGER.info("SteadyChunks 停服清理完成: 卸载区块={} 卸载维度={} 检测泄漏={}",
                 totalChunksUnloaded.get(), totalDimensionsUnloaded.get(), totalLeaksDetected.get());
     }

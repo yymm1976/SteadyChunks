@@ -502,7 +502,14 @@ public final class ChunkScheduler {
         try {
             future = originalOperation.get();
         } catch (Throwable ex) {
-            // 第 9 轮 P1 修复：direct 异常路径无 proxy 可触发终态绑定，手工关闭 lease
+            // 第 10 轮 P0-1 修复：同步异常统一失败路径——释放组合 permit 并回退
+            // inflightCount（旧实现只关 registration，一次同步异常永久消耗一个全局
+            // permit + 一个 NOISE permit + 一个 inflightCount，重复几次后所有 NOISE
+            // 都进等待队列）。释放顺序与获取顺序相反：stage → global。
+            stage.close();
+            global.close();
+            inflightCount.decrementAndGet();
+            // direct 异常路径无 proxy 可触发终态绑定，手工关闭 lease
             // （排队路径 proxy.completeExceptionally 会触发绑定，无需此处关闭）。
             if (proxy == null && registration != null) {
                 registration.close();
@@ -972,17 +979,47 @@ public final class ChunkScheduler {
      * 与 {@link #stopAcceptingAndClear(Throwable)} 的区别：不动生命周期状态
      * （accepting/代数），只清空等待队列——调用方（Watchdog 恢复线程）判定
      * 调度停摆后用于破环，不改变调度器其余状态。
+     * <p>
+     * 第 10 轮修复：完成线程语义分两级——{@link #failOpenAllPendingViaMailbox()}
+     * 先经原 worldgen mailbox 提交（保持原版线程语义）；若 mailbox 本身停滞导致
+     * 任务未终态，Watchdog 超时后调用本方法直接 complete（UNSAFE_EMERGENCY，
+     * 由 Watchdog 记录独立指标）。
      *
      * @return 释放的排队任务数
      */
     public int failOpenAllPending() {
+        return drainAllPending(task -> task.proxy().complete(
+                ChunkResult.error("SteadyChunks drain 停摆恢复（UNSAFE_EMERGENCY）")));
+    }
+
+    /**
+     * 第 10 轮修复：drain 停摆恢复第一级——经原 worldgen mailbox 提交 error
+     * completion，保持原版线程语义（恢复动作由 mailbox worker 执行，而非
+     * Watchdog daemon 线程直接 complete）。
+     *
+     * @return 释放的排队任务数
+     */
+    public int failOpenAllPendingViaMailbox() {
+        return drainAllPending(task -> {
+            try {
+                task.resumeExecutor().execute(() -> task.proxy().complete(
+                        ChunkResult.error("SteadyChunks drain 停摆恢复（mailbox）")));
+            } catch (Throwable t) {
+                // mailbox 拒绝（停滞/关闭）：降级为直接 complete，避免任务永不终态
+                task.proxy().complete(ChunkResult.error("SteadyChunks drain 停摆恢复（mailbox 拒绝降级）"));
+            }
+        });
+    }
+
+    /** 清空等待队列并对每个任务执行终结动作（第 10 轮抽取的公共路径）。 */
+    private int drainAllPending(java.util.function.Consumer<PendingNoiseTask> terminalAction) {
         int n = 0;
         PendingNoiseTask task;
         while ((task = pendingNoiseTasks.poll()) != null) {
             pendingCount.updateAndGet(v -> Math.max(0, v - 1));
             // 终态绑定（proxy.whenComplete → registration.close()）自动关闭 lease；
             // error result 与 stopAcceptingAndClear 同语义（第 5 轮 P2 修复）。
-            task.proxy().complete(ChunkResult.error("SteadyChunks drain 停摆恢复"));
+            terminalAction.accept(task);
             n++;
         }
         return n;

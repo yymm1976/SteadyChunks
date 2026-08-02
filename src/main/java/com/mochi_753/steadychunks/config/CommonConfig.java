@@ -135,7 +135,7 @@ public final class CommonConfig {
         LIMIT_STRUCTURE_STARTS = builder.comment("STRUCTURE_STARTS 并发上限")
                 .defineInRange("structure_starts", 2, 1, 8);
         LIMIT_NOISE = builder.comment("NOISE 并发上限")
-                .defineInRange("noise", 8, 1, 8);
+                .defineInRange("noise", 3, 1, 8);
         LIMIT_FEATURES = builder.comment("FEATURES 并发上限（写入密集，建议保守）")
                 .defineInRange("features", 1, 1, 4);
         LIMIT_LIGHT = builder.comment("LIGHT 并发上限")

@@ -162,13 +162,12 @@ public final class FaultInjector {
      * 验证所有模块在停服时正确排空和清理。
      *
      * @param coordinator 生命周期协调器
-     * @param maxWaitMs   最大等待时间
      */
-    public void injectServerShutdown(LifecycleCleanupCoordinator coordinator, long maxWaitMs) {
+    public void injectServerShutdown(LifecycleCleanupCoordinator coordinator) {
         totalInjections.incrementAndGet();
         SteadyChunks.LOGGER.warn("SteadyChunks FaultInjector: 注入服务器停止");
         try {
-            coordinator.onServerShutdown(maxWaitMs);
+            coordinator.onServerShutdown();
         } catch (Throwable t) {
             SteadyChunks.LOGGER.warn("SteadyChunks FaultInjector: 停服清理异常: {}", t.getMessage());
         }

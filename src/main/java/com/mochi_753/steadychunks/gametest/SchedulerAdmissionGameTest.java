@@ -1,11 +1,12 @@
 package com.mochi_753.steadychunks.gametest;
 
-import com.mochi_753.steadychunks.config.CommonConfig;
 import com.mochi_753.steadychunks.io.LifecycleCleanupCoordinator;
 import com.mochi_753.steadychunks.scheduler.ChunkScheduler;
 import com.mochi_753.steadychunks.scheduler.ResourceType;
 import com.mochi_753.steadychunks.scheduler.StageLimiter;
+import com.mochi_753.steadychunks.scheduler.Watchdog;
 import net.minecraft.gametest.framework.GameTest;
+import net.minecraft.gametest.framework.GameTestAssertException;
 import net.minecraft.gametest.framework.GameTestHelper;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.level.ChunkMap;
@@ -88,7 +89,9 @@ public class SchedulerAdmissionGameTest {
         // 第 9 轮卡死修复：测试内部把 NOISE_HEAVY 桶压到 1（验证准入排队），若不恢复，
         // 后续批次的结构区块加载/真实生成全部在 NOISE 并发=1 下排队滞留 → 生成任务
         // 长期不终结（refCount 不归零）→ toDrop 滞留 → processUnloads 忙转螺旋。
-        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, CommonConfig.LIMIT_NOISE.get());
+        // 第 10 轮修复：显式恢复测试值 8（不读 CommonConfig.LIMIT_NOISE——生产默认
+        // 3 保持原样，不得用生产配置修测试稳定性）。
+        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, 8);
     }
 
     /**
@@ -936,11 +939,11 @@ public class SchedulerAdmissionGameTest {
                 ChunkStatus.NOISE, false, map, holder, () -> aUnderlying);
         helper.assertTrue(coordinator.globalTaskCount() == 1, "任务 A 注册后全局计数应为 1");
 
-        // 停服：等待超时（A 未完成）→ 强制清理。修复后保留计数供迟到 lease 归零
-        coordinator.onServerShutdown(50L);
+        // 停服：先关注册门 + 立即清空 pending（第 10 轮 P0-3：不在 Server Thread 等待）
+        coordinator.onServerShutdown();
         helper.assertTrue(coordinator.isShutdownMode(), "停服后应处于停服模式");
         helper.assertTrue(coordinator.globalTaskCount() == 1,
-                "停服超时强制清理不得清零仍有 lease 的全局计数");
+                "停服强制清理不得清零仍有 lease 的全局计数");
         helper.assertTrue(scheduler.pendingCount() == 0, "停服清理后等待队列应清空");
 
         // 服务器重启：恢复接收（修复前 shutdownMode 无恢复入口，永久拒绝新世界）
@@ -968,6 +971,106 @@ public class SchedulerAdmissionGameTest {
                 "全部任务完成后全局计数应归零");
 
         resetScheduler(scheduler);
+        helper.succeed();
+    }
+
+    /**
+     * 第 10 轮 P0-1 修复验证：originalOperation 同步抛异常时统一失败路径——
+     * 释放组合 permit（global + NOISE）、回退 inflightCount、关闭 registration。
+     * 旧实现只关 registration：一次同步异常永久消耗一个全局 permit + 一个 NOISE
+     * permit + 一个 inflightCount，重复几次后所有 NOISE 都进等待队列。
+     */
+    @GameTest(template = "empty", batch = "steady_sync_throw", timeoutTicks = 600)
+    public void originalOperationThrowsSynchronously(GameTestHelper helper) {
+        GenerationChunkHolder holder = obtainHolder(helper);
+        ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
+        ChunkScheduler scheduler = ChunkScheduler.getInstance();
+        scheduler.setEnabled(true);
+        scheduler.setAdmissionPaused(false);
+        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, 8);
+        LifecycleCleanupCoordinator coordinator = LifecycleCleanupCoordinator.getInstance();
+
+        int beforeInflight = scheduler.inflightCount();
+        int beforeCpu = scheduler.cpuPermitsAvailable();
+        int beforeNoise = scheduler.stageLimiter().permit(ChunkStatus.NOISE).availablePermits();
+
+        CompletableFuture<ChunkResult<ChunkAccess>> task = scheduler.controlAdmission(
+                ChunkStatus.NOISE, false, map, holder,
+                () -> { throw new IllegalStateException("同步抛异常（P0-1 测试）"); });
+
+        helper.assertTrue(task.isDone(), "同步异常任务应立即终态");
+        helper.assertTrue(task.isCompletedExceptionally(), "任务应异常完成");
+        helper.assertTrue(scheduler.inflightCount() == beforeInflight,
+                "inflight 应回退到原值（P0-1：不得泄漏）");
+        helper.assertTrue(scheduler.cpuPermitsAvailable() == beforeCpu,
+                "全局 permit 应全部释放（P0-1）");
+        helper.assertTrue(scheduler.stageLimiter().permit(ChunkStatus.NOISE).availablePermits() == beforeNoise,
+                "NOISE permit 应全部释放（P0-1）");
+        helper.assertTrue(coordinator.globalTaskCount() == 0,
+                "registration 应归零（P0-1）");
+
+        resetScheduler(scheduler);
+        helper.succeed();
+    }
+
+    /**
+     * 第 10 轮 P0-4 修复验证：Watchdog 恢复线程支持多服务器生命周期——
+     * stop 后再次 start 必须创建新线程（旧实现 recoveryStarted 永久为 true，
+     * 集成服务器第二个世界起恢复线程不再启动）。
+     */
+    @GameTest(template = "empty", batch = "steady_watchdog_lifecycle", timeoutTicks = 600)
+    public void watchdogRestartsAcrossServerLifecycle(GameTestHelper helper) {
+        Watchdog wd = Watchdog.getInstance();
+        ChunkScheduler scheduler = ChunkScheduler.getInstance();
+
+        // 先确保停止（ServerStarting 可能已启动恢复线程）
+        wd.stopRecoveryThread();
+        for (int i = 0; i < 100 && wd.isRecoveryThreadAlive(); i++) {
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        helper.assertTrue(!wd.isRecoveryThreadAlive(), "stop 后线程应退出");
+
+        // 重启（模拟第二个服务器生命周期）
+        wd.startRecoveryThread(scheduler);
+        helper.assertTrue(wd.isRecoveryThreadAlive(), "重启后线程应存活（P0-4）");
+
+        // 再次停止收尾
+        wd.stopRecoveryThread();
+        for (int i = 0; i < 100 && wd.isRecoveryThreadAlive(); i++) {
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        helper.assertTrue(!wd.isRecoveryThreadAlive(), "再次 stop 后线程应退出");
+        helper.succeed();
+    }
+
+    /**
+     * 第 10 轮评审要求：正确性测试禁用 Watchdog 并断言恢复数为零。
+     * <p>
+     * 本测试停止恢复线程（后续批次在无恢复保护下运行——硬门槛：调度链必须
+     * 不依赖 Watchdog 自愈也能通过），并断言此前从未发生过自动恢复
+     * （totalRecoveries==0 且 totalUnsafeRecoveries==0），防止 Watchdog
+     * 掩盖核心调度链竞态。
+     */
+    @GameTest(template = "empty", batch = "steady_watchdog_disabled", timeoutTicks = 600)
+    public void watchdogMustNotRecoverDuringCorrectnessTests(GameTestHelper helper) {
+        Watchdog wd = Watchdog.getInstance();
+        // 此前任何批次的自动恢复都会使此断言失败（暴露调度链竞态）
+        helper.assertTrue(wd.totalRecoveries() == 0,
+                "正确性测试期间不得发生任何自动恢复（Watchdog 掩盖竞态）");
+        helper.assertTrue(wd.totalUnsafeRecoveries() == 0,
+                "正确性测试期间不得发生 UNSAFE_EMERGENCY 恢复");
+        // 禁用恢复线程：后续批次在无 Watchdog 保护下运行（硬门槛）
+        wd.stopRecoveryThread();
         helper.succeed();
     }
 }

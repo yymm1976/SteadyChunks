@@ -25,7 +25,9 @@ import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.AddReloadListenerEvent;
 import net.neoforged.neoforge.event.RegisterCommandsEvent;
 import net.neoforged.neoforge.event.level.LevelEvent;
+import net.neoforged.neoforge.event.server.ServerAboutToStartEvent;
 import net.neoforged.neoforge.event.server.ServerStartingEvent;
+import net.neoforged.neoforge.event.server.ServerStoppedEvent;
 import net.neoforged.neoforge.event.server.ServerStoppingEvent;
 import net.neoforged.neoforge.event.tick.ServerTickEvent;
 import net.minecraft.resources.ResourceKey;
@@ -68,9 +70,15 @@ public final class ModuleBootstrap {
 
         // 5. 订阅事件
         modEventBus.addListener(ModuleBootstrap::onCommonSetup);
+        // 第 10 轮 P0-3 修复：开门提前到 ServerAboutToStartEvent——在服务器加载任何
+        // 内容（维度/出生区块）之前恢复注册门与任务接收，避免集成服务器第二世界
+        // 早期 NOISE 被旧生命周期状态拒绝（ServerStartingEvent 发生得太晚）。
+        NeoForge.EVENT_BUS.addListener(ModuleBootstrap::onServerAboutToStart);
         NeoForge.EVENT_BUS.addListener(ModuleBootstrap::onServerStarting);
         // 第 9 轮生产接线：服务器停止 → 生命周期停服排空（与 onServerStarting 配对）
         NeoForge.EVENT_BUS.addListener(ModuleBootstrap::onServerStopping);
+        // 第 10 轮 P0-3 修复：最终缓存清理与泄漏报告移到 ServerStoppedEvent
+        NeoForge.EVENT_BUS.addListener(ModuleBootstrap::onServerStopped);
         NeoForge.EVENT_BUS.addListener(ModuleBootstrap::onRegisterCommands);
         NeoForge.EVENT_BUS.addListener(ModuleBootstrap::onServerTick);
         // §17.2 订阅数据包重载事件，触发缓存统一失效
@@ -121,13 +129,20 @@ public final class ModuleBootstrap {
     }
 
     /**
+     * 第 10 轮 P0-3 修复：服务器“开始加载任何内容之前”开门——恢复注册门、调度器
+     * 接收与 I/O 接收，并递增服务器生命周期代数。集成服务器同 JVM 第二世界的
+     * 维度/出生区块加载发生在 ServerStartingEvent 之前，必须在此之前恢复接收。
+     */
+    private static void onServerAboutToStart(ServerAboutToStartEvent event) {
+        LifecycleCleanupCoordinator.getInstance().onServerStart();
+    }
+
+    /**
      * 服务端启动时同步诊断开关，确保配置已加载。
      */
     private static void onServerStarting(ServerStartingEvent event) {
-        // 第 9 轮 P1 修复：恢复任务接收（集成服务器回主菜单后再开新世界，
-        // 会再次触发 ServerStarting——shutdownMode 必须复位，否则静态单例
-        // 永久拒绝新世界任务注册）。
-        LifecycleCleanupCoordinator.getInstance().onServerStart();
+        // 第 10 轮 P0-3 修复：接收恢复已提前到 ServerAboutToStartEvent，
+        // 此处只做配置同步与恢复线程启动。
 
         // 第 9 轮卡死修复：启动独立 drain 停摆恢复线程（忙转死锁破环，见 Watchdog）。
         Watchdog.getInstance().startRecoveryThread(ChunkScheduler.getInstance());
@@ -176,17 +191,28 @@ public final class ModuleBootstrap {
     }
 
     /**
-     * 第 9 轮生产接线：服务器停止时执行停服清理（拒绝新任务、等待活跃任务完成、
-     * 强制清理残留）。与 {@link #onServerStarting(ServerStartingEvent)} 配对，
+     * 第 9 轮生产接线：服务器停止时执行停服清理（关注册门、立即清空等待队列）。
+     * 与 {@link #onServerStarting(ServerStartingEvent)} 配对，
      * 支持集成服务器回主菜单后再开新世界的完整生命周期。
      * <p>
-     * 等待上限 5 秒：超过即强制清理缓存/队列（任务计数保留，由迟到 lease 归零，
-     * 见 {@link LifecycleCleanupCoordinator#onServerShutdown(long)}）。
+     * 第 10 轮 P0-3 修复：不再在 Server Thread 上等待任务归零（旧 5 秒轮询会阻塞
+     * pending 推进）——关注册门后立即 closeForShutdown 清 pending，运行中任务自然
+     * 终结（迟到 lease 归零），最终清理与泄漏报告见 {@link #onServerStopped(ServerStoppedEvent)}。
      */
     private static void onServerStopping(ServerStoppingEvent event) {
         // 第 9 轮卡死修复：停止独立恢复线程（幂等，daemon 线程不阻塞停服）。
         Watchdog.getInstance().stopRecoveryThread();
-        LifecycleCleanupCoordinator.getInstance().onServerShutdown(5000L);
+        // 第 10 轮 P0-3 修复：无参版本——关注册门 + 立即 closeForShutdown 清 pending，
+        // 不在 Server Thread 上 sleep 等待（旧 5 秒轮询会阻塞 pending 推进）。
+        LifecycleCleanupCoordinator.getInstance().onServerShutdown();
+    }
+
+    /**
+     * 第 10 轮 P0-3 修复：服务器完全停止后做最终缓存清理与泄漏报告
+     * （运行中任务此刻应已终结，迟到 lease 已递减计数）。
+     */
+    private static void onServerStopped(ServerStoppedEvent event) {
+        LifecycleCleanupCoordinator.getInstance().onServerStopped();
     }
 
     /**
