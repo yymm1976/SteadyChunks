@@ -1038,6 +1038,21 @@ public final class ChunkScheduler {
         return rejected;
     }
 
+    /**
+     * 第 14 轮 P1 修复：捕获后因停服/换代放弃的批次任务重新入队。
+     * <p>
+     * Watchdog 先发布 CAPTURING 所有权再锁外捕获；捕获期间 stopRecoveryThread
+     * 可能已摘除批次（此时无任务可处置）——捕获到的任务必须回退队列，
+     * 由停服的 closeForShutdown 兜底清理（或新 Watchdog 重新恢复），不得遗弃。
+     * proxy 未完成、lease 未关闭，与普通等待任务语义一致。
+     */
+    public void requeueRecoveryBatch(RecoveryBatch batch) {
+        for (PendingNoiseTask t : batch.tasks()) {
+            pendingNoiseTasks.offer(t);
+            pendingCount.incrementAndGet();
+        }
+    }
+
     /** 批次内所有任务的代理 Future 是否全部终态（Watchdog 批次状态机用）。 */
     public boolean recoveryBatchAllDone(RecoveryBatch batch) {
         for (PendingNoiseTask t : batch.tasks()) {
@@ -1073,6 +1088,28 @@ public final class ChunkScheduler {
             }
         }
         return unsafe;
+    }
+
+    /**
+     * 第 14 轮 P0-3 修复：异步强制完成——逐任务提交到指定 executor（每任务独立
+     * 线程），complete 成功者经 {@code onCompleted} 回调计数（并发调用，调用方
+     * 累加须线程安全）。同步回调阻塞只卡自己的执行线程，不阻塞调用方
+     * （ServerStopping）；complete 幂等（已被并发完成的返回 false 不计数）。
+     *
+     * @param batch       目标批次
+     * @param reason      error result 原因
+     * @param executor    每任务独立线程的执行器（如虚拟线程执行器）
+     * @param onCompleted 每次实际完成的回调（参数恒为 1，可累加）
+     */
+    public void escalateRecoveryBatchAsync(RecoveryBatch batch, String reason,
+            Executor executor, java.util.function.IntConsumer onCompleted) {
+        for (PendingNoiseTask t : batch.tasks()) {
+            executor.execute(() -> {
+                if (t.proxy().complete(ChunkResult.error(reason))) {
+                    onCompleted.accept(1);
+                }
+            });
+        }
     }
 
     /**

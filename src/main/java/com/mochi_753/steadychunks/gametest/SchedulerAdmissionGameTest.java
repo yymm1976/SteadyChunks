@@ -97,6 +97,25 @@ public class SchedulerAdmissionGameTest {
         }
     }
 
+    /**
+     * 第 14 轮适配：轮询等待条件成立（最多 3 秒）——stopRecoveryThread 自第 14 轮
+     * 起异步处置批次（emergency 虚拟线程完成），终态/指标断言须轮询。
+     */
+    private static void awaitTrue(java.util.function.BooleanSupplier condition, String message) {
+        for (int i = 0; i < 300; i++) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new GameTestAssertException(message + "（等待被中断）");
+            }
+        }
+        throw new GameTestAssertException(message);
+    }
+
     /** 重置调度器全局状态，避免测试间泄漏。 */
     private static void resetScheduler(ChunkScheduler scheduler) {
         scheduler.setAdmissionPaused(false);
@@ -249,18 +268,28 @@ public class SchedulerAdmissionGameTest {
         CompletableFuture<ChunkResult<ChunkAccess>> waiting = scheduler.controlAdmission(
                 ChunkStatus.NOISE, false, map, holder,
                 () -> CompletableFuture.completedFuture(ChunkResult.of(helper.getLevel().getChunk(0, 0))));
-        helper.assertTrue(scheduler.pendingCount() == 1, "应存在 1 个等待任务");
+        try {
+            helper.assertTrue(scheduler.pendingCount() == 1,
+                    "应存在 1 个等待任务（实际=" + scheduler.pendingCount()
+                            + " noiseAvail=" + scheduler.stageLimiter().permit(ChunkStatus.NOISE).availablePermits()
+                            + " inflight=" + scheduler.inflightCount()
+                            + " cpuAvail=" + scheduler.cpuPermitsAvailable() + "）");
 
-        // 模拟维度卸载/停服：clearAll 应以 error result 完成等待任务
-        // （第 5 轮修复：异常完成会让原版 setFatalException，破坏真实区块生成链）
-        scheduler.clearAll(new IllegalStateException("Dimension unload"));
-        helper.assertTrue(waiting.isDone(), "clearAll 后等待任务应被完成");
-        helper.assertTrue(!waiting.join().isSuccess(), "clearAll 后等待任务应以 error result 完成");
-        helper.assertTrue(scheduler.pendingCount() == 0, "clearAll 后等待队列应清空");
-
-        // 完成第一个任务，避免其挂起影响后续测试
-        firstUnderlying.complete(ChunkResult.of(helper.getLevel().getChunk(0, 0)));
-        resetScheduler(scheduler);
+            // 模拟维度卸载/停服：clearAll 应以 error result 完成等待任务
+            // （第 5 轮修复：异常完成会让原版 setFatalException，破坏真实区块生成链）
+            scheduler.clearAll(new IllegalStateException("Dimension unload"));
+            helper.assertTrue(waiting.isDone(), "clearAll 后等待任务应被完成");
+            helper.assertTrue(!waiting.join().isSuccess(), "clearAll 后等待任务应以 error result 完成");
+            helper.assertTrue(scheduler.pendingCount() == 0, "clearAll 后等待队列应清空");
+        } finally {
+            // 第 14 轮防御：断言失败中止也不得残留占位任务——残留的未完成任务占
+            // global + NOISE permit，且 enabled/limit 未复位，会级联卡死后续批次
+            // （实测：dim_poll_window 的 obtainHolder 真实生成排队 → getChunk 死等）
+            if (!firstUnderlying.isDone()) {
+                firstUnderlying.complete(ChunkResult.of(helper.getLevel().getChunk(0, 0)));
+            }
+            resetScheduler(scheduler);
+        }
         helper.succeed();
     }
 
@@ -1414,13 +1443,14 @@ public class SchedulerAdmissionGameTest {
         helper.assertTrue(!queued.isDone(), "mailbox 停滞时批次任务 proxy 不应完成");
         helper.assertTrue(coordinator.globalTaskCount() == 1, "批次任务仍持有注册 lease");
 
-        // P0 修复验证：停服（stopRecoveryThread）必须强制完成活动批次
+        // P0 修复验证：停服（stopRecoveryThread）必须处置活动批次——第 14 轮起
+        // 为异步 emergency 分派（停服不被回调阻塞），终态/指标轮询确认
         wd.stopRecoveryThread();
-        helper.assertTrue(queued.isDone(), "停服后批次任务 proxy 必须终态");
+        helper.assertTrue(!wd.hasActiveRecoveryBatch(), "停服后活动批次应已脱离（同步）");
+        awaitTrue(() -> queued.isDone(), "停服后批次任务 proxy 必须终态");
         helper.assertTrue(!queued.join().isSuccess(), "停服处置应为 error result");
-        helper.assertTrue(!wd.hasActiveRecoveryBatch(), "停服后活动批次应清空");
-        helper.assertTrue(coordinator.globalTaskCount() == 0, "停服处置后 registration 应归零");
-        helper.assertTrue(wd.totalUnsafeShutdownRecoveries() == 1,
+        awaitTrue(() -> coordinator.globalTaskCount() == 0, "停服处置后 registration 应归零");
+        awaitTrue(() -> wd.totalUnsafeShutdownRecoveries() == 1,
                 "停服处置应计入独立指标 totalUnsafeShutdownRecoveries（实际="
                         + wd.totalUnsafeShutdownRecoveries() + "）");
         helper.assertTrue(wd.totalUnsafeRecoveries() == 0,
@@ -1514,13 +1544,14 @@ public class SchedulerAdmissionGameTest {
         helper.assertTrue(!queued.isDone(), "proxy 未完成（execute 尚未放行）");
         helper.assertTrue(coordinator.globalTaskCount() == 1, "批次任务仍持有注册 lease");
 
-        // 停服：stopRecoveryThread 必须能看到批次并处置（任意 phase 幂等）
+        // 停服：stopRecoveryThread 必须能看到批次并处置（任意 phase 幂等；
+        // 第 14 轮起异步 emergency 分派——轮询终态）
         wd.stopRecoveryThread();
-        helper.assertTrue(queued.isDone(), "停服后 proxy 必须终态");
+        helper.assertTrue(!wd.hasActiveRecoveryBatch(), "批次应已脱离（同步）");
+        awaitTrue(() -> queued.isDone(), "停服后 proxy 必须终态");
         helper.assertTrue(!queued.join().isSuccess(), "应为 error result");
-        helper.assertTrue(!wd.hasActiveRecoveryBatch(), "批次已清空");
-        helper.assertTrue(coordinator.globalTaskCount() == 0, "registration 归零");
-        helper.assertTrue(wd.totalUnsafeShutdownRecoveries() == 1,
+        awaitTrue(() -> coordinator.globalTaskCount() == 0, "registration 归零");
+        awaitTrue(() -> wd.totalUnsafeShutdownRecoveries() == 1,
                 "停服处置计入 shutdown 指标（实际=" + wd.totalUnsafeShutdownRecoveries() + "）");
         helper.assertTrue(wd.totalUnsafeRecoveries() == 0,
                 "停服处置不得混入运行期指标");
@@ -1639,6 +1670,283 @@ public class SchedulerAdmissionGameTest {
         wd.setStallCheckIgnorePausedForTest(false);
         scheduler.setResumeExecutorOverride(null);
         wd.stopRecoveryThread();
+        resetScheduler(scheduler);
+        wd.resetRecoveryMetrics();
+        helper.succeed();
+    }
+
+    /**
+     * 第 14 轮 P0-1 修复验证：阻塞的 mailbox 提交不得阻断运行期自动二级恢复。
+     * <p>
+     * 旧实现提交由唯一监督线程同步执行——execute 阻塞时监督线程被卡，
+     * MAILBOX_SUBMITTING 分支"不推进"，两秒 deadline 永远不检查 → 运行期
+     * 自动 UNSAFE_EMERGENCY 永不发生（只能在停服回收）。
+     * <p>
+     * 新实现：提交移出监督线程（独立 recoverySubmitter），CAPTURED/
+     * MAILBOX_SUBMITTING/WAITING_MAILBOX 统一允许 deadline 超时升级。
+     * 本测试<b>不调用 stopRecoveryThread</b>：execute 永久阻塞 → deadline 后
+     * 第二级必须自动强制完成（unsafe==1）。
+     */
+    @GameTest(template = "empty", batch = "steady_watchdog_submit_escalate", timeoutTicks = 600)
+    public void blockingMailboxSubmissionMustEscalateWithoutShutdown(GameTestHelper helper) {
+        GenerationChunkHolder holder = obtainHolder(helper);
+        ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
+        ChunkScheduler scheduler = ChunkScheduler.getInstance();
+        Watchdog wd = Watchdog.getInstance();
+        wd.stopRecoveryThread();
+        wd.resetRecoveryMetrics();
+
+        scheduler.setEnabled(true);
+        scheduler.setAdmissionPaused(false);
+        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, 8);
+        waitForQueueDrain(scheduler);
+
+        // 入队 1 个任务（paused 保持）→ 启动恢复线程
+        scheduler.setAdmissionPaused(true);
+        CompletableFuture<ChunkResult<ChunkAccess>> queued = scheduler.controlAdmission(
+                ChunkStatus.NOISE, false, map, holder,
+                () -> new CompletableFuture<ChunkResult<ChunkAccess>>());
+        helper.assertTrue(scheduler.pendingCount() == 1, "paused 时任务应入队等待");
+        wd.startRecoveryThread(scheduler);
+
+        // override：execute 永久阻塞（提交在独立线程——监督线程不受影响）
+        CountDownLatch enteredExecute = new CountDownLatch(1);
+        CountDownLatch releaseExecute = new CountDownLatch(1);
+        scheduler.setResumeExecutorOverride(command -> {
+            enteredExecute.countDown();
+            try {
+                releaseExecute.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        wd.setStallCheckIgnorePausedForTest(true);
+
+        // 形成批次：提交分派到独立线程并阻塞在 execute
+        long now = System.nanoTime();
+        wd.checkDrainStallForTest(scheduler, now);
+        wd.checkDrainStallForTest(scheduler, now);
+        wd.checkDrainStallForTest(scheduler, now);
+        helper.assertTrue(wd.hasActiveRecoveryBatch(), "第一级应形成活动批次");
+        helper.assertTrue(scheduler.pendingCount() == 0, "第一级后队列应清空");
+        try {
+            helper.assertTrue(enteredExecute.await(5, TimeUnit.SECONDS),
+                    "execute 应由独立提交线程调用并阻塞");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        helper.assertTrue(!queued.isDone(), "提交阻塞时 proxy 不应完成");
+
+        // P0-1 修复验证：不调用 stopRecoveryThread——deadline 后运行期自动第二级
+        wd.checkDrainStallForTest(scheduler, System.nanoTime() + 3_000_000_000L);
+        awaitTrue(() -> queued.isDone(), "deadline 后批次任务应被第二级强制完成（不依赖提交完成）");
+        helper.assertTrue(!queued.join().isSuccess(), "强制完成应为 error result");
+        awaitTrue(() -> wd.totalUnsafeRecoveries() == 1,
+                "第二级应计入 totalUnsafeRecoveries（实际=" + wd.totalUnsafeRecoveries() + "）");
+        awaitTrue(() -> !wd.hasActiveRecoveryBatch(), "批次终态后应清空");
+
+        // 放行提交线程（幂等：任务已由第二级完成）
+        releaseExecute.countDown();
+
+        // 清理
+        wd.setStallCheckIgnorePausedForTest(false);
+        scheduler.setResumeExecutorOverride(null);
+        wd.stopRecoveryThread();
+        resetScheduler(scheduler);
+        wd.resetRecoveryMetrics();
+        helper.succeed();
+    }
+
+    /**
+     * 第 14 轮 P0-2 修复验证：停服仍可发生在"判定恢复"与"捕获发布"之间——
+     * 旧线程此时不得捕获并发布新批次。
+     * <p>
+     * 旧实现阶段 1 锁内判定 startFirstLevel 后释放锁，阶段 3 重新取锁无条件
+     * 捕获发布：两个锁区间之间 stopRecoveryThread 可能先执行（看不到批次），
+     * 旧线程随后仍发布 → 停服后任务被捕获而无人处置；快速 stop/start 时旧线程
+     * 还可能把旧服务器批次发布到新 Watchdog。
+     * <p>
+     * 新实现：阶段 3 捕获前重新验证 stopRecovery + 恢复代数 + 已有批次。
+     * 探针（preCaptureProbe）在"判定与捕获之间"暂停驱动线程，主线程执行
+     * stop→start 后放行——旧线程必须放弃（任务仍在队列）。
+     */
+    @GameTest(template = "empty", batch = "steady_watchdog_stop_start_publish", timeoutTicks = 600)
+    public void stoppedWatchdogMustNotPublishNewBatch(GameTestHelper helper) {
+        GenerationChunkHolder holder = obtainHolder(helper);
+        ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
+        ChunkScheduler scheduler = ChunkScheduler.getInstance();
+        Watchdog wd = Watchdog.getInstance();
+        wd.stopRecoveryThread();
+        wd.resetRecoveryMetrics();
+
+        scheduler.setEnabled(true);
+        scheduler.setAdmissionPaused(false);
+        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, 8);
+        waitForQueueDrain(scheduler);
+
+        // 入队 1 个任务（paused 保持）→ 启动恢复线程
+        scheduler.setAdmissionPaused(true);
+        CompletableFuture<ChunkResult<ChunkAccess>> queued = scheduler.controlAdmission(
+                ChunkStatus.NOISE, false, map, holder,
+                () -> new CompletableFuture<ChunkResult<ChunkAccess>>());
+        helper.assertTrue(scheduler.pendingCount() == 1, "paused 时任务应入队等待");
+        wd.startRecoveryThread(scheduler);
+        scheduler.setResumeExecutorOverride(command -> { /* 永不运行 */ });
+        wd.setStallCheckIgnorePausedForTest(true);
+        ExecutorService pool = null;
+        try {
+            // 探针：阶段 1 判定后、阶段 3 重新取锁前阻塞驱动线程（仅触发时调用一次）
+            CountDownLatch probeReached = new CountDownLatch(1);
+            CountDownLatch releaseProbe = new CountDownLatch(1);
+            wd.setPreCaptureProbe(() -> {
+                probeReached.countDown();
+                try {
+                    releaseProbe.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+
+            // 驱动线程：第 3 次调用触发第一级判定 → 停在探针
+            pool = Executors.newSingleThreadExecutor();
+            long now = System.nanoTime();
+            AtomicReference<Throwable> driverFailure = new AtomicReference<>();
+            pool.submit(() -> {
+                try {
+                    wd.checkDrainStallForTest(scheduler, now);
+                    wd.checkDrainStallForTest(scheduler, now);
+                    wd.checkDrainStallForTest(scheduler, now);
+                } catch (Throwable t) {
+                    driverFailure.set(t);
+                }
+            });
+            try {
+                helper.assertTrue(probeReached.await(5, TimeUnit.SECONDS),
+                        "探针应被触发（判定与捕获之间）");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+
+            // 停服 + 立即重启（评审场景：快速 stop/start——旧线程代数已过期）
+            wd.stopRecoveryThread();
+            wd.startRecoveryThread(scheduler);
+            // 第 14 轮修复：stop→start 的新线程 1 秒后醒来——立即清 paused 排除
+            // 开关，新线程检测时恢复"paused 不触发"语义（探针等待可能使测试体
+            // 超过 1 秒，否则新线程会触发第一级 capture 并提交到永不运行的
+            // override，代理永不完成残留——实测引发 processUnloads 忙转卡死）
+            wd.setStallCheckIgnorePausedForTest(false);
+
+            // 放行 → 旧驱动线程阶段 3 重新验证：代数不匹配 → 不得捕获发布
+            releaseProbe.countDown();
+            pool.shutdown();
+            try {
+                pool.awaitTermination(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            helper.assertTrue(driverFailure.get() == null, "驱动线程不应异常");
+            helper.assertTrue(!wd.hasActiveRecoveryBatch(), "stop/start 后旧线程不得发布新批次（P0-2）");
+            helper.assertTrue(scheduler.pendingCount() == 1, "任务应仍在队列（未被捕获）");
+        } finally {
+            // 第 14 轮防御：断言失败中止也不得残留 override/开关/探针/恢复线程
+            if (pool != null) {
+                pool.shutdownNow();
+            }
+            wd.setStallCheckIgnorePausedForTest(false);
+            scheduler.setResumeExecutorOverride(null);
+            wd.stopRecoveryThread();
+            resetScheduler(scheduler);
+            wd.resetRecoveryMetrics();
+        }
+        helper.succeed();
+    }
+
+    /**
+     * 第 14 轮 P0-3 修复验证：停服不得被同步 Future 回调无限阻塞。
+     * <p>
+     * 旧实现 stopRecoveryThread 在 ServerStopping 调用线程同步 escalate——
+     * proxy.complete 同步运行挂载的回调，阻塞回调会卡住 ServerStopping，
+     * finishServerShutdown 无法执行（与"不在 Server Thread 等待"停服目标冲突）。
+     * <p>
+     * 新实现：批次交给 emergency 分派器（每任务独立虚拟线程），stop 立即返回。
+     * 本测试：任务回调阻塞 → stop 后流程必须能继续（finishServerShutdown 等价物）
+     * → 放行回调 → 终态/指标最终归零。
+     */
+    @GameTest(template = "empty", batch = "steady_watchdog_stop_nonblocking", timeoutTicks = 600)
+    public void stopRecoveryThreadMustNotBlockOnCompletionCallback(GameTestHelper helper) {
+        GenerationChunkHolder holder = obtainHolder(helper);
+        ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
+        ChunkScheduler scheduler = ChunkScheduler.getInstance();
+        Watchdog wd = Watchdog.getInstance();
+        LifecycleCleanupCoordinator coordinator = LifecycleCleanupCoordinator.getInstance();
+        wd.stopRecoveryThread();
+        wd.resetRecoveryMetrics();
+
+        scheduler.setEnabled(true);
+        scheduler.setAdmissionPaused(false);
+        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, 8);
+        waitForQueueDrain(scheduler);
+
+        // 入队 1 个任务（paused 保持）→ 启动恢复线程
+        scheduler.setAdmissionPaused(true);
+        CompletableFuture<ChunkResult<ChunkAccess>> queued = scheduler.controlAdmission(
+                ChunkStatus.NOISE, false, map, holder,
+                () -> new CompletableFuture<ChunkResult<ChunkAccess>>());
+        helper.assertTrue(scheduler.pendingCount() == 1, "paused 时任务应入队等待");
+        wd.startRecoveryThread(scheduler);
+        scheduler.setResumeExecutorOverride(command -> { /* 永不运行 */ });
+        wd.setStallCheckIgnorePausedForTest(true);
+
+        // 任务回调阻塞（模拟下游回调卡住）
+        CountDownLatch callbackBlocked = new CountDownLatch(1);
+        CountDownLatch releaseCallback = new CountDownLatch(1);
+        queued.whenComplete((result, ex) -> {
+            callbackBlocked.countDown();
+            try {
+                releaseCallback.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+
+        // 形成批次
+        long now = System.nanoTime();
+        wd.checkDrainStallForTest(scheduler, now);
+        wd.checkDrainStallForTest(scheduler, now);
+        wd.checkDrainStallForTest(scheduler, now);
+        helper.assertTrue(wd.hasActiveRecoveryBatch(), "第一级应形成活动批次");
+        helper.assertTrue(!queued.isDone(), "mailbox 停滞时 proxy 不应完成");
+
+        // P0-3 修复验证：stop 必须立即返回（异步 emergency 分派）——
+        // 若同步 complete，测试线程会卡在回调 await 而无法执行后续断言
+        wd.stopRecoveryThread();
+        try {
+            helper.assertTrue(callbackBlocked.await(5, TimeUnit.SECONDS),
+                    "emergency 虚拟线程应已触发回调（stop 不阻塞，回调在独立线程）");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        helper.assertTrue(!wd.hasActiveRecoveryBatch(), "批次应已脱离（同步）");
+
+        // 回调仍阻塞期间：停服后续流程必须能继续（finishServerShutdown 等价物）
+        coordinator.onServerShutdown();
+        helper.assertTrue(scheduler.pendingCount() == 0, "停服清理后等待队列应清空");
+
+        // 放行回调 → 虚拟线程完成 → 终态/指标归零
+        releaseCallback.countDown();
+        awaitTrue(() -> queued.isDone(), "任务应终态");
+        helper.assertTrue(!queued.join().isSuccess(), "停服处置应为 error result");
+        awaitTrue(() -> coordinator.globalTaskCount() == 0, "registration 应归零");
+        awaitTrue(() -> wd.totalUnsafeShutdownRecoveries() == 1,
+                "停服处置应计入 shutdown 指标（实际=" + wd.totalUnsafeShutdownRecoveries() + "）");
+        helper.assertTrue(wd.totalUnsafeRecoveries() == 0, "不得混入运行期指标");
+        coordinator.onServerStopped();
+        coordinator.onServerStart(); // 恢复接收，避免污染后续批次
+        helper.assertTrue(!coordinator.isShutdownMode(), "恢复后应退出停服模式");
+
+        // 清理
+        wd.setStallCheckIgnorePausedForTest(false);
+        scheduler.setResumeExecutorOverride(null);
         resetScheduler(scheduler);
         wd.resetRecoveryMetrics();
         helper.succeed();
