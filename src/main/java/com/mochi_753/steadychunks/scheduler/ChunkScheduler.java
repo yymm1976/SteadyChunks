@@ -906,6 +906,12 @@ public final class ChunkScheduler {
     /** P1-3：是否处于有节奏放行模式（调度器已禁用且队列未清空） */
     public boolean isBypassMode() { return bypassMode.get(); }
 
+    /** 测试注入的恢复执行器当前值（阶段 2：清洁断言用；生产 null）。 */
+    public Executor resumeExecutorOverride() { return resumeExecutorOverride; }
+
+    /** 测试注入的入队探针当前值（阶段 2：清洁断言用；生产 null）。 */
+    public Runnable enqueueProbeHook() { return enqueueProbeHook; }
+
     /**
      * §9.4 服务器关闭或维度卸载时调用：异常完成所有等待任务并清空队列。
      * <p>

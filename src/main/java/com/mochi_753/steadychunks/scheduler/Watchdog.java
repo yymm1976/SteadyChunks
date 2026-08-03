@@ -176,6 +176,15 @@ public final class Watchdog {
     /** 停服处置恢复数（第 12 轮 P0：GameTest 断言停服批次被强制完成）。 */
     public long totalUnsafeShutdownRecoveries() { return totalUnsafeShutdownRecoveries.get(); }
 
+    /** 停服处置中（未终态）的批次数量（第 14 轮 P0-3：测试清洁断言用）。 */
+    public int shutdownBatchCount() { return shutdownBatches.size(); }
+
+    /** 测试专用：停滞检测开关当前值（阶段 2：清洁断言用）。 */
+    public boolean isStallCheckIgnorePausedForTest() { return stallCheckIgnorePausedForTest; }
+
+    /** 测试专用：判定-捕获探针当前值（阶段 2：清洁断言用）。 */
+    public Runnable preCaptureProbe() { return preCaptureProbe; }
+
     /**
      * 第 12 轮 P1 修复：复位恢复指标——GameTest 测试前后复位，避免刻意触发的
      * 状态机恢复污染跨批次累计值（与 ChunkScheduler.resetDiagnostics 同惯例；

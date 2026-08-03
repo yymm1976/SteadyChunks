@@ -58,3 +58,6 @@ replay_pid*
 
 # 审查报告（本地产物，不入库）
 审查结果.md
+
+# GameTest 卡死证据（原始日志/jstack 不入库，磁盘保留）
+artifacts/round14-stalls/
