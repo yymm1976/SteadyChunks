@@ -1011,9 +1011,12 @@ public final class ChunkScheduler {
                 executor.execute(() -> t.proxy().complete(
                         ChunkResult.error("SteadyChunks drain 停摆恢复（mailbox）")));
             } catch (Throwable ex) {
-                // mailbox 拒绝（停滞/关闭）：daemon 线程直接完成，计入 unsafe 指标
-                t.proxy().complete(ChunkResult.error("SteadyChunks drain 停摆恢复（mailbox 拒绝降级）"));
-                rejected++;
+                // mailbox 拒绝（停滞/关闭）：daemon 线程直接完成，计入 unsafe 指标。
+                // 第 12 轮 P2 修复：complete 返回 false 表示已被并发路径完成——
+                // 不重复计入（旧实现无条件 rejected++ 可能多计指标）。
+                if (t.proxy().complete(ChunkResult.error("SteadyChunks drain 停摆恢复（mailbox 拒绝降级）"))) {
+                    rejected++;
+                }
             }
         }
         return new MailboxRecoveryResult(
@@ -1040,10 +1043,19 @@ public final class ChunkScheduler {
      * @return 本次实际直接完成的任务数（unsafe 计数）
      */
     public int escalateRecoveryBatch(RecoveryBatch batch) {
+        return escalateRecoveryBatch(batch, "SteadyChunks drain 停摆恢复（UNSAFE_EMERGENCY）");
+    }
+
+    /**
+     * 第 12 轮 P0 修复：带原因的第二级——停服路径（Watchdog.stopRecoveryThread 处置
+     * 活动批次）复用同一强制完成逻辑，仅 error result 信息区分来源。
+     *
+     * @return 本次实际直接完成的任务数（unsafe 计数）
+     */
+    public int escalateRecoveryBatch(RecoveryBatch batch, String reason) {
         int unsafe = 0;
         for (PendingNoiseTask t : batch.tasks()) {
-            if (t.proxy().complete(
-                    ChunkResult.error("SteadyChunks drain 停摆恢复（UNSAFE_EMERGENCY）"))) {
+            if (t.proxy().complete(ChunkResult.error(reason))) {
                 unsafe++;
             }
         }

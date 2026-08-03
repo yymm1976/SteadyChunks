@@ -44,8 +44,6 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class LifecycleCleanupCoordinator {
     private static LifecycleCleanupCoordinator instance;
 
-    /** 按维度索引的活跃任务计数（泄漏检测用） */
-    private final ConcurrentHashMap<ResourceKey<Level>, AtomicInteger> dimensionTaskCounts = new ConcurrentHashMap<>();
     /** 按玩家索引的活跃引用（泄漏检测用） */
     private final ConcurrentHashMap<UUID, AtomicInteger> playerReferences = new ConcurrentHashMap<>();
     /** 累计卸载区块数 */
@@ -64,11 +62,17 @@ public final class LifecycleCleanupCoordinator {
      * 旧服务器生命周期的迟到 lease 不会污染新服务器（旧实现共享 globalTaskCount，
      * 旧任务在 ServerStopped 后迟到 close 会把新生命周期计数抹掉甚至减成负数）。
      * 新服务器启动时原子替换 {@link #currentLifecycle}，旧对象随旧任务自然归零。
+     * <p>
+     * 第 12 轮 P1 修复：维度计数随生命周期隔离——旧服务器迟到任务与新服务器同
+     * 维度任务不再共享同一 counter（旧实现维度 Map 在协调器上全局共享，重叠窗口
+     * 内 detectLeaks 比较维度总和与全局计数会产生假泄漏）。
      */
     static final class ServerLifecycle {
         final long generation;
         final AtomicInteger activeTasks = new AtomicInteger(0);
         final AtomicBoolean accepting = new AtomicBoolean(true);
+        /** 按维度索引的活跃任务计数（随生命周期隔离，泄漏检测用） */
+        final ConcurrentHashMap<ResourceKey<Level>, AtomicInteger> dimensionTaskCounts = new ConcurrentHashMap<>();
 
         ServerLifecycle(long generation) {
             this.generation = generation;
@@ -153,15 +157,17 @@ public final class LifecycleCleanupCoordinator {
             return UNREGISTERED;
         }
         lifecycle.activeTasks.incrementAndGet();
+        // 第 12 轮 P1 修复：counter 从捕获的生命周期内取——旧代迟到 close 只影响
+        // 旧 lifecycle 的维度 Map，新服务器同名维度计数不受污染。
         AtomicInteger dimensionCounter =
-                dimensionTaskCounts.computeIfAbsent(dimension, k -> new AtomicInteger(0));
+                lifecycle.dimensionTaskCounts.computeIfAbsent(dimension, k -> new AtomicInteger(0));
         dimensionCounter.incrementAndGet();
         // 注册后二次校验：停服在"检查门与递增"之间越过时回退计数，不返回有效 lease。
         if (!lifecycle.accepting.get() || lifecycle != currentLifecycle.get()) {
             lifecycle.activeTasks.decrementAndGet();
             int remaining = dimensionCounter.decrementAndGet();
             if (remaining == 0) {
-                dimensionTaskCounts.remove(dimension, dimensionCounter);
+                lifecycle.dimensionTaskCounts.remove(dimension, dimensionCounter);
             }
             return UNREGISTERED;
         }
@@ -176,13 +182,13 @@ public final class LifecycleCleanupCoordinator {
             @Override
             public void close() {
                 // 幂等：仅首次 close 递减。递减捕获的服务器生命周期（旧代 lease 迟到
-                // close 只影响旧 counter，不污染新服务器）与捕获的维度 counter
-                //（remove(key, value) 防串代删除，与维度卸载 remove 并发为无操作）。
+                // close 只影响旧 counter 与旧维度 Map，不污染新服务器）与捕获的维度
+                // counter（remove(key, value) 防串代删除，与维度卸载 remove 并发为无操作）。
                 if (closed.compareAndSet(false, true)) {
                     lifecycle.activeTasks.decrementAndGet();
                     int remaining = dimensionCounter.decrementAndGet();
                     if (remaining == 0) {
-                        dimensionTaskCounts.remove(dimension, dimensionCounter);
+                        lifecycle.dimensionTaskCounts.remove(dimension, dimensionCounter);
                     }
                 }
             }
@@ -267,15 +273,18 @@ public final class LifecycleCleanupCoordinator {
         // cancelDimension 同步取消队列任务并 close 其 lease；已出队/运行中任务
         // 在代理 Future 终态才 close。因此清理后残留 = 正在收尾的任务（正常，最终归零）
         // 或永不终结的任务（真泄漏，如原版生成 Future 随维度卸载被丢弃）。
-        int remainingTasks = dimensionTaskCounts.getOrDefault(dimension, new AtomicInteger(0)).get();
+        // 第 12 轮 P1 修复：读当前生命周期的维度 Map——旧生命周期迟到任务不混入。
+        ServerLifecycle lifecycle = currentLifecycle.get();
+        int remainingTasks = lifecycle.dimensionTaskCounts.getOrDefault(dimension, new AtomicInteger(0)).get();
         if (remainingTasks > 0) {
             totalLeaksDetected.addAndGet(remainingTasks);
             SteadyChunks.LOGGER.warn("SteadyChunks 维度卸载泄漏: dim={} 残留任务={}", dimension.location(), remainingTasks);
         }
 
-        // 移除维度计数 entry；此后该维度任务 close 时 computeIfPresent 为无操作
-        // （不会重建 0 → -1 的负数 entry，修复旧 unregisterTask 的永久负计数污染）。
-        dimensionTaskCounts.remove(dimension);
+        // 移除当前生命周期维度计数 entry；此后该维度任务 close 时 remove(key, value)
+        // 为无操作（不会重建 0 → -1 的负数 entry，修复旧 unregisterTask 的永久负计数
+        // 污染）；旧生命周期迟到 close 只影响旧 Map，无副作用。
+        lifecycle.dimensionTaskCounts.remove(dimension);
         SteadyChunks.LOGGER.info("SteadyChunks 维度卸载完成: {}", dimension.location());
     }
 
@@ -412,7 +421,9 @@ public final class LifecycleCleanupCoordinator {
         int leaks = 0;
         int global = currentLifecycle.get().activeTasks.get();
         int sum = 0;
-        for (AtomicInteger c : dimensionTaskCounts.values()) {
+        // 第 12 轮 P1 修复：维度总和取自当前生命周期——全局与维度计数天然同代，
+        // 旧生命周期迟到任务不会造成假泄漏。
+        for (AtomicInteger c : currentLifecycle.get().dimensionTaskCounts.values()) {
             sum += c.get();
         }
         if (sum != global) {
@@ -426,7 +437,8 @@ public final class LifecycleCleanupCoordinator {
     /** 当前服务器生命周期的活跃任务计数（旧生命周期残留不纳入） */
     public int globalTaskCount() { return currentLifecycle.get().activeTasks.get(); }
     public int dimensionTaskCount(ResourceKey<Level> dim) {
-        return dimensionTaskCounts.getOrDefault(dim, new AtomicInteger(0)).get();
+        // 第 12 轮 P1 修复：读当前生命周期的维度 Map（旧代迟到任务不混入）
+        return currentLifecycle.get().dimensionTaskCounts.getOrDefault(dim, new AtomicInteger(0)).get();
     }
     public long totalChunksUnloaded() { return totalChunksUnloaded.get(); }
     public long totalDimensionsUnloaded() { return totalDimensionsUnloaded.get(); }

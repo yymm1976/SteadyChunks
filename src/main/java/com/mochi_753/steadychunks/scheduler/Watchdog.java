@@ -57,6 +57,19 @@ public final class Watchdog {
     /** 累计恢复次数（mailbox 第一级 + UNSAFE_EMERGENCY 第二级合计） */
     private final AtomicLong totalRecoveries = new AtomicLong(0);
     /**
+     * 第 12 轮 P1 修复：测试专用停滞检测开关——置 true 时 checkDrainStall 忽略
+     * admissionPaused 排除项，使 GameTest 能在 paused 队列上驱动停滞检测
+     * （paused 阻止并发 drain 抢走任务，队列快照稳定；真实触发条件刻意排除
+     * paused，生产从不设置）。仅 checkDrainStallForTest 驱动期间置 true，
+     * start/stop 强制复位，测试结束必须显式清空。
+     */
+    private volatile boolean stallCheckIgnorePausedForTest = false;
+
+    /** 测试专用：驱动停滞检测时忽略 paused 排除项（生产默认 false）。 */
+    public void setStallCheckIgnorePausedForTest(boolean ignore) {
+        this.stallCheckIgnorePausedForTest = ignore;
+    }
+    /**
      * 第 10 轮修复：UNSAFE_EMERGENCY 次数——Watchdog daemon 线程直接 complete
      * 代理 Future（绕过 worldgen mailbox 线程语义）的独立指标，正确性测试断言
      * 此值为 0，任何非零都意味着调度链曾停滞且 mailbox 恢复失效。
@@ -69,6 +82,37 @@ public final class Watchdog {
      * 找不到第一级任务的问题）。
      */
     private ChunkScheduler.RecoveryBatch activeRecoveryBatch;
+    /**
+     * 第 12 轮 P0 修复：停服时强制完成活动恢复批次的任务数——独立于运行期
+     * UNSAFE_EMERGENCY（{@link #totalUnsafeRecoveries}）：停服路径由
+     * ServerStopping 的 {@link #stopRecoveryThread()} 触发，不混入运行期指标
+     * （正确性测试仍断言运行期指标为 0）。
+     */
+    private final AtomicLong totalUnsafeShutdownRecoveries = new AtomicLong(0);
+
+    /** 是否存在活动恢复批次（第 12 轮 P1：GameTest 状态机断言用）。 */
+    public synchronized boolean hasActiveRecoveryBatch() {
+        return activeRecoveryBatch != null;
+    }
+
+    /** 活动批次截止时间（纳秒）；无批次返回 -1（第 12 轮 P1：GameTest 注入时钟用）。 */
+    public synchronized long activeRecoveryBatchDeadlineNanos() {
+        return activeRecoveryBatch != null ? activeRecoveryBatch.deadlineNanos() : -1;
+    }
+
+    /** 停服处置恢复数（第 12 轮 P0：GameTest 断言停服批次被强制完成）。 */
+    public long totalUnsafeShutdownRecoveries() { return totalUnsafeShutdownRecoveries.get(); }
+
+    /**
+     * 第 12 轮 P1 修复：复位恢复指标——GameTest 测试前后复位，避免刻意触发的
+     * 状态机恢复污染跨批次累计值（与 ChunkScheduler.resetDiagnostics 同惯例；
+     * 正确性硬门槛断言运行期指标为 0 不依赖本方法，测试自身先复位再断言）。
+     */
+    public synchronized void resetRecoveryMetrics() {
+        totalRecoveries.set(0);
+        totalUnsafeRecoveries.set(0);
+        totalUnsafeShutdownRecoveries.set(0);
+    }
 
     /**
      * 启动独立 drain 停摆恢复线程（ModuleBootstrap 服务器启动时调用）。
@@ -102,6 +146,13 @@ public final class Watchdog {
         }
         recoveryStarted = true;
         stopRecovery = false;
+        // 第 12 轮 P1 修复：跨服务器生命周期复位停滞状态——旧世界残留的
+        // stallCount 不会让新世界仅 1 秒就误触发恢复；lastDrainProgress 对齐
+        // 当前进度，首个检测周期不会因旧值误判停滞。
+        stallCount = 0;
+        lastDrainProgress = scheduler.drainProgress();
+        // 第 12 轮 P1 修复：复位测试专用开关（防上一测试异常中止遗留）
+        stallCheckIgnorePausedForTest = false;
         Thread thread = new Thread(() -> {
             try {
                 while (!stopRecovery && generation == recoveryGeneration.get()) {
@@ -111,7 +162,7 @@ public final class Watchdog {
                         break;
                     }
                     try {
-                        checkDrainStall(scheduler);
+                        checkDrainStall(scheduler, generation);
                     } catch (Throwable t) {
                         SteadyChunks.LOGGER.warn("SteadyChunks Watchdog 恢复检查异常", t);
                     }
@@ -133,13 +184,39 @@ public final class Watchdog {
         thread.start();
     }
 
-    /** 停止恢复线程（服务器停止时调用，幂等；interrupt 唤醒 sleep） */
-    public synchronized void stopRecoveryThread() {
-        stopRecovery = true;
-        // 第 11 轮 P0 修复：停服清除活动恢复批次（任务引用随批次释放，世界销毁
-        // 兜底；proxy 未完成的任务由原版任务随世界销毁自然丢弃）
-        activeRecoveryBatch = null;
-        Thread thread = recoveryThread;
+    /**
+     * 停止恢复线程（服务器停止时调用，幂等；interrupt 唤醒 sleep）。
+     * <p>
+     * 第 12 轮 P0 修复：停服不得静默遗弃活动恢复批次——锁内脱离批次引用后，
+     * 锁外由调用线程（ServerStopping）同步强制完成批次内未终态任务
+     * （proxy 终态 → registration 关闭 → 旧 ServerLifecycle 计数归零）。
+     * 旧实现直接置空：批次任务已不在 pending 队列，closeForShutdown 看不到
+     * 它们，proxy 永不终态、TaskRegistration 不关闭、旧生命周期永久残留计数。
+     */
+    public void stopRecoveryThread() {
+        ChunkScheduler.RecoveryBatch detached;
+        Thread thread;
+        synchronized (this) {
+            stopRecovery = true;
+            detached = activeRecoveryBatch;
+            activeRecoveryBatch = null;
+            // 第 12 轮 P1 修复：跨服务器生命周期复位停滞状态（见 startRecoveryThread）
+            stallCount = 0;
+            lastDrainProgress = ChunkScheduler.getInstance().drainProgress();
+            // 第 12 轮 P1 修复：复位测试专用开关（防测试异常中止遗留污染后续批次）
+            stallCheckIgnorePausedForTest = false;
+            thread = recoveryThread;
+        }
+        if (detached != null) {
+            // 锁外执行外部调用（P1-1：不持 Watchdog 锁触发 Future 回调/registration close）
+            int completed = ChunkScheduler.getInstance().escalateRecoveryBatch(
+                    detached, "服务器停服：活动恢复批次强制完成");
+            totalUnsafeShutdownRecoveries.addAndGet(completed);
+            SteadyChunks.LOGGER.error(
+                    "SteadyChunks Watchdog: 停服处置活动恢复批次 {}——{} 个未终态任务由"
+                            + "停服线程直接完成（计入 totalUnsafeShutdownRecoveries）",
+                    detached.id(), completed);
+        }
         if (thread != null) {
             thread.interrupt();
         }
@@ -157,81 +234,132 @@ public final class Watchdog {
     public long totalUnsafeRecoveries() { return totalUnsafeRecoveries.get(); }
 
     /**
-     * 第 11 轮 P0 修复：批次状态机 + drain 停滞检测（synchronized——stop 后立即
-     * start 时新旧线程可能短暂并存，防并发触发恢复）。
+     * 第 11 轮 P0 修复：批次状态机 + drain 停滞检测。
      * <p>
      * 批次优先：活动批次存在时（第一级已取出任务、pending 可能已归零），无论
      * pendingCount 如何都先推进批次（全部终态 → 清除；超时 → 第二级强制完成），
      * 修复旧实现 pending==0 早退导致第二级永不执行的问题。
+     * <p>
+     * 第 12 轮 P1 修复：锁粒度收窄——synchronized 块内只交换/读取状态（批次引用、
+     * 停滞计数、队列快照），executor.execute 与 Future 完成等外部调用全部移到锁外：
+     * 避免恢复线程持锁时被 worldgen mailbox 执行器阻塞，导致 ServerStopping 的
+     * stopRecoveryThread 等待同一把锁而卡住停服线程（重新引入停服阻塞风险）。
      */
-    private synchronized void checkDrainStall(ChunkScheduler scheduler) {
-        ChunkScheduler.RecoveryBatch batch = activeRecoveryBatch;
-        if (batch != null) {
-            if (scheduler.recoveryBatchAllDone(batch)) {
-                activeRecoveryBatch = null;
-            } else if (System.nanoTime() >= batch.deadlineNanos()) {
-                int unsafe = scheduler.escalateRecoveryBatch(batch);
-                totalUnsafeRecoveries.addAndGet(unsafe);
-                activeRecoveryBatch = null;
-                SteadyChunks.LOGGER.error(
-                        "SteadyChunks Watchdog: UNSAFE_EMERGENCY——mailbox 恢复失效，"
-                                + "daemon 线程直接完成 {} 个批次任务（打破卸载重入风暴死锁）",
-                        unsafe);
-            }
-            return; // 批次处理期间不启动新批次
-        }
-        int pending = scheduler.pendingCount();
-        long progress = scheduler.drainProgress();
-        if (pending == 0
-                || scheduler.isAdmissionPaused()
-                || !scheduler.isEnabled()
-                || scheduler.isFailOpen()
-                || scheduler.drainWipValue() != 0
-                || scheduler.cpuPermitsAvailable() <= 0) {
-            // 正常等待（paused/disabled/permit 不足）或队列空：复位停滞计数
-            stallCount = 0;
-            lastDrainProgress = progress;
-            return;
-        }
-        var noisePermit = scheduler.stageLimiter().permit(ChunkStatus.NOISE);
-        if (noisePermit != null && noisePermit.availablePermits() == 0) {
-            // NOISE 阶段 permit 被占：排队等待正常（P2 修复，第 5 轮）
-            stallCount = 0;
-            lastDrainProgress = progress;
-            return;
-        }
-        if (progress == lastDrainProgress) {
-            stallCount++;
-            // 第 9 轮卡死修复：停滞 2 秒后输出诊断（含排除项状态），便于定位
-            // "在途型"忙转（pending==0 但 refCount 滞留——恢复线程覆盖不到）。
-            if (stallCount == 2) {
-                SteadyChunks.LOGGER.warn(
-                        "SteadyChunks Watchdog: drain 停滞观察中 pending={} inflight={} drainWip={} "
-                                + "bypass={} paused={} failOpen={}（若持续 3 秒将启动两级恢复）",
-                        pending, scheduler.inflightCount(), scheduler.drainWipValue(),
-                        scheduler.isBypassMode(), scheduler.isAdmissionPaused(), scheduler.isFailOpen());
-            }
-            if (stallCount >= 3) {
-                stallCount = 0;
-                // 第 11 轮 P0 修复：第一级形成 RecoveryBatch（保留任务引用）并经
-                // mailbox 提交；拒绝的任务直接完成并计入 unsafe（P1）。
-                ChunkScheduler.MailboxRecoveryResult result = scheduler.beginMailboxRecovery();
-                totalRecoveries.incrementAndGet();
-                totalUnsafeRecoveries.addAndGet(result.rejectedAndCompletedUnsafely());
-                if (!result.batch().tasks().isEmpty()) {
-                    activeRecoveryBatch = result.batch();
+    private void checkDrainStall(ChunkScheduler scheduler, long generation) {
+        checkDrainStall(scheduler, System.nanoTime(), generation);
+    }
+
+    /**
+     * 第 12 轮 P1 修复：测试入口——注入 nowNanos 驱动批次 deadline 状态机，
+     * 不依赖真实等待（GameTest 端到端驱动第一级/第二级恢复）。
+     * generation 取当前代数：测试线程以"当前恢复线程"身份驱动发布路径。
+     */
+    public void checkDrainStallForTest(ChunkScheduler scheduler, long nowNanos) {
+        checkDrainStall(scheduler, nowNanos, recoveryGeneration.get());
+    }
+
+    private void checkDrainStall(ChunkScheduler scheduler, long nowNanos, long generation) {
+        // ---- 阶段 1（锁内）：批次推进决策 + 停滞检测（纯状态读写，无外部调用） ----
+        ChunkScheduler.RecoveryBatch batchToEscalate = null;
+        boolean startFirstLevel = false;
+        int pendingAtTrigger = -1;
+        synchronized (this) {
+            ChunkScheduler.RecoveryBatch batch = activeRecoveryBatch;
+            if (batch != null) {
+                if (scheduler.recoveryBatchAllDone(batch)) {
+                    activeRecoveryBatch = null;
+                } else if (nowNanos >= batch.deadlineNanos()) {
+                    // 第二级：锁内脱离批次，锁外直接完成（不在锁内触发 Future 回调）
+                    activeRecoveryBatch = null;
+                    batchToEscalate = batch;
                 }
+                // 批次处理期间不启动新批次
+            } else {
+                int pending = scheduler.pendingCount();
+                long progress = scheduler.drainProgress();
+                if (pending == 0
+                        || (scheduler.isAdmissionPaused() && !stallCheckIgnorePausedForTest)
+                        || !scheduler.isEnabled()
+                        || scheduler.isFailOpen()
+                        || scheduler.drainWipValue() != 0
+                        || scheduler.cpuPermitsAvailable() <= 0) {
+                    // 正常等待（paused/disabled/permit 不足）或队列空：复位停滞计数。
+                    // 第 12 轮 P1 修复：paused 排除项可被测试专用开关忽略（见
+                    // {@link #stallCheckIgnorePausedForTest}），生产行为不变。
+                    stallCount = 0;
+                    lastDrainProgress = progress;
+                } else {
+                    var noisePermit = scheduler.stageLimiter().permit(ChunkStatus.NOISE);
+                    if (noisePermit != null && noisePermit.availablePermits() == 0) {
+                        // NOISE 阶段 permit 被占：排队等待正常（P2 修复，第 5 轮）
+                        stallCount = 0;
+                        lastDrainProgress = progress;
+                    } else if (progress == lastDrainProgress) {
+                        stallCount++;
+                        // 停滞 2 秒后输出诊断（含排除项状态），便于定位在途型忙转
+                        if (stallCount == 2) {
+                            SteadyChunks.LOGGER.warn(
+                                    "SteadyChunks Watchdog: drain 停滞观察中 pending={} inflight={} drainWip={} "
+                                            + "bypass={} paused={} failOpen={}（若持续 3 秒将启动两级恢复）",
+                                    pending, scheduler.inflightCount(), scheduler.drainWipValue(),
+                                    scheduler.isBypassMode(), scheduler.isAdmissionPaused(), scheduler.isFailOpen());
+                        }
+                        if (stallCount >= 3) {
+                            stallCount = 0;
+                            startFirstLevel = true;
+                            pendingAtTrigger = pending;
+                        }
+                    } else {
+                        stallCount = 0;
+                    }
+                    lastDrainProgress = progress;
+                }
+            }
+        }
+
+        // ---- 阶段 2（锁外）：外部调用（executor / Future 完成） ----
+        if (batchToEscalate != null) {
+            int unsafe = scheduler.escalateRecoveryBatch(batchToEscalate);
+            totalUnsafeRecoveries.addAndGet(unsafe);
+            SteadyChunks.LOGGER.error(
+                    "SteadyChunks Watchdog: UNSAFE_EMERGENCY——mailbox 恢复失效，"
+                            + "daemon 线程直接完成 {} 个批次任务（打破卸载重入风暴死锁）",
+                    unsafe);
+        } else if (startFirstLevel) {
+            ChunkScheduler.MailboxRecoveryResult result = scheduler.beginMailboxRecovery();
+            // ---- 阶段 3（锁内）：发布批次；停服窗口内形成的批次就地升级，防任务遗弃 ----
+            boolean publishStopped;
+            synchronized (this) {
+                // 第一级形成期间 stop（stopRecovery）或 stop→start（代数变化）：
+                // 批次任务已移出队列，不能发布到已停止/新代数的 Watchdog——
+                // 就地完成（计入停服指标），与 stopRecoveryThread 的处置路径互补。
+                publishStopped = stopRecovery || generation != recoveryGeneration.get();
+                if (!publishStopped) {
+                    totalRecoveries.incrementAndGet();
+                    totalUnsafeRecoveries.addAndGet(result.rejectedAndCompletedUnsafely());
+                    if (!result.batch().tasks().isEmpty()) {
+                        activeRecoveryBatch = result.batch();
+                    }
+                }
+            }
+            if (publishStopped) {
+                int n = scheduler.escalateRecoveryBatch(result.batch(),
+                        "停服窗口形成的恢复批次强制完成");
+                totalUnsafeShutdownRecoveries.addAndGet(result.rejectedAndCompletedUnsafely() + n);
+                SteadyChunks.LOGGER.error(
+                        "SteadyChunks Watchdog: 停服窗口形成的恢复批次 {}（{} 个任务，mailbox 拒绝 {} 个）"
+                                + "由停服线程直接完成（计入 totalUnsafeShutdownRecoveries）",
+                        result.batch().id(), result.batch().tasks().size(),
+                        result.rejectedAndCompletedUnsafely());
+            } else {
                 SteadyChunks.LOGGER.warn(
                         "SteadyChunks Watchdog: drain 停摆检测（3 秒无进度，pending={}），"
                                 + "第一级形成恢复批次 {}（{} 个任务，mailbox 拒绝 {} 个），"
                                 + "2 秒内无终态将升级 UNSAFE_EMERGENCY",
-                        pending, result.batch().id(), result.batch().tasks().size(),
+                        pendingAtTrigger, result.batch().id(), result.batch().tasks().size(),
                         result.rejectedAndCompletedUnsafely());
             }
-        } else {
-            stallCount = 0;
         }
-        lastDrainProgress = progress;
     }
 
     private Watchdog() {
