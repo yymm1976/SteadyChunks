@@ -19,6 +19,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * 生命周期清理协调器，对应开发计划 §9.4。
@@ -47,8 +48,6 @@ public final class LifecycleCleanupCoordinator {
     private final ConcurrentHashMap<ResourceKey<Level>, AtomicInteger> dimensionTaskCounts = new ConcurrentHashMap<>();
     /** 按玩家索引的活跃引用（泄漏检测用） */
     private final ConcurrentHashMap<UUID, AtomicInteger> playerReferences = new ConcurrentHashMap<>();
-    /** 全局活跃任务计数 */
-    private final AtomicInteger globalTaskCount = new AtomicInteger(0);
     /** 累计卸载区块数 */
     private final AtomicLong totalChunksUnloaded = new AtomicLong(0);
     /** 累计卸载维度数 */
@@ -57,16 +56,35 @@ public final class LifecycleCleanupCoordinator {
     private final AtomicLong totalLeaksDetected = new AtomicLong(0);
     /** 停服模式标志 */
     private final AtomicBoolean shutdownMode = new AtomicBoolean(false);
+
     /**
-     * 第 10 轮 P0-2 修复：服务器生命周期注册门。
+     * 第 11 轮 P0/P1 修复：服务器生命周期计数（generation-local counter）。
      * <p>
-     * 与 {@link #shutdownMode} 配合关闭 check-then-act 窗口：停服必须先关注册门
-     * （acceptingRegistrations=false + serverGeneration++）再等待/清理，注册后
-     * 二次校验失败立即回退计数，杜绝"停服越过等待屏障后新任务仍注册"。
+     * registration 捕获注册时的 {@link ServerLifecycle} 对象，close 只递减捕获对象——
+     * 旧服务器生命周期的迟到 lease 不会污染新服务器（旧实现共享 globalTaskCount，
+     * 旧任务在 ServerStopped 后迟到 close 会把新生命周期计数抹掉甚至减成负数）。
+     * 新服务器启动时原子替换 {@link #currentLifecycle}，旧对象随旧任务自然归零。
      */
-    private final AtomicBoolean acceptingRegistrations = new AtomicBoolean(true);
-    /** 服务器生命周期代数：每次开/关门递增，注册后二次校验用 */
+    static final class ServerLifecycle {
+        final long generation;
+        final AtomicInteger activeTasks = new AtomicInteger(0);
+        final AtomicBoolean accepting = new AtomicBoolean(true);
+
+        ServerLifecycle(long generation) {
+            this.generation = generation;
+        }
+    }
+
+    /** 当前服务器生命周期（onServerStart 替换、onServerShutdown 关闭 accepting） */
+    private final AtomicReference<ServerLifecycle> currentLifecycle =
+            new AtomicReference<>(new ServerLifecycle(0));
+    /** 服务器生命周期代数计数器（新 lifecycle 的 generation 来源） */
     private final AtomicLong serverGeneration = new AtomicLong(0);
+
+    /** 是否接受新注册（供 controlAdmission 停服门前置，P1） */
+    public boolean isAcceptingRegistrations() {
+        return !shutdownMode.get() && currentLifecycle.get().accepting.get();
+    }
 
     private LifecycleCleanupCoordinator() {
     }
@@ -128,19 +146,19 @@ public final class LifecycleCleanupCoordinator {
         if (shutdownMode.get()) {
             return UNREGISTERED; // 停服模式拒绝新任务
         }
-        // 第 10 轮 P0-2 修复：读门状态与代数（注册后二次校验用）
-        long generation = serverGeneration.get();
-        if (!acceptingRegistrations.get()) {
+        // 第 11 轮 P0/P1 修复：捕获当前服务器生命周期对象（注册后二次校验 + close
+        // 只递减捕获对象，旧代迟到 close 不污染新服务器计数）。
+        ServerLifecycle lifecycle = currentLifecycle.get();
+        if (!lifecycle.accepting.get()) {
             return UNREGISTERED;
         }
-        globalTaskCount.incrementAndGet();
+        lifecycle.activeTasks.incrementAndGet();
         AtomicInteger dimensionCounter =
                 dimensionTaskCounts.computeIfAbsent(dimension, k -> new AtomicInteger(0));
         dimensionCounter.incrementAndGet();
-        // 第 10 轮 P0-2 修复：注册后二次校验——停服在"检查门与递增"之间越过时回退计数，
-        // 不返回有效 lease（调用方将拒绝任务，任务不会以旧服务器生命周期运行）。
-        if (!acceptingRegistrations.get() || generation != serverGeneration.get()) {
-            globalTaskCount.decrementAndGet();
+        // 注册后二次校验：停服在"检查门与递增"之间越过时回退计数，不返回有效 lease。
+        if (!lifecycle.accepting.get() || lifecycle != currentLifecycle.get()) {
+            lifecycle.activeTasks.decrementAndGet();
             int remaining = dimensionCounter.decrementAndGet();
             if (remaining == 0) {
                 dimensionTaskCounts.remove(dimension, dimensionCounter);
@@ -157,12 +175,11 @@ public final class LifecycleCleanupCoordinator {
 
             @Override
             public void close() {
-                // 幂等：仅首次 close 递减。维度计数归零即移除 entry。
-                // remove(key, value) 仅在 key 仍映射到注册时捕获的 counter 时删除：
-                // 维度卸载 remove 后重载产生的新 counter 不会被旧 lease 误删；
-                // 与 onDimensionUnload 的 remove 并发时为无操作，不会重建负数 entry。
+                // 幂等：仅首次 close 递减。递减捕获的服务器生命周期（旧代 lease 迟到
+                // close 只影响旧 counter，不污染新服务器）与捕获的维度 counter
+                //（remove(key, value) 防串代删除，与维度卸载 remove 并发为无操作）。
                 if (closed.compareAndSet(false, true)) {
-                    globalTaskCount.decrementAndGet();
+                    lifecycle.activeTasks.decrementAndGet();
                     int remaining = dimensionCounter.decrementAndGet();
                     if (remaining == 0) {
                         dimensionTaskCounts.remove(dimension, dimensionCounter);
@@ -298,10 +315,10 @@ public final class LifecycleCleanupCoordinator {
     public void onServerStart() {
         SteadyChunks.LOGGER.info("SteadyChunks 服务器启动：恢复任务接收");
         shutdownMode.set(false);
-        // 第 10 轮 P0-2 修复：打开注册门并递增服务器代数（旧服务器生命周期的迟到
-        // 注册二次校验会因代数不匹配而回退）
-        acceptingRegistrations.set(true);
-        serverGeneration.incrementAndGet();
+        // 第 11 轮 P0/P1 修复：原子替换为新的服务器生命周期（generation-local counter）——
+        // 旧生命周期的迟到 lease 只递减旧 counter，不污染新服务器（旧实现共享计数，
+        // 旧任务在 ServerStopped 后迟到 close 会把新计数抹掉甚至减成负数）。
+        currentLifecycle.set(new ServerLifecycle(serverGeneration.incrementAndGet()));
         // 第 9 轮 P1 修复：启动场景不清空队列（resetForReload 会以 error result 清空
         // spawn 区域真实生成残留任务，导致区块卡在 NOISE 之前、后续强制同步加载死锁）。
         // 队列残留（若有）由维度卸载清理（LevelEvent.Unload → cancelDimension）兜底，
@@ -310,23 +327,6 @@ public final class LifecycleCleanupCoordinator {
         IoQueueController.getInstance().exitShutdownMode();
     }
 
-    /**
-     * 服务器关闭时调用：拒绝新任务，安全排空。
-     * <p>
-     * 步骤：
-     * <ol>
-     *   <li>进入停服模式，拒绝新任务</li>
-     *   <li>I/O 队列进入停服模式（提升写入预算）</li>
-     *   <li>等待活跃任务完成（有限时间）</li>
-     *   <li>强制清理所有缓存和队列</li>
-     * </ol>
-     * <p>
-     * 第 9 轮 P1 修复：等待超时后仍保留任务计数（不强制归零）——运行中的任务
-     * 仍持有注册 lease，超时强制清零会让它们的迟到 close 把计数减成负数。
-     * 保留计数由迟到 lease 自行递减到零；新服务器生命周期由 {@link #onServerStart()} 恢复。
-     *
-     * @param maxWaitMs 最大等待时间（毫秒）
-     */
     /**
      * 服务器关闭时调用（ServerStoppingEvent）：拒绝新任务并立即清空等待队列。
      * <p>
@@ -342,10 +342,10 @@ public final class LifecycleCleanupCoordinator {
      */
     public void onServerShutdown() {
         SteadyChunks.LOGGER.info("SteadyChunks 开始停服清理");
-        // 1. 先关注册门（P0-2：check-then-act 窗口收窄——此后新注册二次校验失败回退）
+        // 1. 先关闭当前生命周期的注册门（P0-2：check-then-act 窗口收窄——
+        //    此后新注册二次校验失败回退）
         shutdownMode.set(true);
-        acceptingRegistrations.set(false);
-        serverGeneration.incrementAndGet();
+        currentLifecycle.get().accepting.set(false);
 
         // 2. I/O 队列进入停服模式（提升写入预算）
         IoQueueController.getInstance().enterShutdownMode();
@@ -354,7 +354,7 @@ public final class LifecycleCleanupCoordinator {
         //    Thread 导致 pending 无法推进，见 javadoc）
         ChunkScheduler.getInstance().closeForShutdown(new IllegalStateException("Server stopping"));
 
-        int remaining = globalTaskCount.get();
+        int remaining = currentLifecycle.get().activeTasks.get();
         if (remaining > 0) {
             SteadyChunks.LOGGER.info("SteadyChunks 停服：等待 {} 个运行中任务自然结束（迟到 lease 自行归零）",
                     remaining);
@@ -367,20 +367,18 @@ public final class LifecycleCleanupCoordinator {
      * 第 10 轮 P0-3 修复：从 {@link #onServerShutdown()} 拆出的后半段——此时
      * Server Thread 已停止，运行中任务应已终结（迟到 lease 递减计数），残留计数
      * 即真泄漏。
+     * <p>
+     * 第 11 轮修复：不再清零计数（旧实现 set(0)+clear 会被旧生命周期迟到 close
+     * 污染成负数，且把残留带进新生命周期）——ServerLifecycle 对象隔离：新服务器
+     * 由 onServerStart 原子替换，旧 lease 只递减旧 counter，泄漏报告读当前对象即可。
      */
     public void onServerStopped() {
         forceClearAll();
-        int remaining = globalTaskCount.get();
+        int remaining = currentLifecycle.get().activeTasks.get();
         if (remaining > 0) {
             totalLeaksDetected.addAndGet(remaining);
             SteadyChunks.LOGGER.warn("SteadyChunks 停服完成残留任务: {}（记为泄漏）", remaining);
         }
-        // 第 10 轮修复：服务器已永久停止，旧生命周期任务不可能再注册/close（原 Future
-        // 随世界销毁，executor 已关闭）——记录泄漏后清零，防止残留计数污染下一个
-        // 服务器生命周期（集成服务器回主菜单再开新世界时从 0 开始，否则计数永不归零
-        // 导致停服等待与泄漏检测长期误报）。
-        globalTaskCount.set(0);
-        dimensionTaskCounts.clear();
         SteadyChunks.LOGGER.info("SteadyChunks 停服清理完成: 卸载区块={} 卸载维度={} 检测泄漏={}",
                 totalChunksUnloaded.get(), totalDimensionsUnloaded.get(), totalLeaksDetected.get());
     }
@@ -400,10 +398,6 @@ public final class LifecycleCleanupCoordinator {
         StructureStartIndex.getInstance().clear();
         TemplateMetadataCache.getInstance().clear();
         CrossChunkAccessCache.current().clear();
-        // 第 9 轮 P1 修复：不再强制清零任务计数（dimensionTaskCounts.clear() +
-        // globalTaskCount.set(0)）。已进入执行的任务仍持有注册 lease，超时强制清零
-        // 会让它们的迟到 close 产生负数；保留计数由迟到 lease 在任务终态自行递减到零，
-        // 新服务器生命周期通过 onServerStart() 恢复接收（不复用被清零的旧计数）。
         playerReferences.clear();
     }
 
@@ -416,7 +410,7 @@ public final class LifecycleCleanupCoordinator {
      */
     public int detectLeaks() {
         int leaks = 0;
-        int global = globalTaskCount.get();
+        int global = currentLifecycle.get().activeTasks.get();
         int sum = 0;
         for (AtomicInteger c : dimensionTaskCounts.values()) {
             sum += c.get();
@@ -429,7 +423,8 @@ public final class LifecycleCleanupCoordinator {
     }
 
     // 诊断访问器
-    public int globalTaskCount() { return globalTaskCount.get(); }
+    /** 当前服务器生命周期的活跃任务计数（旧生命周期残留不纳入） */
+    public int globalTaskCount() { return currentLifecycle.get().activeTasks.get(); }
     public int dimensionTaskCount(ResourceKey<Level> dim) {
         return dimensionTaskCounts.getOrDefault(dim, new AtomicInteger(0)).get();
     }

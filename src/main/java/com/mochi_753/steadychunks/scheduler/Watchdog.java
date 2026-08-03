@@ -44,6 +44,12 @@ public final class Watchdog {
     private volatile boolean stopRecovery = false;
     /** 恢复线程实例（第 10 轮 P0-4 修复：保存实例以便 interrupt/join 与重启） */
     private Thread recoveryThread;
+    /**
+     * 第 11 轮 P1 修复：恢复线程代数——stop 后立即 start 时旧线程可能仍 alive，
+     * 旧实现直接 return 导致新服务器无线程；代数让旧线程在下轮循环发现
+     * 自己已被替换而退出，新线程立即接管。
+     */
+    private final AtomicLong recoveryGeneration = new AtomicLong(0);
     /** 上次检测时的 drain 进度（ChunkScheduler.drainProgress） */
     private long lastDrainProgress = -1;
     /** 连续停滞检测计数（≥3 次 = 3 秒未 drain，判定停摆） */
@@ -54,10 +60,15 @@ public final class Watchdog {
      * 第 10 轮修复：UNSAFE_EMERGENCY 次数——Watchdog daemon 线程直接 complete
      * 代理 Future（绕过 worldgen mailbox 线程语义）的独立指标，正确性测试断言
      * 此值为 0，任何非零都意味着调度链曾停滞且 mailbox 恢复失效。
+     * 第 11 轮修复：mailbox 立即拒绝（execute 抛异常）的直接完成也计入。
      */
     private final AtomicLong totalUnsafeRecoveries = new AtomicLong(0);
-    /** 第一级（mailbox）恢复后的等待截止时间（毫秒）；-1 表示未处于等待期 */
-    private long emergencyWaitDeadline = -1;
+    /**
+     * 第 11 轮 P0 修复：活动恢复批次——第一级从队列取出的任务引用保留到 proxy
+     * 终态（pending 归零也不丢），超时由第二级强制完成（修复旧实现第二级
+     * 找不到第一级任务的问题）。
+     */
+    private ChunkScheduler.RecoveryBatch activeRecoveryBatch;
 
     /**
      * 启动独立 drain 停摆恢复线程（ModuleBootstrap 服务器启动时调用）。
@@ -68,26 +79,32 @@ public final class Watchdog {
      * daemon 线程每 1 秒检测一次：pending>0 且 permit 可用且 drain 进度连续
      * 3 个周期未变（drain 停摆）→ 两级恢复：
      * <ol>
-     *   <li>第一级经原 worldgen mailbox 提交 error completion（保持原版线程语义）；</li>
-     *   <li>2 秒后若仍停滞（mailbox 本身是停滞链一部分），第二级直接 complete
+     *   <li>第一级 {@link ChunkScheduler#beginMailboxRecovery()} 把排队任务形成
+     *       {@link ChunkScheduler.RecoveryBatch}（保留任务引用）并经原 worldgen
+     *       mailbox 提交 error completion（保持原版线程语义）；</li>
+     *   <li>批次 deadline（2 秒）后仍有任务未终态（mailbox 本身是停滞链一部分），
+     *       第二级 {@link ChunkScheduler#escalateRecoveryBatch} 直接 complete
      *       （UNSAFE_EMERGENCY，计入 {@link #totalUnsafeRecoveries}）。</li>
      * </ol>
      * 触发条件刻意严格（排除 paused/disabled/permit 不足），避免误伤正常排队
      * 等待；释放后区块由原版自愈重新生成，调度器其余状态不动。
      * <p>
-     * 第 10 轮 P0-4 修复：保存线程实例，支持集成服务器多世界生命周期——
-     * stop 后再次 start 会创建新线程（旧实现 recoveryStarted 永久为 true，
-     * 第二个世界起恢复线程不再启动）。
+     * 第 10 轮 P0-4 修复：保存线程实例，支持集成服务器多世界生命周期。
+     * 第 11 轮 P1 修复：线程代数——旧线程退出时只在引用仍是自己时清空，
+     * stop 后立即 start 不会因旧线程未退出而丢失新线程。
      */
     public synchronized void startRecoveryThread(ChunkScheduler scheduler) {
-        if (recoveryThread != null && recoveryThread.isAlive()) {
-            return; // 已在运行
+        long generation = recoveryGeneration.incrementAndGet();
+        Thread old = recoveryThread;
+        if (old != null && old.isAlive()) {
+            // 旧线程（可能是上一服务器生命周期的残留）：中断唤醒，代数组使其退出
+            old.interrupt();
         }
         recoveryStarted = true;
         stopRecovery = false;
         Thread thread = new Thread(() -> {
             try {
-                while (!stopRecovery) {
+                while (!stopRecovery && generation == recoveryGeneration.get()) {
                     try {
                         Thread.sleep(1000);
                     } catch (InterruptedException e) {
@@ -100,10 +117,14 @@ public final class Watchdog {
                     }
                 }
             } finally {
-                // 第 10 轮 P0-4 修复：线程退出时清空实例，允许下次 start 重建
+                // 第 10 轮 P0-4 修复：线程退出时清空实例，允许下次 start 重建。
+                // 第 11 轮 P1 修复：仅当引用仍是自己时清空——stop 后立即 start 的
+                // 新线程引用不被旧线程误清。
                 synchronized (Watchdog.this) {
-                    recoveryStarted = false;
-                    recoveryThread = null;
+                    if (recoveryThread == Thread.currentThread()) {
+                        recoveryStarted = false;
+                        recoveryThread = null;
+                    }
                 }
             }
         }, "SteadyChunks-DrainRecovery");
@@ -115,6 +136,9 @@ public final class Watchdog {
     /** 停止恢复线程（服务器停止时调用，幂等；interrupt 唤醒 sleep） */
     public synchronized void stopRecoveryThread() {
         stopRecovery = true;
+        // 第 11 轮 P0 修复：停服清除活动恢复批次（任务引用随批次释放，世界销毁
+        // 兜底；proxy 未完成的任务由原版任务随世界销毁自然丢弃）
+        activeRecoveryBatch = null;
         Thread thread = recoveryThread;
         if (thread != null) {
             thread.interrupt();
@@ -132,7 +156,30 @@ public final class Watchdog {
     /** UNSAFE_EMERGENCY 直接完成次数（正确性测试必须为 0） */
     public long totalUnsafeRecoveries() { return totalUnsafeRecoveries.get(); }
 
-    private void checkDrainStall(ChunkScheduler scheduler) {
+    /**
+     * 第 11 轮 P0 修复：批次状态机 + drain 停滞检测（synchronized——stop 后立即
+     * start 时新旧线程可能短暂并存，防并发触发恢复）。
+     * <p>
+     * 批次优先：活动批次存在时（第一级已取出任务、pending 可能已归零），无论
+     * pendingCount 如何都先推进批次（全部终态 → 清除；超时 → 第二级强制完成），
+     * 修复旧实现 pending==0 早退导致第二级永不执行的问题。
+     */
+    private synchronized void checkDrainStall(ChunkScheduler scheduler) {
+        ChunkScheduler.RecoveryBatch batch = activeRecoveryBatch;
+        if (batch != null) {
+            if (scheduler.recoveryBatchAllDone(batch)) {
+                activeRecoveryBatch = null;
+            } else if (System.nanoTime() >= batch.deadlineNanos()) {
+                int unsafe = scheduler.escalateRecoveryBatch(batch);
+                totalUnsafeRecoveries.addAndGet(unsafe);
+                activeRecoveryBatch = null;
+                SteadyChunks.LOGGER.error(
+                        "SteadyChunks Watchdog: UNSAFE_EMERGENCY——mailbox 恢复失效，"
+                                + "daemon 线程直接完成 {} 个批次任务（打破卸载重入风暴死锁）",
+                        unsafe);
+            }
+            return; // 批次处理期间不启动新批次
+        }
         int pending = scheduler.pendingCount();
         long progress = scheduler.drainProgress();
         if (pending == 0
@@ -166,33 +213,23 @@ public final class Watchdog {
             }
             if (stallCount >= 3) {
                 stallCount = 0;
-                if (emergencyWaitDeadline < 0) {
-                    // 第 10 轮修复：第一级——经原 worldgen mailbox 提交 error completion
-                    //（保持原版线程语义，不让 Watchdog daemon 线程直接 complete）
-                    int released = scheduler.failOpenAllPendingViaMailbox();
-                    totalRecoveries.incrementAndGet();
-                    emergencyWaitDeadline = System.currentTimeMillis() + 2000;
-                    SteadyChunks.LOGGER.warn(
-                            "SteadyChunks Watchdog: drain 停摆检测（3 秒无进度，pending={}），"
-                                    + "第一级 mailbox 提交 error completion {} 个，2 秒内无终态将升级 UNSAFE_EMERGENCY",
-                            pending, released);
-                } else if (System.currentTimeMillis() > emergencyWaitDeadline) {
-                    // 第二级：mailbox 本身停滞（提交未执行）→ UNSAFE_EMERGENCY 直接
-                    // complete（独立指标记录，正确性测试断言为 0）
-                    emergencyWaitDeadline = -1;
-                    int released = scheduler.failOpenAllPending();
-                    totalUnsafeRecoveries.incrementAndGet();
-                    SteadyChunks.LOGGER.error(
-                            "SteadyChunks Watchdog: UNSAFE_EMERGENCY——mailbox 恢复失效，"
-                                    + "daemon 线程直接 complete {} 个排队任务（打破卸载重入风暴死锁）",
-                            released);
+                // 第 11 轮 P0 修复：第一级形成 RecoveryBatch（保留任务引用）并经
+                // mailbox 提交；拒绝的任务直接完成并计入 unsafe（P1）。
+                ChunkScheduler.MailboxRecoveryResult result = scheduler.beginMailboxRecovery();
+                totalRecoveries.incrementAndGet();
+                totalUnsafeRecoveries.addAndGet(result.rejectedAndCompletedUnsafely());
+                if (!result.batch().tasks().isEmpty()) {
+                    activeRecoveryBatch = result.batch();
                 }
-                // 等待期内（第一级已提交、2 秒未到）：保持 emergencyWaitDeadline，
-                // 下个周期由 drain 进度或第二级逻辑处理
+                SteadyChunks.LOGGER.warn(
+                        "SteadyChunks Watchdog: drain 停摆检测（3 秒无进度，pending={}），"
+                                + "第一级形成恢复批次 {}（{} 个任务，mailbox 拒绝 {} 个），"
+                                + "2 秒内无终态将升级 UNSAFE_EMERGENCY",
+                        pending, result.batch().id(), result.batch().tasks().size(),
+                        result.rejectedAndCompletedUnsafely());
             }
         } else {
             stallCount = 0;
-            emergencyWaitDeadline = -1; // drain 恢复：清除等待期
         }
         lastDrainProgress = progress;
     }

@@ -16,6 +16,7 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -257,24 +258,21 @@ public final class ChunkScheduler {
             return originalOperation.get();
         }
 
+        // 第 11 轮 P1 修复：全局停服门置于维度兼容 fail-open 之前——第三方替换
+        // GeneratingChunkMap/Accessor 失效或维度解析暂时失败时，也不能绕过停服门
+        // 直接执行（旧顺序先 dimensionOf（null → fail-open）再检查 accepting）。
+        if (!acceptingTasks.get()
+                || !LifecycleCleanupCoordinator.getInstance().isAcceptingRegistrations()) {
+            return CompletableFuture.completedFuture(
+                    ChunkResult.error("SteadyChunks 调度器已关闭"));
+        }
+
         // P1 修复（第 7 轮）：无法从生成上下文解析维度时 fail-open 走原版。
         // 不抛异常（会破坏 Mixin 调用链），也不错误归入默认维度（卸载时无法定向取消、
         // 诊断归类错误）。正常实现为 ChunkMap，此分支仅防御第三方/测试替换实现。
         ResourceKey<Level> dimension = dimensionOf(map, holder);
         if (dimension == null) {
             return originalOperation.get();
-        }
-
-        // P1 修复（第 5 轮）：生命周期关闭时不接受新任务。排队路径（enqueuePending）
-        // 已有检查，此处覆盖"直接获 permit 立即执行"的路径，保证 closeForShutdown
-        // 后不再启动新任务。
-        // P2 修复（第 5 轮）：以 error result <b>正常完成</b> 而非异常完成。原版
-        // GenerationChunkHolder.lambda$applyStep$0 的 handle 会把异常完成视为致命
-        // （MinecraftServer.setFatalException），打断真实区块生成链导致区块卡死
-        // （processUnloads 忙转）；正常 error result 走 completeFuture 路径，区块可恢复。
-        if (!acceptingTasks.get()) {
-            return CompletableFuture.completedFuture(
-                    ChunkResult.error("SteadyChunks 调度器已关闭"));
         }
 
         // 第 9 轮 P0-1 修复：注册点前移到 NOISE 准入入口——direct（permit 立即满足）、
@@ -967,62 +965,89 @@ public final class ChunkScheduler {
     }
 
     /**
-     * 第 9 轮卡死修复：drain 停摆恢复——以 error result 完成所有排队任务。
+     * 第 11 轮 P0 修复：mailbox 恢复批次（第一级保留任务引用，第二级可强制完成）。
      * <p>
-     * 忙转死锁场景（卸载竞态 → scheduleUnload 重入风暴 → Server thread 卡在
-     * processUnloads → drain 停滞 → 排队任务永不终结 → refCount 不归零 → 风暴加剧）
-     * 的唯一破环点：让排队任务终结（原版 runUntilWait 收到 error result 后
-     * markForCancellation → releaseClaim → refCount 归零 → isReadyForSaving 恢复
-     * true → 保存/卸载完成 → 忙转自愈）。error result 走原版 completeFuture 正常
-     * 路径，区块状态可恢复，之后由原版自愈重新生成。
+     * 旧实现第一级把任务 poll 出队后仅提交 mailbox：若 mailbox 停滞，任务从队列
+     * 消失（pendingCount 归零）但 proxy 永不完成——Watchdog 因 pending==0 早退，
+     * 第二级对空队列也找不到任务。批次持久化任务引用直到 proxy 终态：
+     * Watchdog 保存 {@code activeRecoveryBatch}，超时后对批次内未完成任务直接
+     * complete（UNSAFE_EMERGENCY）。
      * <p>
-     * 与 {@link #stopAcceptingAndClear(Throwable)} 的区别：不动生命周期状态
-     * （accepting/代数），只清空等待队列——调用方（Watchdog 恢复线程）判定
-     * 调度停摆后用于破环，不改变调度器其余状态。
-     * <p>
-     * 第 10 轮修复：完成线程语义分两级——{@link #failOpenAllPendingViaMailbox()}
-     * 先经原 worldgen mailbox 提交（保持原版线程语义）；若 mailbox 本身停滞导致
-     * 任务未终态，Watchdog 超时后调用本方法直接 complete（UNSAFE_EMERGENCY，
-     * 由 Watchdog 记录独立指标）。
-     *
-     * @return 释放的排队任务数
+     * public 供 GameTest 断言批次行为（tasks 组件为包私有类型，GameTest 只经
+     * {@link ChunkScheduler#escalateRecoveryBatch(RecoveryBatch)} 交互）。
      */
-    public int failOpenAllPending() {
-        return drainAllPending(task -> task.proxy().complete(
-                ChunkResult.error("SteadyChunks drain 停摆恢复（UNSAFE_EMERGENCY）")));
+    public record RecoveryBatch(long id, long deadlineNanos, List<PendingNoiseTask> tasks) {
     }
+
+    /** 第一级恢复的结构化结果：待跟踪批次 + mailbox 立即拒绝并直接完成的数量。 */
+    public record MailboxRecoveryResult(RecoveryBatch batch, int rejectedAndCompletedUnsafely) {
+    }
+
+    /** 恢复批次 ID 来源 */
+    private final AtomicLong recoveryBatchId = new AtomicLong(0);
+    /** 第一级提交后等待 mailbox 执行的期限（纳秒），超时升级第二级 */
+    private static final long RECOVERY_WAIT_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(2);
 
     /**
-     * 第 10 轮修复：drain 停摆恢复第一级——经原 worldgen mailbox 提交 error
-     * completion，保持原版线程语义（恢复动作由 mailbox worker 执行，而非
-     * Watchdog daemon 线程直接 complete）。
-     *
-     * @return 释放的排队任务数
+     * 第 11 轮 P0 修复：drain 停摆恢复第一级——把当前排队任务移出队列并形成
+     * {@link RecoveryBatch}（保留任务引用），逐任务经原 worldgen mailbox 提交
+     * error completion（保持原版线程语义）。
+     * <p>
+     * mailbox 立即拒绝（execute 抛异常）的任务在此直接 complete（与
+     * UNSAFE_EMERGENCY 同线程语义），计数经 {@link MailboxRecoveryResult#rejectedAndCompletedUnsafely()}
+     * 返回，由 Watchdog 计入 {@code totalUnsafeRecoveries}（旧实现漏计）。
      */
-    public int failOpenAllPendingViaMailbox() {
-        return drainAllPending(task -> {
-            try {
-                task.resumeExecutor().execute(() -> task.proxy().complete(
-                        ChunkResult.error("SteadyChunks drain 停摆恢复（mailbox）")));
-            } catch (Throwable t) {
-                // mailbox 拒绝（停滞/关闭）：降级为直接 complete，避免任务永不终态
-                task.proxy().complete(ChunkResult.error("SteadyChunks drain 停摆恢复（mailbox 拒绝降级）"));
-            }
-        });
-    }
-
-    /** 清空等待队列并对每个任务执行终结动作（第 10 轮抽取的公共路径）。 */
-    private int drainAllPending(java.util.function.Consumer<PendingNoiseTask> terminalAction) {
-        int n = 0;
+    public MailboxRecoveryResult beginMailboxRecovery() {
+        List<PendingNoiseTask> tasks = new java.util.ArrayList<>();
         PendingNoiseTask task;
         while ((task = pendingNoiseTasks.poll()) != null) {
             pendingCount.updateAndGet(v -> Math.max(0, v - 1));
-            // 终态绑定（proxy.whenComplete → registration.close()）自动关闭 lease；
-            // error result 与 stopAcceptingAndClear 同语义（第 5 轮 P2 修复）。
-            terminalAction.accept(task);
-            n++;
+            tasks.add(task);
         }
-        return n;
+        int rejected = 0;
+        for (PendingNoiseTask t : tasks) {
+            try {
+                Executor executor = resumeExecutorOverride != null ? resumeExecutorOverride : t.resumeExecutor();
+                executor.execute(() -> t.proxy().complete(
+                        ChunkResult.error("SteadyChunks drain 停摆恢复（mailbox）")));
+            } catch (Throwable ex) {
+                // mailbox 拒绝（停滞/关闭）：daemon 线程直接完成，计入 unsafe 指标
+                t.proxy().complete(ChunkResult.error("SteadyChunks drain 停摆恢复（mailbox 拒绝降级）"));
+                rejected++;
+            }
+        }
+        return new MailboxRecoveryResult(
+                new RecoveryBatch(recoveryBatchId.incrementAndGet(),
+                        System.nanoTime() + RECOVERY_WAIT_NANOS, tasks),
+                rejected);
+    }
+
+    /** 批次内所有任务的代理 Future 是否全部终态（Watchdog 批次状态机用）。 */
+    public boolean recoveryBatchAllDone(RecoveryBatch batch) {
+        for (PendingNoiseTask t : batch.tasks()) {
+            if (!t.proxy().isDone()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 第 11 轮 P0 修复：drain 停摆恢复第二级（UNSAFE_EMERGENCY）——对批次内
+     * 尚未终态的任务由调用线程（Watchdog daemon）直接 complete。complete 返回
+     * false 表示任务已被其他路径完成（幂等），不计入 unsafe。
+     *
+     * @return 本次实际直接完成的任务数（unsafe 计数）
+     */
+    public int escalateRecoveryBatch(RecoveryBatch batch) {
+        int unsafe = 0;
+        for (PendingNoiseTask t : batch.tasks()) {
+            if (t.proxy().complete(
+                    ChunkResult.error("SteadyChunks drain 停摆恢复（UNSAFE_EMERGENCY）"))) {
+                unsafe++;
+            }
+        }
+        return unsafe;
     }
 
     /**

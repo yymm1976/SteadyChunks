@@ -80,6 +80,23 @@ public class SchedulerAdmissionGameTest {
         return holder;
     }
 
+    /**
+     * 第 11 轮缓解：等待调度器等待队列排空（最多 3 秒）。用于 override 类测试
+     * （mailbox_fail / mailbox_escalate / mailbox_reject）设置 override 之前——
+     * 避免批次结构加载的真实生成任务在 override 生效期间 drain（被 error 完成
+     * 导致区块卡 NOISE 之前，后续强制同步加载死等忙转）。
+     */
+    private static void waitForQueueDrain(ChunkScheduler scheduler) {
+        for (int i = 0; i < 300 && scheduler.pendingCount() > 0; i++) {
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+    }
+
     /** 重置调度器全局状态，避免测试间泄漏。 */
     private static void resetScheduler(ChunkScheduler scheduler) {
         scheduler.setAdmissionPaused(false);
@@ -298,6 +315,10 @@ public class SchedulerAdmissionGameTest {
         scheduler.setEnabled(true);
         scheduler.setAdmissionPaused(false);
         scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, 1);
+        // 第 11 轮缓解：等待批次结构加载的真实任务排空——override 生效期间真实任务
+        // drain 会撞上模拟的 mailbox 拒绝/停滞而被 error 完成，区块卡 NOISE 之前 →
+        // 后续强制同步加载（BE tick getChunk）死等忙转。
+        waitForQueueDrain(scheduler);
         // 测试注入：提交恢复任务时抛异常（模拟 mailbox 停止接收/第三方改动）
         scheduler.setResumeExecutorOverride(runnable -> {
             throw new java.util.concurrent.RejectedExecutionException("模拟 mailbox 已停止接收");
@@ -955,14 +976,16 @@ public class SchedulerAdmissionGameTest {
         CompletableFuture<ChunkResult<ChunkAccess>> taskB = scheduler.controlAdmission(
                 ChunkStatus.NOISE, false, map, holder, () -> bUnderlying);
         helper.assertTrue(!taskB.isDone(), "重启后新任务 B 应被接受（原 Future 未完成）");
-        helper.assertTrue(coordinator.globalTaskCount() == 2,
-                "重启后全局计数应为 2（旧任务 A 残留 + 新任务 B）");
+        // 第 11 轮 P0/P1 修复：计数按服务器生命周期隔离——旧任务 A 在旧 lifecycle，
+        // globalTaskCount 只反映当前 lifecycle（B）
+        helper.assertTrue(coordinator.globalTaskCount() == 1,
+                "重启后当前生命周期计数应为 1（仅新任务 B；旧任务 A 在旧 lifecycle 不污染）");
 
-        // 旧任务 A 迟到完成：计数递减（不产生负数）
+        // 旧任务 A 迟到完成：只递减旧 lifecycle 计数（不产生负数、不影响新计数）
         aUnderlying.complete(ChunkResult.of(chunk));
         helper.assertTrue(taskA.isDone(), "旧任务 A 应已完成");
         helper.assertTrue(coordinator.globalTaskCount() == 1,
-                "迟到 lease 关闭后全局计数应为 1（不得为负数）");
+                "旧 lease 迟到关闭不得影响新生命周期计数（仍为 B 的 1）");
 
         // 新任务 B 完成：计数归零
         bUnderlying.complete(ChunkResult.of(chunk));
@@ -1070,6 +1093,170 @@ public class SchedulerAdmissionGameTest {
         helper.assertTrue(wd.totalUnsafeRecoveries() == 0,
                 "正确性测试期间不得发生 UNSAFE_EMERGENCY 恢复");
         // 禁用恢复线程：后续批次在无 Watchdog 保护下运行（硬门槛）
+        wd.stopRecoveryThread();
+        helper.succeed();
+    }
+
+    /**
+     * 第 11 轮 P0 修复验证：两级恢复的第二级（UNSAFE_EMERGENCY）必须能强制完成
+     * 第一级遗留任务——第一级把任务移出队列并形成 RecoveryBatch（保留引用），
+     * mailbox 停滞（override executor 接收但不运行）时批次任务 proxy 未完成，
+     * escalateRecoveryBatch 直接 complete（旧实现第二级对已清空队列找不到任务）。
+     */
+    @GameTest(template = "empty", batch = "steady_mailbox_escalate", timeoutTicks = 600)
+    public void mailboxRecoveryMustEscalateToUnsafe(GameTestHelper helper) {
+        GenerationChunkHolder holder = obtainHolder(helper);
+        ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
+        ChunkScheduler scheduler = ChunkScheduler.getInstance();
+        scheduler.setEnabled(true);
+        scheduler.setAdmissionPaused(false);
+        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, 8);
+        waitForQueueDrain(scheduler);
+
+        // 入队 1 个任务：admissionPaused 保证入队且 drainOwnedPass 跳过（不依赖 permit 状态）。
+        // paused 保持到 beginMailboxRecovery 之后——防止并发 drain（worldgen 完成回调
+        // 触发 requestDrain）在批次形成前 poll 走任务导致空批次。
+        scheduler.setAdmissionPaused(true);
+        CompletableFuture<ChunkResult<ChunkAccess>> queued = scheduler.controlAdmission(
+                ChunkStatus.NOISE, false, map, holder,
+                () -> new CompletableFuture<ChunkResult<ChunkAccess>>());
+        helper.assertTrue(scheduler.pendingCount() == 1,
+                "paused 时任务应入队等待（实际=" + scheduler.pendingCount() + "）");
+
+        // override：接收但不运行（模拟 mailbox 停滞）
+        scheduler.setResumeExecutorOverride(command -> { /* 永不运行 */ });
+
+        // 第一级：形成 RecoveryBatch（任务移出队列但 proxy 未完成）
+        var firstLevel = scheduler.beginMailboxRecovery();
+        scheduler.setAdmissionPaused(false);
+        helper.assertTrue(scheduler.pendingCount() == 0, "第一级后队列应清空");
+        helper.assertTrue(!queued.isDone(), "mailbox 停滞时批次任务 proxy 不应完成");
+
+        // 第二级：对批次内未完成任务直接 complete（UNSAFE_EMERGENCY）
+        int unsafe = scheduler.escalateRecoveryBatch(firstLevel.batch());
+        helper.assertTrue(unsafe == 1, "第二级应强制完成 1 个遗留任务");
+        helper.assertTrue(queued.isDone(), "批次任务应被强制完成");
+
+        // 清理
+        scheduler.setResumeExecutorOverride(null);
+        resetScheduler(scheduler);
+        helper.succeed();
+    }
+
+    /**
+     * 第 11 轮 P1 修复验证：mailbox 立即拒绝（execute 抛异常）的任务直接完成，
+     * 必须计入 rejectedAndCompletedUnsafely（旧实现漏计 unsafe 指标）。
+     */
+    @GameTest(template = "empty", batch = "steady_mailbox_reject", timeoutTicks = 600)
+    public void mailboxRejectionMustCountUnsafeRecovery(GameTestHelper helper) {
+        GenerationChunkHolder holder = obtainHolder(helper);
+        ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
+        ChunkScheduler scheduler = ChunkScheduler.getInstance();
+        scheduler.setEnabled(true);
+        scheduler.setAdmissionPaused(false);
+        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, 8);
+        waitForQueueDrain(scheduler);
+
+        // 入队 1 个任务（admissionPaused 保证入队且不被 drain；paused 保持到
+        // beginMailboxRecovery 之后，防并发 drain 提前 poll 走任务）
+        scheduler.setAdmissionPaused(true);
+        CompletableFuture<ChunkResult<ChunkAccess>> queued = scheduler.controlAdmission(
+                ChunkStatus.NOISE, false, map, holder,
+                () -> new CompletableFuture<ChunkResult<ChunkAccess>>());
+        helper.assertTrue(scheduler.pendingCount() == 1,
+                "paused 时任务应入队等待（实际=" + scheduler.pendingCount() + "）");
+
+        // override：立即拒绝（mailbox 停滞/关闭）
+        scheduler.setResumeExecutorOverride(command -> {
+            throw new java.util.concurrent.RejectedExecutionException("mailbox closed");
+        });
+
+        var result = scheduler.beginMailboxRecovery();
+        scheduler.setAdmissionPaused(false);
+        helper.assertTrue(result.rejectedAndCompletedUnsafely() == 1,
+                "mailbox 拒绝的任务应计入 rejectedAndCompletedUnsafely（实际="
+                        + result.rejectedAndCompletedUnsafely() + "）");
+        helper.assertTrue(queued.isDone(), "被拒绝的任务应直接完成（不永久挂起）");
+
+        // 清理
+        scheduler.setResumeExecutorOverride(null);
+        resetScheduler(scheduler);
+        helper.succeed();
+    }
+
+    /**
+     * 第 11 轮 P0/P1 修复验证：旧服务器生命周期的迟到 lease 不得污染新服务器计数。
+     * onServerStopped 后开启新生命周期（ServerLifecycle 原子替换），旧任务迟到
+     * close 只递减旧 counter——新生命周期计数不受影响（旧实现共享 globalTaskCount，
+     * 迟到 close 会把新计数抹掉甚至减成负数）。
+     */
+    @GameTest(template = "empty", batch = "steady_late_lease", timeoutTicks = 600)
+    public void lateOldServerLeaseMustNotAffectNewServerCounter(GameTestHelper helper) {
+        GenerationChunkHolder holder = obtainHolder(helper);
+        ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
+        ChunkAccess chunk = helper.getLevel().getChunk(0, 0);
+        ChunkScheduler scheduler = ChunkScheduler.getInstance();
+        scheduler.setEnabled(true);
+        scheduler.setAdmissionPaused(false);
+        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, 8);
+        LifecycleCleanupCoordinator coordinator = LifecycleCleanupCoordinator.getInstance();
+
+        // 生命周期 1：任务 A（未完成）
+        CompletableFuture<ChunkResult<ChunkAccess>> aUnderlying = new CompletableFuture<>();
+        CompletableFuture<ChunkResult<ChunkAccess>> taskA = scheduler.controlAdmission(
+                ChunkStatus.NOISE, false, map, holder, () -> aUnderlying);
+        helper.assertTrue(coordinator.globalTaskCount() == 1, "生命周期 1 计数应为 1");
+
+        // 停服 → 停止（旧生命周期终结）→ 新服务器启动（生命周期 2 原子替换）
+        coordinator.onServerShutdown();
+        coordinator.onServerStopped();
+        coordinator.onServerStart();
+        helper.assertTrue(!coordinator.isShutdownMode(), "新服务器应恢复接收");
+
+        // 生命周期 2：任务 B
+        CompletableFuture<ChunkResult<ChunkAccess>> bUnderlying = new CompletableFuture<>();
+        CompletableFuture<ChunkResult<ChunkAccess>> taskB = scheduler.controlAdmission(
+                ChunkStatus.NOISE, false, map, holder, () -> bUnderlying);
+        helper.assertTrue(!taskB.isDone(), "新任务 B 应被接受");
+        helper.assertTrue(coordinator.globalTaskCount() == 1,
+                "新生命周期计数应为 1（仅 B；A 在旧 lifecycle）");
+
+        // 旧任务 A 迟到完成：旧 lease 只递减旧 counter
+        aUnderlying.complete(ChunkResult.of(chunk));
+        helper.assertTrue(taskA.isDone(), "旧任务 A 应已完成");
+        helper.assertTrue(coordinator.globalTaskCount() == 1,
+                "旧 lease 迟到 close 不得污染新生命周期计数");
+
+        // B 完成：归零
+        bUnderlying.complete(ChunkResult.of(chunk));
+        helper.assertTrue(taskB.isDone(), "新任务 B 应已完成");
+        helper.assertTrue(coordinator.globalTaskCount() == 0,
+                "全部完成后当前生命周期计数应归零");
+
+        resetScheduler(scheduler);
+        helper.succeed();
+    }
+
+    /**
+     * 第 11 轮 P1 修复验证：stop 后立即 start（不等待旧线程退出）也必须留下
+     * 一条存活恢复线程——线程代数让旧线程退出、新线程立即接管（旧实现 start
+     * 看到旧线程仍 alive 直接 return，新服务器无线程）。
+     */
+    @GameTest(template = "empty", batch = "steady_watchdog_immediate", timeoutTicks = 600)
+    public void watchdogImmediateStopStartMustLeaveLiveThread(GameTestHelper helper) {
+        Watchdog wd = Watchdog.getInstance();
+        ChunkScheduler scheduler = ChunkScheduler.getInstance();
+
+        // 连续 stop/start，不等待旧线程退出（模拟生产事件中停服后立即开新世界）
+        wd.stopRecoveryThread();
+        wd.startRecoveryThread(scheduler);
+        wd.stopRecoveryThread();
+        wd.startRecoveryThread(scheduler);
+
+        helper.assertTrue(wd.isRecoveryThreadAlive(),
+                "连续 stop/start 后必须存在一条存活恢复线程（P1 竞态）");
+
+        // 收尾：停止
         wd.stopRecoveryThread();
         helper.succeed();
     }
