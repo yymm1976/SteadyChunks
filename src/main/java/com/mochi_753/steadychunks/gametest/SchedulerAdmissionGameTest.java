@@ -1,5 +1,6 @@
 package com.mochi_753.steadychunks.gametest;
 
+import com.mochi_753.steadychunks.SteadyChunks;
 import com.mochi_753.steadychunks.io.LifecycleCleanupCoordinator;
 import com.mochi_753.steadychunks.scheduler.ChunkScheduler;
 import com.mochi_753.steadychunks.scheduler.ResourceType;
@@ -1855,6 +1856,11 @@ public class SchedulerAdmissionGameTest {
             wd.setStallCheckIgnorePausedForTest(false);
             scheduler.setResumeExecutorOverride(null);
             wd.stopRecoveryThread();
+            // 第 14 轮根因修复：先清队列再复位——resetScheduler 的取消暂停会同步
+            // 触发 requestDrain，队列残留任务（本测试故意保留的验证任务）会被
+            // drain 抢走并以永不完成的原操作执行（inflight++ + 占 NOISE permit
+            // 永久残留——实测 clear_all noiseAvail=0 inflight=1，级联 10 连挂）
+            scheduler.clearAll(new IllegalStateException("GameTest cleanup"));
             resetScheduler(scheduler);
             wd.resetRecoveryMetrics();
         }
