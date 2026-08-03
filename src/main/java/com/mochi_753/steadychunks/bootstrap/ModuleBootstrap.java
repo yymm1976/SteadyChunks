@@ -200,11 +200,17 @@ public final class ModuleBootstrap {
      * 终结（迟到 lease 归零），最终清理与泄漏报告见 {@link #onServerStopped(ServerStoppedEvent)}。
      */
     private static void onServerStopping(ServerStoppingEvent event) {
-        // 第 9 轮卡死修复：停止独立恢复线程（幂等，daemon 线程不阻塞停服）。
+        // 第 13 轮 P1 修复：先关注册门——stopRecoveryThread 逐个完成 proxy 期间，
+        // 其他世界生成线程不得注册新任务（旧顺序先处置批次再关门，处置窗口内
+        // 新任务可注册进即将销毁的生命周期）。三段式：
+        // 关门 → 处置活动恢复批次 → 清 pending / I/O。
+        LifecycleCleanupCoordinator.getInstance().beginServerShutdown();
+        // 第 9 轮卡死修复：停止独立恢复线程（幂等，daemon 线程不阻塞停服）；
+        // 第 12 轮 P0 修复：stop 同步处置活动恢复批次（proxy 终态 → 计数归零）。
         Watchdog.getInstance().stopRecoveryThread();
-        // 第 10 轮 P0-3 修复：无参版本——关注册门 + 立即 closeForShutdown 清 pending，
+        // 第 10 轮 P0-3 修复：无参版本——立即 closeForShutdown 清 pending，
         // 不在 Server Thread 上 sleep 等待（旧 5 秒轮询会阻塞 pending 推进）。
-        LifecycleCleanupCoordinator.getInstance().onServerShutdown();
+        LifecycleCleanupCoordinator.getInstance().finishServerShutdown();
     }
 
     /**

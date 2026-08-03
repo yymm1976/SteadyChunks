@@ -337,6 +337,40 @@ public final class LifecycleCleanupCoordinator {
     }
 
     /**
+     * 第 13 轮 P1 修复：停服第一步——只关闭注册门（不清理、不等待）。
+     * <p>
+     * 拆自 {@link #onServerShutdown()}：stopRecoveryThread 逐个完成 proxy 时，
+     * 其他世界生成线程仍可能注册新任务——必须先关门再处置恢复批次。
+     * 与 {@link #finishServerShutdown()} 配合组成三段式停服：
+     * beginServerShutdown → Watchdog.stopRecoveryThread → finishServerShutdown。
+     */
+    public void beginServerShutdown() {
+        SteadyChunks.LOGGER.info("SteadyChunks 开始停服（关闭注册门）");
+        shutdownMode.set(true);
+        currentLifecycle.get().accepting.set(false);
+    }
+
+    /**
+     * 第 13 轮 P1 修复：停服第二步——I/O 进入停服模式 + 立即以 error result 完成
+     * 所有 pending + 报告剩余运行中任务（原 {@link #onServerShutdown()} 后半段，
+     * 须在 Watchdog.stopRecoveryThread 处置活动批次之后调用）。
+     */
+    public void finishServerShutdown() {
+        // I/O 队列进入停服模式（提升写入预算）
+        IoQueueController.getInstance().enterShutdownMode();
+
+        // 立即以 error result 完成所有 pending（不再等待——等待会阻塞 Server
+        //    Thread 导致 pending 无法推进，见 onServerShutdown javadoc）
+        ChunkScheduler.getInstance().closeForShutdown(new IllegalStateException("Server stopping"));
+
+        int remaining = currentLifecycle.get().activeTasks.get();
+        if (remaining > 0) {
+            SteadyChunks.LOGGER.info("SteadyChunks 停服：等待 {} 个运行中任务自然结束（迟到 lease 自行归零）",
+                    remaining);
+        }
+    }
+
+    /**
      * 服务器关闭时调用（ServerStoppingEvent）：拒绝新任务并立即清空等待队列。
      * <p>
      * 第 10 轮 P0-3 修复：不再在 Server Thread 上 sleep 等待任务归零——
@@ -348,26 +382,15 @@ public final class LifecycleCleanupCoordinator {
      *   <li>最终缓存清理与泄漏报告移到 {@link #onServerStopped()}（ServerStoppedEvent），
      *       此时运行中任务应已结束。</li>
      * </ul>
+     * <p>
+     * 第 13 轮 P1 修复：本方法为 begin+finish 合成（GameTest 与单段调用方兼容）；
+     * 生产接线（ModuleBootstrap.onServerStopping）使用三段式，在
+     * {@link #beginServerShutdown()} 与 {@link #finishServerShutdown()} 之间处置
+     * Watchdog 活动恢复批次（stopRecoveryThread）。
      */
     public void onServerShutdown() {
-        SteadyChunks.LOGGER.info("SteadyChunks 开始停服清理");
-        // 1. 先关闭当前生命周期的注册门（P0-2：check-then-act 窗口收窄——
-        //    此后新注册二次校验失败回退）
-        shutdownMode.set(true);
-        currentLifecycle.get().accepting.set(false);
-
-        // 2. I/O 队列进入停服模式（提升写入预算）
-        IoQueueController.getInstance().enterShutdownMode();
-
-        // 3. 立即以 error result 完成所有 pending（不再等待——等待会阻塞 Server
-        //    Thread 导致 pending 无法推进，见 javadoc）
-        ChunkScheduler.getInstance().closeForShutdown(new IllegalStateException("Server stopping"));
-
-        int remaining = currentLifecycle.get().activeTasks.get();
-        if (remaining > 0) {
-            SteadyChunks.LOGGER.info("SteadyChunks 停服：等待 {} 个运行中任务自然结束（迟到 lease 自行归零）",
-                    remaining);
-        }
+        beginServerShutdown();
+        finishServerShutdown();
     }
 
     /**

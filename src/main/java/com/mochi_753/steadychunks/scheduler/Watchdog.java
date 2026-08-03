@@ -80,8 +80,39 @@ public final class Watchdog {
      * 第 11 轮 P0 修复：活动恢复批次——第一级从队列取出的任务引用保留到 proxy
      * 终态（pending 归零也不丢），超时由第二级强制完成（修复旧实现第二级
      * 找不到第一级任务的问题）。
+     * <p>
+     * 第 13 轮 P0 修复：批次所有权从捕获到终态始终发布——升级期间也不清空
+     * （窗口 B），提交进行中也可见（窗口 A），任何时刻停服都能幂等处置。
      */
-    private ChunkScheduler.RecoveryBatch activeRecoveryBatch;
+    private ActiveRecovery activeRecovery;
+
+    /**
+     * 第 13 轮 P0 修复：恢复批次阶段（批次所有权始终由 {@link #activeRecovery} 发布，
+     * phase 只表示推进到哪一步，清空只在全部任务终态后发生）。
+     */
+    enum RecoveryPhase {
+        /** 已从 pending 捕获（批次已发布；锁内捕获与发布零间隙） */
+        CAPTURED,
+        /** mailbox 提交进行中（锁外逐个 executor.execute；提交阻塞时批次仍可见） */
+        MAILBOX_SUBMITTING,
+        /** 提交完成，等待 mailbox 执行或 deadline 升级 */
+        WAITING_MAILBOX,
+        /** 第二级升级进行中（批次保持发布，其他线程可幂等参与完成） */
+        ESCALATING,
+        /** 全部任务终态（仅终态确认后才清空 activeRecovery） */
+        DONE
+    }
+
+    /** 第 13 轮 P0 修复：活动恢复批次状态对象。 */
+    static final class ActiveRecovery {
+        final ChunkScheduler.RecoveryBatch batch;
+        volatile RecoveryPhase phase = RecoveryPhase.CAPTURED;
+
+        ActiveRecovery(ChunkScheduler.RecoveryBatch batch) {
+            this.batch = batch;
+        }
+    }
+
     /**
      * 第 12 轮 P0 修复：停服时强制完成活动恢复批次的任务数——独立于运行期
      * UNSAFE_EMERGENCY（{@link #totalUnsafeRecoveries}）：停服路径由
@@ -92,12 +123,13 @@ public final class Watchdog {
 
     /** 是否存在活动恢复批次（第 12 轮 P1：GameTest 状态机断言用）。 */
     public synchronized boolean hasActiveRecoveryBatch() {
-        return activeRecoveryBatch != null;
+        return activeRecovery != null;
     }
 
     /** 活动批次截止时间（纳秒）；无批次返回 -1（第 12 轮 P1：GameTest 注入时钟用）。 */
     public synchronized long activeRecoveryBatchDeadlineNanos() {
-        return activeRecoveryBatch != null ? activeRecoveryBatch.deadlineNanos() : -1;
+        ActiveRecovery ar = activeRecovery;
+        return ar != null ? ar.batch.deadlineNanos() : -1;
     }
 
     /** 停服处置恢复数（第 12 轮 P0：GameTest 断言停服批次被强制完成）。 */
@@ -123,9 +155,10 @@ public final class Watchdog {
      * daemon 线程每 1 秒检测一次：pending>0 且 permit 可用且 drain 进度连续
      * 3 个周期未变（drain 停摆）→ 两级恢复：
      * <ol>
-     *   <li>第一级 {@link ChunkScheduler#beginMailboxRecovery()} 把排队任务形成
-     *       {@link ChunkScheduler.RecoveryBatch}（保留任务引用）并经原 worldgen
-     *       mailbox 提交 error completion（保持原版线程语义）；</li>
+     *   <li>第一级 {@link ChunkScheduler#captureRecoveryBatch()} 捕获排队任务并
+     *       {@link ChunkScheduler#submitRecoveryBatch} 经原 worldgen mailbox 提交
+     *       error completion（保持原版线程语义）；批次从捕获起始终发布
+     *       （{@link ActiveRecovery}，第 13 轮 P0：提交阻塞/升级期间均可见）；</li>
      *   <li>批次 deadline（2 秒）后仍有任务未终态（mailbox 本身是停滞链一部分），
      *       第二级 {@link ChunkScheduler#escalateRecoveryBatch} 直接 complete
      *       （UNSAFE_EMERGENCY，计入 {@link #totalUnsafeRecoveries}）。</li>
@@ -162,7 +195,7 @@ public final class Watchdog {
                         break;
                     }
                     try {
-                        checkDrainStall(scheduler, generation);
+                        checkDrainStall(scheduler);
                     } catch (Throwable t) {
                         SteadyChunks.LOGGER.warn("SteadyChunks Watchdog 恢复检查异常", t);
                     }
@@ -192,14 +225,20 @@ public final class Watchdog {
      * （proxy 终态 → registration 关闭 → 旧 ServerLifecycle 计数归零）。
      * 旧实现直接置空：批次任务已不在 pending 队列，closeForShutdown 看不到
      * 它们，proxy 永不终态、TaskRegistration 不关闭、旧生命周期永久残留计数。
+     * <p>
+     * 第 13 轮 P0 修复：脱离的是 {@link ActiveRecovery}（任意 phase 均可处置——
+     * CAPTURED/MAILBOX_SUBMITTING 表示提交进行中、WAITING/ESCALATING 表示等待
+     * 或升级中）；escalate 幂等（complete 返回 false 不重复），与提交线程/升级
+     * 线程并发安全。
      */
     public void stopRecoveryThread() {
         ChunkScheduler.RecoveryBatch detached;
         Thread thread;
         synchronized (this) {
             stopRecovery = true;
-            detached = activeRecoveryBatch;
-            activeRecoveryBatch = null;
+            ActiveRecovery ar = activeRecovery;
+            detached = ar != null ? ar.batch : null;
+            activeRecovery = null;
             // 第 12 轮 P1 修复：跨服务器生命周期复位停滞状态（见 startRecoveryThread）
             stallCount = 0;
             lastDrainProgress = ChunkScheduler.getInstance().drainProgress();
@@ -244,34 +283,57 @@ public final class Watchdog {
      * 停滞计数、队列快照），executor.execute 与 Future 完成等外部调用全部移到锁外：
      * 避免恢复线程持锁时被 worldgen mailbox 执行器阻塞，导致 ServerStopping 的
      * stopRecoveryThread 等待同一把锁而卡住停服线程（重新引入停服阻塞风险）。
+     * <p>
+     * 第 13 轮 P0 修复：批次所有权全周期可见——捕获与发布在同一锁块（零间隙，
+     * 窗口 A）；第二级升级期间批次保持发布（phase=ESCALATING，窗口 B），
+     * 全部任务终态确认后才清空；提交/升级/停服三路并发幂等。
      */
-    private void checkDrainStall(ChunkScheduler scheduler, long generation) {
-        checkDrainStall(scheduler, System.nanoTime(), generation);
+    private void checkDrainStall(ChunkScheduler scheduler) {
+        checkDrainStall(scheduler, System.nanoTime());
     }
 
     /**
      * 第 12 轮 P1 修复：测试入口——注入 nowNanos 驱动批次 deadline 状态机，
      * 不依赖真实等待（GameTest 端到端驱动第一级/第二级恢复）。
-     * generation 取当前代数：测试线程以"当前恢复线程"身份驱动发布路径。
      */
     public void checkDrainStallForTest(ChunkScheduler scheduler, long nowNanos) {
-        checkDrainStall(scheduler, nowNanos, recoveryGeneration.get());
+        checkDrainStall(scheduler, nowNanos);
     }
 
-    private void checkDrainStall(ChunkScheduler scheduler, long nowNanos, long generation) {
+    private void checkDrainStall(ChunkScheduler scheduler, long nowNanos) {
         // ---- 阶段 1（锁内）：批次推进决策 + 停滞检测（纯状态读写，无外部调用） ----
         ChunkScheduler.RecoveryBatch batchToEscalate = null;
         boolean startFirstLevel = false;
         int pendingAtTrigger = -1;
         synchronized (this) {
-            ChunkScheduler.RecoveryBatch batch = activeRecoveryBatch;
-            if (batch != null) {
-                if (scheduler.recoveryBatchAllDone(batch)) {
-                    activeRecoveryBatch = null;
-                } else if (nowNanos >= batch.deadlineNanos()) {
-                    // 第二级：锁内脱离批次，锁外直接完成（不在锁内触发 Future 回调）
-                    activeRecoveryBatch = null;
-                    batchToEscalate = batch;
+            ActiveRecovery ar = activeRecovery;
+            if (ar != null) {
+                switch (ar.phase) {
+                    case CAPTURED, MAILBOX_SUBMITTING -> {
+                        // 提交进行中（锁外 executor.execute 未返回）：批次已发布
+                        // （窗口 A 修复），本周期不推进，等提交完成置 WAITING_MAILBOX
+                    }
+                    case WAITING_MAILBOX -> {
+                        if (scheduler.recoveryBatchAllDone(ar.batch)) {
+                            ar.phase = RecoveryPhase.DONE;
+                            activeRecovery = null;
+                        } else if (nowNanos >= ar.batch.deadlineNanos()) {
+                            // 第二级：置 ESCALATING 但<b>保持发布</b>（窗口 B 修复）——
+                            // 锁外 escalate 期间批次仍对停服/其他线程可见，可幂等参与
+                            ar.phase = RecoveryPhase.ESCALATING;
+                            batchToEscalate = ar.batch;
+                        }
+                    }
+                    case ESCALATING -> {
+                        // 另一线程正在/已经升级：全部终态则清空，否则参与幂等完成
+                        if (scheduler.recoveryBatchAllDone(ar.batch)) {
+                            ar.phase = RecoveryPhase.DONE;
+                            activeRecovery = null;
+                        } else {
+                            batchToEscalate = ar.batch;
+                        }
+                    }
+                    case DONE -> activeRecovery = null;
                 }
                 // 批次处理期间不启动新批次
             } else {
@@ -325,40 +387,51 @@ public final class Watchdog {
                     "SteadyChunks Watchdog: UNSAFE_EMERGENCY——mailbox 恢复失效，"
                             + "daemon 线程直接完成 {} 个批次任务（打破卸载重入风暴死锁）",
                     unsafe);
-        } else if (startFirstLevel) {
-            ChunkScheduler.MailboxRecoveryResult result = scheduler.beginMailboxRecovery();
-            // ---- 阶段 3（锁内）：发布批次；停服窗口内形成的批次就地升级，防任务遗弃 ----
-            boolean publishStopped;
+            // ---- 阶段 2.5（锁内）：全部终态确认后才清空（窗口 B：升级期间批次
+            //      保持发布，直到 proxy 全部终态） ----
             synchronized (this) {
-                // 第一级形成期间 stop（stopRecovery）或 stop→start（代数变化）：
-                // 批次任务已移出队列，不能发布到已停止/新代数的 Watchdog——
-                // 就地完成（计入停服指标），与 stopRecoveryThread 的处置路径互补。
-                publishStopped = stopRecovery || generation != recoveryGeneration.get();
-                if (!publishStopped) {
-                    totalRecoveries.incrementAndGet();
-                    totalUnsafeRecoveries.addAndGet(result.rejectedAndCompletedUnsafely());
-                    if (!result.batch().tasks().isEmpty()) {
-                        activeRecoveryBatch = result.batch();
+                ActiveRecovery ar = activeRecovery;
+                if (ar != null && ar.batch == batchToEscalate) {
+                    if (scheduler.recoveryBatchAllDone(ar.batch)) {
+                        ar.phase = RecoveryPhase.DONE;
+                        activeRecovery = null;
                     }
+                    // 极端情况仍有未终态（complete 必致终态，实际不可达）：保持
+                    // ESCALATING 发布，下轮继续幂等完成
                 }
             }
-            if (publishStopped) {
-                int n = scheduler.escalateRecoveryBatch(result.batch(),
-                        "停服窗口形成的恢复批次强制完成");
-                totalUnsafeShutdownRecoveries.addAndGet(result.rejectedAndCompletedUnsafely() + n);
-                SteadyChunks.LOGGER.error(
-                        "SteadyChunks Watchdog: 停服窗口形成的恢复批次 {}（{} 个任务，mailbox 拒绝 {} 个）"
-                                + "由停服线程直接完成（计入 totalUnsafeShutdownRecoveries）",
-                        result.batch().id(), result.batch().tasks().size(),
-                        result.rejectedAndCompletedUnsafely());
-            } else {
-                SteadyChunks.LOGGER.warn(
-                        "SteadyChunks Watchdog: drain 停摆检测（3 秒无进度，pending={}），"
-                                + "第一级形成恢复批次 {}（{} 个任务，mailbox 拒绝 {} 个），"
-                                + "2 秒内无终态将升级 UNSAFE_EMERGENCY",
-                        pendingAtTrigger, result.batch().id(), result.batch().tasks().size(),
-                        result.rejectedAndCompletedUnsafely());
+        } else if (startFirstLevel) {
+            // ---- 阶段 3（锁内）：捕获 + 立即发布（窗口 A：捕获与发布零间隙，
+            //      之后 executor 无论阻塞/拒绝/返回，批次始终可见） ----
+            ChunkScheduler.RecoveryBatch captured;
+            synchronized (this) {
+                captured = scheduler.captureRecoveryBatch();
+                activeRecovery = new ActiveRecovery(captured);
+                activeRecovery.phase = RecoveryPhase.MAILBOX_SUBMITTING;
             }
+            // ---- 阶段 4（锁外）：逐个提交 mailbox（批次已发布，提交阻塞也可见） ----
+            int rejected = scheduler.submitRecoveryBatch(captured);
+            // ---- 阶段 5（锁内）：提交完成置 WAITING_MAILBOX；批次已被停服处置
+            //      （stop 的 detach 在同一锁块置 stopRecovery + 清空）则仅补指标 ----
+            synchronized (this) {
+                ActiveRecovery ar = activeRecovery;
+                if (ar != null && ar.batch == captured) {
+                    // 正常发布路径：提交完成 → 等待 mailbox/升级
+                    totalRecoveries.incrementAndGet();
+                    totalUnsafeRecoveries.addAndGet(rejected);
+                    ar.phase = RecoveryPhase.WAITING_MAILBOX;
+                } else {
+                    // stopRecoveryThread 已处置（detach + escalate 幂等完成全部任务）；
+                    // 此期间 execute 拒绝的任务已由 stop 的 complete 覆盖（P2：
+                    // complete 返回 false 不计数，rejected 实际为 0），仅补停服指标
+                    totalUnsafeShutdownRecoveries.addAndGet(rejected);
+                }
+            }
+            SteadyChunks.LOGGER.warn(
+                    "SteadyChunks Watchdog: drain 停摆检测（3 秒无进度，pending={}），"
+                            + "第一级形成恢复批次 {}（{} 个任务，mailbox 拒绝 {} 个），"
+                            + "2 秒内无终态将升级 UNSAFE_EMERGENCY",
+                    pendingAtTrigger, captured.id(), captured.tasks().size(), rejected);
         }
     }
 

@@ -970,17 +970,19 @@ public final class ChunkScheduler {
      * 旧实现第一级把任务 poll 出队后仅提交 mailbox：若 mailbox 停滞，任务从队列
      * 消失（pendingCount 归零）但 proxy 永不完成——Watchdog 因 pending==0 早退，
      * 第二级对空队列也找不到任务。批次持久化任务引用直到 proxy 终态：
-     * Watchdog 保存 {@code activeRecoveryBatch}，超时后对批次内未完成任务直接
+     * Watchdog 保存 {@code activeRecovery}，超时后对批次内未完成任务直接
      * complete（UNSAFE_EMERGENCY）。
+     * <p>
+     * 第 13 轮 P0 修复（窗口 A）：捕获与提交拆分为两步——{@link #captureRecoveryBatch()}
+     * 仅从队列移出任务（调用方锁内捕获后<b>立即发布</b>），{@link #submitRecoveryBatch}
+     * 在批次已发布的前提下锁外逐个提交 mailbox。旧版 beginMailboxRecovery 先逐个
+     * execute 全部返回后才形成批次：executor 阻塞时任务已离队但批次未发布，
+     * 停服/第二级都看不到（批次所有权不可见窗口）。
      * <p>
      * public 供 GameTest 断言批次行为（tasks 组件为包私有类型，GameTest 只经
      * {@link ChunkScheduler#escalateRecoveryBatch(RecoveryBatch)} 交互）。
      */
     public record RecoveryBatch(long id, long deadlineNanos, List<PendingNoiseTask> tasks) {
-    }
-
-    /** 第一级恢复的结构化结果：待跟踪批次 + mailbox 立即拒绝并直接完成的数量。 */
-    public record MailboxRecoveryResult(RecoveryBatch batch, int rejectedAndCompletedUnsafely) {
     }
 
     /** 恢复批次 ID 来源 */
@@ -989,40 +991,51 @@ public final class ChunkScheduler {
     private static final long RECOVERY_WAIT_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(2);
 
     /**
-     * 第 11 轮 P0 修复：drain 停摆恢复第一级——把当前排队任务移出队列并形成
-     * {@link RecoveryBatch}（保留任务引用），逐任务经原 worldgen mailbox 提交
-     * error completion（保持原版线程语义）。
+     * 第 13 轮 P0 修复：drain 停摆恢复第一级第一步——仅从 pending 移出任务形成
+     * {@link RecoveryBatch}，<b>不调用任何 executor</b>。
      * <p>
-     * mailbox 立即拒绝（execute 抛异常）的任务在此直接 complete（与
-     * UNSAFE_EMERGENCY 同线程语义），计数经 {@link MailboxRecoveryResult#rejectedAndCompletedUnsafely()}
-     * 返回，由 Watchdog 计入 {@code totalUnsafeRecoveries}（旧实现漏计）。
+     * 调用方（Watchdog）必须在锁内完成"捕获 → 发布 activeRecovery"（零间隙），
+     * 再锁外调用 {@link #submitRecoveryBatch(RecoveryBatch)}——保证 executor 阻塞
+     * 时批次对停服/第二级始终可见（窗口 A 修复，旧 beginMailboxRecovery 先提交
+     * 后返回批次，提交期间任务所有权不可见）。
      */
-    public MailboxRecoveryResult beginMailboxRecovery() {
+    public RecoveryBatch captureRecoveryBatch() {
         List<PendingNoiseTask> tasks = new java.util.ArrayList<>();
         PendingNoiseTask task;
         while ((task = pendingNoiseTasks.poll()) != null) {
             pendingCount.updateAndGet(v -> Math.max(0, v - 1));
             tasks.add(task);
         }
+        return new RecoveryBatch(recoveryBatchId.incrementAndGet(),
+                System.nanoTime() + RECOVERY_WAIT_NANOS, tasks);
+    }
+
+    /**
+     * 第 13 轮 P0 修复：drain 停摆恢复第一级第二步——对<b>已发布</b>的批次逐任务
+     * 经原 worldgen mailbox 提交 error completion（保持原版线程语义；调用方须在
+     * 批次可见后锁外调用，批次可见性由调用方保证）。
+     * <p>
+     * mailbox 立即拒绝（execute 抛异常）的任务在此直接 complete（与
+     * UNSAFE_EMERGENCY 同线程语义），计数返回由 Watchdog 计入 unsafe 指标
+     * （第 12 轮 P2 修复：仅 complete 成功者计数——已被并发路径完成的不得重复计）。
+     *
+     * @return 本次实际直接完成的拒绝任务数
+     */
+    public int submitRecoveryBatch(RecoveryBatch batch) {
         int rejected = 0;
-        for (PendingNoiseTask t : tasks) {
+        for (PendingNoiseTask t : batch.tasks()) {
             try {
                 Executor executor = resumeExecutorOverride != null ? resumeExecutorOverride : t.resumeExecutor();
                 executor.execute(() -> t.proxy().complete(
                         ChunkResult.error("SteadyChunks drain 停摆恢复（mailbox）")));
             } catch (Throwable ex) {
-                // mailbox 拒绝（停滞/关闭）：daemon 线程直接完成，计入 unsafe 指标。
-                // 第 12 轮 P2 修复：complete 返回 false 表示已被并发路径完成——
-                // 不重复计入（旧实现无条件 rejected++ 可能多计指标）。
+                // mailbox 拒绝（停滞/关闭）：daemon 线程直接完成，计入 unsafe 指标
                 if (t.proxy().complete(ChunkResult.error("SteadyChunks drain 停摆恢复（mailbox 拒绝降级）"))) {
                     rejected++;
                 }
             }
         }
-        return new MailboxRecoveryResult(
-                new RecoveryBatch(recoveryBatchId.incrementAndGet(),
-                        System.nanoTime() + RECOVERY_WAIT_NANOS, tasks),
-                rejected);
+        return rejected;
     }
 
     /** 批次内所有任务的代理 Future 是否全部终态（Watchdog 批次状态机用）。 */
