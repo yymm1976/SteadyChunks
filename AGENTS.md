@@ -1,6 +1,6 @@
 # SteadyChunks — Agent 交接文档
 
-> 最后更新：2026-08-04（第 14 轮 6 阶段 + 审查第 2/3 轮修复：分支 `overnight/round14-inflight-diagnostics`，HEAD `849972c`，已推送 origin）。
+> 最后更新：2026-08-04（第 14 轮 6 阶段 + 审查第 2/3 轮修复：分支 `overnight/round14-inflight-diagnostics`，**分支 HEAD `1cfe943`、代码 HEAD `849972c`**，已推送 origin）。
 > 本文档用于跨 Harness 迁移交接，接手后先读此文件再动手。
 
 ## 1. 项目速览
@@ -49,9 +49,11 @@ Remove-Item -Recurse -Force "run-server\world"; Remove-Item -Force "run-server\l
 | fbd2797 | 阶段 5b/5c：soak 50 轮结果摘要（21 PASS / 29 STALL / 0 FAIL，42%，全纯原版卡死栈） |
 | 5fce083 | 阶段 5c：AGENTS.md 更新至第 14 轮完成态 |
 | 0f73ffa | 审查第 2 轮修复（9 项，已推送）：P0-1 requeue offer 后二次生命周期校验+测试 requeueMustNotPublishAfterShutdownClear；P0-2 soak 脚本按仓库作用域落地（Test-IsRepoJava/Wait-ProcessGone/Stop-ProcessTree/旧日志前置）+ 两脚本判定串改 `All [0-9]+ required tests passed`（31 测试）；提交线程 phase 回退防护 + 滞留指标；submitRecoveryBatch 每任务 isDone 跳过；环形缓冲零分配 + publishedSequences 防撕裂；逐出 rememberTerminated + 有界 FIFO 记忆；IncidentRecorder 计数（Submitted/Written/Dropped/WriteFailed）|
+| 849972c | 审查第 3 轮收尾（已推送）：requeue 先计数再发布（消幽灵 pending，测试探针改 poll 窗口）；soak Queue[int]/$ProcessId/先 kill 后 wait/轮末残留扫描/汇总 infra 统计；环形缓冲构造器发布序号初始化；BoundedIdSet 去重语义 + evictOldest 所有权 + record 复查；submitter 活动表不随 metrics reset 清空 + 清洁硬断言；验证 31/31 二连过 + soak 3 轮 infra=0 |
+| 1cfe943 | docs：AGENTS.md 更新至第 3 轮完成态 |
 
 - **未跟踪**（不入库）：`.reasonix/`、`reasonix.toml`、`artifacts/tool-review/`；证据目录 `artifacts/round14-stalls/`（227MB）、`artifacts/soak/`（177MB）已 gitignore，磁盘保留
-- **待办**：① 等待第 3 轮审查意见确认（收尾提交 `849972c` 已推送）；② 是否 merge 到 main 由用户决定（目标规定"不 merge main，仅推送分支"）。
+- **待办**：① 第 3 轮复核已判定"第 14 轮可以结束、可以合并 main"（非阻断 P1 终态路径顺序已修，见下轮提交）；② 是否 merge 到 main 由用户决定（目标规定"不 merge main，仅推送分支"）；③ 下阶段方向：Holder/原版 GenerationTask 生命周期因果追踪或新优化，不再围绕已知 processUnloads/tickChunks 签名重复 soak。
 
 ## 4. 第 14 轮交付内容（阶段 2-4 新增，代码结构）
 

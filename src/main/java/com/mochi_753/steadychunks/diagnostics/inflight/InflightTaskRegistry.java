@@ -119,10 +119,13 @@ public final class InflightTaskRegistry {
                 record.lastType = type;
                 record.lastNanos = now;
                 record.lastThreadId = threadId;
-                active.remove(taskId);
-                // 审查修复：登记已终态——TERMINAL 之后到达的迟到非终态事件（如
-                // PROXY_COMPLETED）不得重新激活；有界 FIFO，满时逐出最旧
+                // 审查（第 3 轮非阻断 P1）修复：先发布终态记忆、再移除 active——
+                // 旧顺序（先 remove 后 add）下，迟到非终态事件可能落在
+                // "active 已空、terminated 未登记"之间，computeIfAbsent 重建记录
+                // 且二次检查仍看不到终态标记（zombie active）。先 add 再
+                // remove(key, record)：并发迟到事件的二次检查必然命中终态标记
                 terminatedTaskIds.add(taskId);
+                active.remove(taskId, record);
             } else if (evictedTaskIds.remove(taskId)) {
                 // 审查 P1 修复：任务曾被容量逐出（未终态即出表）——终态正常，
                 // 不视为重复异常；从逐出集合移除（释放跟踪）
