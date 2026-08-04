@@ -44,6 +44,23 @@ public final class IncidentRecorder {
     private static final DateTimeFormatter STAMP = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
     private static final Map<String, Long> LAST_RECORDED = new ConcurrentHashMap<>();
 
+    /**
+     * 审查 P1 修复：独立有界诊断 executor——Watchdog 只做限流检查 + 提交，
+     * 目录创建/文件写入/线程栈收集全部在 writer 线程执行（慢磁盘或杀软扫描
+     * 不再阻塞 supervisor、不推迟二级升级）。队列满时丢弃新快照（快照丢失
+     * 优于阻塞监督线程）。
+     */
+    private static final java.util.concurrent.ExecutorService WRITER =
+            new java.util.concurrent.ThreadPoolExecutor(
+                    1, 1, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
+                    new java.util.concurrent.ArrayBlockingQueue<>(4),
+                    r -> {
+                        Thread t = new Thread(r, "SteadyChunks-IncidentWriter");
+                        t.setDaemon(true);
+                        return t;
+                    },
+                    new java.util.concurrent.ThreadPoolExecutor.DiscardPolicy());
+
     private IncidentRecorder() {
     }
 
@@ -103,21 +120,25 @@ public final class IncidentRecorder {
 
     private static void writeIncident(String type, Consumer<StringBuilder> summary) {
         String dirName = LocalDateTime.now().format(STAMP) + "-" + type;
-        try {
-            Path dir = BASE.resolve(dirName);
-            Files.createDirectories(dir);
-            StringBuilder summaryText = new StringBuilder();
-            summaryText.append("type=").append(type).append('\n')
-                    .append("time=").append(LocalDateTime.now()).append('\n');
-            summary.accept(summaryText);
-            writeFile(dir.resolve("incident.txt"), summaryText.toString());
-            writeFile(dir.resolve("active-tasks.txt"), dumpActiveTasks());
-            writeFile(dir.resolve("ring-events.txt"), dumpRingEvents());
-            writeFile(dir.resolve("threads.txt"), dumpThreads());
-            SteadyChunks.LOGGER.warn("SteadyChunks 事故快照已写入: {}（只诊断，不自动修复）", dir);
-        } catch (IOException | RuntimeException ex) {
-            SteadyChunks.LOGGER.warn("写入事故快照失败: {}", ex.toString());
-        }
+        // 审查 P1 修复：数据收集（active/ring/线程栈）与磁盘 I/O 全在 writer
+        // 线程；提交失败（队列满）由 DiscardPolicy 静默丢弃——诊断不阻塞主链路
+        WRITER.execute(() -> {
+            try {
+                Path dir = BASE.resolve(dirName);
+                Files.createDirectories(dir);
+                StringBuilder summaryText = new StringBuilder();
+                summaryText.append("type=").append(type).append('\n')
+                        .append("time=").append(LocalDateTime.now()).append('\n');
+                summary.accept(summaryText);
+                writeFile(dir.resolve("incident.txt"), summaryText.toString());
+                writeFile(dir.resolve("active-tasks.txt"), dumpActiveTasks());
+                writeFile(dir.resolve("ring-events.txt"), dumpRingEvents());
+                writeFile(dir.resolve("threads.txt"), dumpThreads());
+                SteadyChunks.LOGGER.warn("SteadyChunks 事故快照已写入: {}（只诊断，不自动修复）", dir);
+            } catch (IOException | RuntimeException ex) {
+                SteadyChunks.LOGGER.warn("写入事故快照失败: {}", ex.toString());
+            }
+        });
     }
 
     private static void writeFile(Path path, String content) throws IOException {

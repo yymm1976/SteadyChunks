@@ -47,6 +47,7 @@ public class SchedulerLifecycleGameTest {
      */
     @GameTest(template = "empty", batch = "steady_late_lease", timeoutTicks = 600)
     public void lateOldServerLeaseMustNotAffectNewServerCounter(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -103,6 +104,7 @@ public class SchedulerLifecycleGameTest {
 
         resetScheduler(scheduler);
         helper.succeed();
+        });
     }
 
 
@@ -118,6 +120,7 @@ public class SchedulerLifecycleGameTest {
      */
     @GameTest(template = "empty", batch = "steady_server_restart", timeoutTicks = 600)
     public void serverRestartShouldUseNewLifecycleGeneration(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -171,6 +174,7 @@ public class SchedulerLifecycleGameTest {
 
         resetScheduler(scheduler);
         helper.succeed();
+        });
     }
 
 
@@ -188,6 +192,7 @@ public class SchedulerLifecycleGameTest {
      */
     @GameTest(template = "empty", batch = "steady_dim_enqueue_window", timeoutTicks = 600)
     public void dimensionUnloadDuringEnqueueShouldReject(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         ServerLevel overworld = helper.getLevel();
         ServerLevel nether = overworld.getServer().getLevel(Level.NETHER);
@@ -263,6 +268,7 @@ public class SchedulerLifecycleGameTest {
             scheduler.openDimension(Level.NETHER);
             resetScheduler(scheduler);
         });
+        });
     }
 
 
@@ -272,6 +278,7 @@ public class SchedulerLifecycleGameTest {
      */
     @GameTest(template = "empty", batch = "steady_dim_isolation", timeoutTicks = 600)
     public void dimensionUnloadShouldCancelOnlyTargetDimension(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         ServerLevel overworld = helper.getLevel();
         ServerLevel nether = overworld.getServer().getLevel(Level.NETHER);
@@ -322,6 +329,7 @@ public class SchedulerLifecycleGameTest {
             scheduler.openDimension(Level.NETHER);
             resetScheduler(scheduler);
         });
+        });
     }
 
 
@@ -337,6 +345,7 @@ public class SchedulerLifecycleGameTest {
      */
     @GameTest(template = "empty", batch = "steady_dim_lease_generation", timeoutTicks = 600)
     public void oldDimensionLeaseMustNotDecrementReloadedDimension(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         ServerLevel overworld = helper.getLevel();
         ServerLevel nether = overworld.getServer().getLevel(Level.NETHER);
@@ -388,6 +397,7 @@ public class SchedulerLifecycleGameTest {
 
         resetScheduler(scheduler);
         helper.succeed();
+        });
     }
 
 
@@ -400,6 +410,7 @@ public class SchedulerLifecycleGameTest {
      */
     @GameTest(template = "empty", batch = "steady_dim_poll_window", timeoutTicks = 600)
     public void dimensionUnloadAfterPollBeforeSubmitShouldReject(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         ServerLevel overworld = helper.getLevel();
         ServerLevel nether = overworld.getServer().getLevel(Level.NETHER);
@@ -472,6 +483,7 @@ public class SchedulerLifecycleGameTest {
             scheduler.openDimension(Level.NETHER);
             resetScheduler(scheduler);
         });
+        });
     }
 
 
@@ -481,6 +493,7 @@ public class SchedulerLifecycleGameTest {
      */
     @GameTest(template = "empty", batch = "steady_dim_unload", timeoutTicks = 600)
     public void dimensionUnloadShouldCancelOnlyThatDimension(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -530,6 +543,7 @@ public class SchedulerLifecycleGameTest {
         firstUnderlying.complete(ChunkResult.of(helper.getLevel().getChunk(0, 0)));
         resetScheduler(scheduler);
         helper.succeed();
+        });
     }
 
 
@@ -545,6 +559,7 @@ public class SchedulerLifecycleGameTest {
      */
     @GameTest(template = "empty", batch = "steady_governor_recover", timeoutTicks = 600)
     public void governorShouldRecoverSharedResource(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         ChunkScheduler scheduler = ChunkScheduler.getInstance();
         scheduler.setEnabled(false); // 纯 StageLimiter 操作，不涉及准入
@@ -572,6 +587,7 @@ public class SchedulerLifecycleGameTest {
         limiter.setResourceLimit(ResourceType.NOISE_HEAVY, 3);
         resetScheduler(scheduler);
         helper.succeed();
+        });
     }
 
 
@@ -590,6 +606,7 @@ public class SchedulerLifecycleGameTest {
      */
     @GameTest(template = "empty", batch = "steady_close_after_poll", timeoutTicks = 600)
     public void closeAfterPollBeforeSubmitShouldRejectTask(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -659,6 +676,7 @@ public class SchedulerLifecycleGameTest {
             scheduler.setResumeExecutorOverride(null);
             resetScheduler(scheduler);
         });
+        });
     }
 
     // ---- 阶段 2：统一 fixture 委托（辅助方法与清理由 SchedulerGameTestFixture 提供） ----
@@ -678,8 +696,8 @@ public class SchedulerLifecycleGameTest {
         SchedulerGameTestFixture.awaitTrue(condition, message);
     }
 
-    /** 重置调度器全局状态（统一清理顺序，见 SchedulerGameTestFixture）。 */
+    /** 重置调度器全局状态（统一清理 + 清洁硬断言 + 追踪复位，见 SchedulerGameTestFixture）。 */
     private static void resetScheduler(ChunkScheduler scheduler) {
-        SchedulerGameTestFixture.resetGlobalState();
+        SchedulerGameTestFixture.forceCleanupAfterFailure();
     }
 }

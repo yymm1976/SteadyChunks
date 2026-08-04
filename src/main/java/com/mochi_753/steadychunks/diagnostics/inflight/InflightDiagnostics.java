@@ -85,6 +85,11 @@ public final class InflightDiagnostics {
         return REGISTRY.terminalAnomalyCount();
     }
 
+    /** 审查 P1 修复：诊断容量溢出（未终态任务被逐出）计数。 */
+    public static long evictionCount() {
+        return REGISTRY.evictionCount();
+    }
+
     public static long totalRecorded() {
         return REGISTRY.totalRecorded();
     }

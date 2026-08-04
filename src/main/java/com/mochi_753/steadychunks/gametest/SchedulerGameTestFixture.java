@@ -75,6 +75,9 @@ public final class SchedulerGameTestFixture {
         }
         waitForQueueDrain(scheduler);
         scheduler.setEnabled(false);
+        // 审查修复：setEnabled(false) 会置 bypassMode=true（有节奏放行），清理
+        // 完成且队列已空时必须显式复位，否则 assertCleanState 的 bypass 检查失败
+        scheduler.resetEmergencyFlags();
         scheduler.resetDiagnostics();
         wd.resetRecoveryMetrics();
         // 5. 阶段 3 追踪诊断：清理完成后活动任务/终态异常应归零。非零说明有任务
@@ -144,6 +147,56 @@ public final class SchedulerGameTestFixture {
         if (scheduler.isAdmissionPaused() || scheduler.isBypassMode() || scheduler.isFailOpen()) {
             throw new GameTestAssertException("清洁状态失败: paused/bypass/failOpen 未复位");
         }
+        // 审查 P1 修复：追踪硬门槛——活动任务/终态异常必须归零（终态事件已收敛到
+        // registration close 绑定回调，proxy 完成时同步落账，断言确定性成立）
+        if (InflightDiagnostics.activeTaskCount() != 0) {
+            throw new GameTestAssertException("清洁状态失败: traceActiveTasks="
+                    + InflightDiagnostics.activeTaskCount()
+                    + "（存在未走完 registration close 的任务）");
+        }
+        if (InflightDiagnostics.terminalAnomalyCount() != 0) {
+            throw new GameTestAssertException("清洁状态失败: traceTerminalAnomalies="
+                    + InflightDiagnostics.terminalAnomalyCount());
+        }
+    }
+
+    /**
+     * 审查 P1 修复：统一测试执行包装——测试体<b>同步部分</b>断言失败中途中止时
+     * 立即执行完整清理 + 清洁硬断言（不依赖下一个测试兜底）。
+     * <p>
+     * 语义边界：测试体正常返回时<b>不清理</b>——succeedWhen 测试的异步流程
+     * （tick 驱动的回调）仍在进行，提前清理会 error-complete 尚未完成的任务、
+     * 摧毁异步断言；正常结束由 succeedWhen 回调内的 resetScheduler（委托
+     * {@link #forceCleanupAfterFailure()}）清理并硬断言；succeedWhen 回调内
+     * 的断言失败由 GameTest 框架标记失败，其残留由下一测试首语句的
+     * {@link #resetGlobalState()} 兜底（GameTest 无 after 钩子，此为框架上限）。
+     * <p>
+     * 用法（由拆分脚本注入）：{@code runIsolated(helper, () -> { ...测试体... });}
+     */
+    public static void runIsolated(GameTestHelper helper, Runnable testBody) {
+        try {
+            testBody.run();
+        } catch (Throwable t) {
+            // 同步断言失败/异常：finally 语义——清理 + 硬断言后原样抛出；
+            // 清理自身的断言失败附加为 suppressed（保留原始失败信息）
+            try {
+                forceCleanupAfterFailure();
+            } catch (Throwable cleanupEx) {
+                t.addSuppressed(cleanupEx);
+            }
+            throw t;
+        }
+    }
+
+    /**
+     * 审查 P1 修复：失败后强制清理——与 {@link #resetGlobalState()} 相同顺序，
+     * 但清理完成后<b>硬断言</b>清洁状态（含追踪活动表/终态异常），并复位追踪
+     * 诊断（防跨测试残留污染累计计数）。
+     */
+    public static void forceCleanupAfterFailure() {
+        resetGlobalState();
+        assertCleanState();
+        InflightDiagnostics.reset();
     }
 
     /**

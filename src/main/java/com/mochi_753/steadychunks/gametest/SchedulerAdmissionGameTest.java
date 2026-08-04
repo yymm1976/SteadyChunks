@@ -41,6 +41,7 @@ public class SchedulerAdmissionGameTest {
 
     @GameTest(template = "empty", batch = "steady_admission_paused", timeoutTicks = 600)
     public void admissionPausedShouldBlockNewTasks(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -71,11 +72,13 @@ public class SchedulerAdmissionGameTest {
             helper.assertTrue(scheduler.pendingCount() == 0, "恢复后等待队列应清空");
             resetScheduler(scheduler);
         });
+        });
     }
 
 
     @GameTest(template = "empty", batch = "steady_clear_all", timeoutTicks = 600)
     public void clearAllShouldCompleteWaitingTasks(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -115,6 +118,7 @@ public class SchedulerAdmissionGameTest {
             resetScheduler(scheduler);
         }
         helper.succeed();
+        });
     }
 
 
@@ -125,6 +129,7 @@ public class SchedulerAdmissionGameTest {
      */
     @GameTest(template = "empty", batch = "steady_clear_concurrent", timeoutTicks = 2400)
     public void clearConcurrentAdmissionShouldNotLeaveTasks(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -176,6 +181,7 @@ public class SchedulerAdmissionGameTest {
             pool.shutdownNow();
             resetScheduler(scheduler);
         });
+        });
     }
 
 
@@ -185,6 +191,7 @@ public class SchedulerAdmissionGameTest {
      */
     @GameTest(template = "empty", batch = "steady_paused_disable", timeoutTicks = 600)
     public void pausedThenDisableShouldBypass(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -210,11 +217,13 @@ public class SchedulerAdmissionGameTest {
             helper.assertTrue(scheduler.pendingCount() == 0, "bypass 后等待队列应清空");
             resetScheduler(scheduler);
         });
+        });
     }
 
 
     @GameTest(template = "empty", batch = "steady_noise_permit", timeoutTicks = 600)
     public void noisePermitOneShouldQueueAndResume(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -248,6 +257,7 @@ public class SchedulerAdmissionGameTest {
             helper.assertTrue(scheduler.pendingCount() == 0, "恢复后等待队列应清空");
             resetScheduler(scheduler);
         });
+        });
     }
 
 
@@ -263,6 +273,7 @@ public class SchedulerAdmissionGameTest {
      */
     @GameTest(template = "empty", batch = "steady_direct_count", timeoutTicks = 600)
     public void directAdmissionShouldBeCountedUntilCompletion(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -301,6 +312,7 @@ public class SchedulerAdmissionGameTest {
 
         resetScheduler(scheduler);
         helper.succeed();
+        });
     }
 
 
@@ -316,6 +328,7 @@ public class SchedulerAdmissionGameTest {
      */
     @GameTest(template = "empty", batch = "steady_mailbox_fail", timeoutTicks = 600)
     public void mailboxFailureShouldReturnErrorResult(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -358,6 +371,7 @@ public class SchedulerAdmissionGameTest {
             scheduler.setResumeExecutorOverride(null);
             resetScheduler(scheduler);
         });
+        });
     }
 
 
@@ -369,6 +383,7 @@ public class SchedulerAdmissionGameTest {
      */
     @GameTest(template = "empty", batch = "steady_sync_throw", timeoutTicks = 600)
     public void originalOperationThrowsSynchronously(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -399,6 +414,7 @@ public class SchedulerAdmissionGameTest {
 
         resetScheduler(scheduler);
         helper.succeed();
+        });
     }
 
     // ---- 阶段 2：统一 fixture 委托（辅助方法与清理由 SchedulerGameTestFixture 提供） ----
@@ -418,8 +434,8 @@ public class SchedulerAdmissionGameTest {
         SchedulerGameTestFixture.awaitTrue(condition, message);
     }
 
-    /** 重置调度器全局状态（统一清理顺序，见 SchedulerGameTestFixture）。 */
+    /** 重置调度器全局状态（统一清理 + 清洁硬断言 + 追踪复位，见 SchedulerGameTestFixture）。 */
     private static void resetScheduler(ChunkScheduler scheduler) {
-        SchedulerGameTestFixture.resetGlobalState();
+        SchedulerGameTestFixture.forceCleanupAfterFailure();
     }
 }

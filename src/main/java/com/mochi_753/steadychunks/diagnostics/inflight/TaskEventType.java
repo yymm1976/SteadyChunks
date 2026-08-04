@@ -21,10 +21,16 @@ public enum TaskEventType {
     EXECUTING,
     /** originalOperation.get() 已返回（原 Future 在途） */
     ORIGINAL_RETURNED,
-    /** 原版 Future 终态（whenComplete：permit 释放、代理完成） */
+    /** 原版 Future 终态（whenComplete 触发；permit 释放之前） */
     ORIGINAL_COMPLETED,
-    /** 代理 Future 对外终态（调用方可见完成） */
+    /** 组合 permit 已释放（stage → global 顺序完成后记录） */
+    PERMITS_RELEASED,
+    /** 代理 Future 完成尝试（proxy.complete 调用前；诊断用） */
+    PROXY_COMPLETE_ATTEMPT,
+    /** 代理 Future 对外终态（complete 返回成功或 isDone 后记录） */
     PROXY_COMPLETED,
+    /** 注册 lease 实际关闭后记录（proxy 终态绑定回调内） */
+    REGISTRATION_CLOSED,
     /** 被恢复批次捕获（captureRecoveryBatch） */
     RECOVERY_CAPTURED,
     /** 恢复处置完成（mailbox 提交执行或第二级强制完成） */
@@ -33,6 +39,13 @@ public enum TaskEventType {
     REJECTED,
     /** 清理/维度取消（error result 完成） */
     CANCELLED,
-    /** 每 taskId 唯一的终态标记（注册表强制：重复终态计为异常） */
-    TASK_TERMINAL
+    /**
+     * 每 taskId 唯一的终态标记（注册表强制：重复终态计为异常）。
+     * <p>
+     * 审查 P0 修复：<b>不得早于 registration close</b>——由 proxy 终态绑定回调
+     * （registration.close() 之后）或 direct 原 Future 绑定回调统一发射；
+     * 其他路径（拒绝/取消/恢复）只发对应事件，不再直接发 TERMINAL，
+     * 保证"活动表为空"等价于"注册 lease 已关闭"。
+     */
+    STEADY_STAGE_TERMINAL
 }

@@ -55,6 +55,7 @@ public class WorldgenIntegrationGameTest {
      */
     @GameTest(template = "empty", batch = "steady_real_gen", timeoutTicks = 1200)
     public void realGenerationShouldCapNoiseConcurrency(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -90,6 +91,7 @@ public class WorldgenIntegrationGameTest {
                     "生成完成后全局 permit 应全部释放");
             resetScheduler(scheduler);
         });
+        });
     }
 
     // ---- 阶段 2：统一 fixture 委托（辅助方法与清理由 SchedulerGameTestFixture 提供） ----
@@ -109,8 +111,8 @@ public class WorldgenIntegrationGameTest {
         SchedulerGameTestFixture.awaitTrue(condition, message);
     }
 
-    /** 重置调度器全局状态（统一清理顺序，见 SchedulerGameTestFixture）。 */
+    /** 重置调度器全局状态（统一清理 + 清洁硬断言 + 追踪复位，见 SchedulerGameTestFixture）。 */
     private static void resetScheduler(ChunkScheduler scheduler) {
-        SchedulerGameTestFixture.resetGlobalState();
+        SchedulerGameTestFixture.forceCleanupAfterFailure();
     }
 }

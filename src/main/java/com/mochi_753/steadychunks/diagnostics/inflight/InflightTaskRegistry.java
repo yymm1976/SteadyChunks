@@ -23,6 +23,15 @@ public final class InflightTaskRegistry {
     private final AtomicLong taskIdSource = new AtomicLong(1);
     private final ConcurrentHashMap<Long, InflightTaskRecord> active = new ConcurrentHashMap<>();
     private final AtomicLong terminalAnomalies = new AtomicLong();
+    /** 审查 P1 修复：被容量逐出的未终态任务集合——后续终态不视为重复异常 */
+    private final java.util.Set<Long> evictedTaskIds = ConcurrentHashMap.newKeySet();
+    /** 审查 P1 修复：容量溢出（逐出）计数——事故快照显示诊断容量是否被击穿 */
+    private final AtomicLong evictionCount = new AtomicLong();
+    /** 审查修复：已终态任务集合（有界）——TERMINAL 之后到达的迟到非终态事件
+     * （如 PROXY_COMPLETED 在 STEADY_STAGE_TERMINAL 之后记录）不得把已终态任务
+     * 重新激活进活动表（实测：活动表残留 last=PROXY_COMPLETED 永久不消） */
+    private final java.util.Set<Long> terminatedTaskIds = ConcurrentHashMap.newKeySet();
+    private static final int TERMINATED_CAP = 16384;
 
     public InflightTaskRegistry(TaskTraceRingBuffer ring) {
         this.ring = ring;
@@ -44,17 +53,33 @@ public final class InflightTaskRegistry {
         long threadId = Thread.currentThread().threadId();
         ring.record(new TaskTraceEvent(taskId, type, now, threadId, dimensionId, chunkX, chunkZ));
 
-        if (type == TaskEventType.TASK_TERMINAL) {
+        if (type == TaskEventType.STEADY_STAGE_TERMINAL) {
             InflightTaskRecord record = active.get(taskId);
             if (record != null && record.terminal.compareAndSet(false, true)) {
                 record.lastType = type;
                 record.lastNanos = now;
                 record.lastThreadId = threadId;
                 active.remove(taskId);
+                // 审查修复：登记已终态——TERMINAL 之后到达的迟到非终态事件（如
+                // PROXY_COMPLETED）不得重新激活；集合有界，满时清空（保留最近，
+                // 迟到窗口为微秒级，清空安全）
+                terminatedTaskIds.add(taskId);
+                if (terminatedTaskIds.size() > TERMINATED_CAP) {
+                    terminatedTaskIds.clear();
+                }
+            } else if (evictedTaskIds.remove(taskId)) {
+                // 审查 P1 修复：任务曾被容量逐出（未终态即出表）——终态正常，
+                // 不视为重复异常；从逐出集合移除（释放跟踪）
             } else {
                 // 重复终态或未知任务：终态唯一性被破坏
                 terminalAnomalies.incrementAndGet();
             }
+            return;
+        }
+
+        // 审查修复：已终态任务的迟到非终态事件——直接忽略（不入活动表、不入环
+        // 已入——事件本身保留在环中供诊断，仅不激活活动条目）
+        if (active.get(taskId) == null && terminatedTaskIds.contains(taskId)) {
             return;
         }
 
@@ -83,6 +108,10 @@ public final class InflightTaskRegistry {
         }
         if (victim >= 0) {
             active.remove(victim);
+            // 审查 P1 修复：逐出必须显式登记——后续终态不计为重复异常，
+            // 事故快照可显示诊断容量被击穿（最老任务恰是最可能真卡住的）
+            evictedTaskIds.add(victim);
+            evictionCount.incrementAndGet();
         }
     }
 
@@ -91,9 +120,14 @@ public final class InflightTaskRegistry {
         return active.size();
     }
 
-    /** 终态唯一性异常计数（重复 TASK_TERMINAL）。 */
+    /** 终态唯一性异常计数（重复 STEADY_STAGE_TERMINAL）。 */
     public long terminalAnomalyCount() {
         return terminalAnomalies.get();
+    }
+
+    /** 审查 P1 修复：容量溢出（未终态任务被逐出）计数——事故快照显示诊断容量击穿。 */
+    public long evictionCount() {
+        return evictionCount.get();
     }
 
     public long totalRecorded() {
@@ -115,6 +149,9 @@ public final class InflightTaskRegistry {
     public void reset() {
         ring.clear();
         active.clear();
+        evictedTaskIds.clear();
+        terminatedTaskIds.clear();
         terminalAnomalies.set(0);
+        evictionCount.set(0);
     }
 }

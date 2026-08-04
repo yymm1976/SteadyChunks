@@ -8,6 +8,7 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -114,24 +115,21 @@ public final class Watchdog {
         /** 第 14 轮修复：批次可在捕获完成后回填（CAPTURING 阶段为 null） */
         volatile ChunkScheduler.RecoveryBatch batch;
         volatile RecoveryPhase phase;
+        /** 审查 P0-2 修复：创建时的恢复代数——旧线程捕获返回后必须与当前代数比对 */
+        final long generation;
 
-        ActiveRecovery(ChunkScheduler.RecoveryBatch batch, RecoveryPhase phase) {
+        ActiveRecovery(ChunkScheduler.RecoveryBatch batch, RecoveryPhase phase, long generation) {
             this.batch = batch;
             this.phase = phase;
+            this.generation = generation;
         }
     }
 
     /**
-     * 第 14 轮 P0-1 修复：第一级 mailbox 提交线程——独立于监督线程，
-     * executor.execute 阻塞时只卡提交线程，监督线程仍每秒检查 deadline
-     * （MAILBOX_SUBMITTING 超时允许第二级升级，运行期自动恢复不依赖提交完成）。
+     * 审查 P1 修复：第一级 mailbox 提交改为<b>每批次独立虚拟线程</b>（见阶段 6）——
+     * 单线程 submitter 若首次 execute 永久阻塞会丢失唯一线程并积累无界队列
+     * （每个 Runnable 强引用整个批次）。此处不再持有共享提交线程。
      */
-    private final java.util.concurrent.ExecutorService recoverySubmitter =
-            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
-                Thread t = new Thread(r, "SteadyChunks-RecoverySubmitter");
-                t.setDaemon(true);
-                return t;
-            });
     /**
      * 第 14 轮 P0-3 修复：停服 emergency 完成分派器——每任务一个独立虚拟线程，
      * 同步回调阻塞只卡自己的虚拟线程，ServerStopping 不被任何回调阻塞。
@@ -318,19 +316,23 @@ public final class Watchdog {
      * 第 14 轮 P0-3 修复：停服 emergency 完成分派——批次保存到
      * {@link #shutdownBatches}（终态前不得遗忘），经
      * {@link ChunkScheduler#escalateRecoveryBatchAsync} 逐任务提交独立虚拟线程
-     * complete（同步回调阻塞只卡自己的虚拟线程）；每任务完成后自检批次
-     * 全终态则从集合移除（幂等，最后一次完成的线程移除）。
+     * complete（同步回调阻塞只卡自己的虚拟线程）。
+     * <p>
+     * 审查 P0-4 修复：批次移除<b>绑定所有 proxy 的终态（allOf）</b>，而非
+     * "谁成功调用了 complete"——mailbox 抢先完成时 complete 返回 false、回调
+     * 不触发，若移除只挂在回调上批次会永久残留；部分 emergency 完成、其余
+     * mailbox 稍后完成时同样无人再检查。unsafe 指标仍只统计 complete()==true
+     * （回调累计），但批次生命周期由 allOf 兜底。
      */
     private void dispatchEmergencyCompletion(ChunkScheduler.RecoveryBatch batch, String reason) {
         shutdownBatches.put(batch.id(), batch);
         ChunkScheduler scheduler = ChunkScheduler.getInstance();
         scheduler.escalateRecoveryBatchAsync(batch, reason, emergencyExecutor,
-                completed -> {
-                    totalUnsafeShutdownRecoveries.addAndGet(completed);
-                    if (scheduler.recoveryBatchAllDone(batch)) {
-                        shutdownBatches.remove(batch.id());
-                    }
-                });
+                totalUnsafeShutdownRecoveries::addAndGet);
+        // P0-4：allOf 挂到全部 proxy 终态——无论谁完成（emergency/mailbox/并发
+        // 路径），批次终态后必然移除；空批次 allOf 立即完成
+        scheduler.recoveryBatchAllDoneFuture(batch).whenComplete((unused, error) ->
+                shutdownBatches.remove(batch.id(), batch));
         SteadyChunks.LOGGER.error(
                 "SteadyChunks Watchdog: 停服处置活动恢复批次 {}（{} 个任务）已分派"
                         + "emergency 完成（计入 totalUnsafeShutdownRecoveries，不阻塞停服）",
@@ -466,27 +468,28 @@ public final class Watchdog {
         // ---- 阶段 2（锁外）：外部调用（Future 完成；升级保持同步——监督线程
         //      阻塞回调仅此一次，批次已 ESCALATING 发布，停服可异步处置） ----
         if (batchToEscalate != null) {
-            int unsafe = scheduler.escalateRecoveryBatch(batchToEscalate);
-            totalUnsafeRecoveries.addAndGet(unsafe);
+            // 审查 P0-3 修复：运行期第二级改<b>异步 per-task 完成</b>——同步
+            // proxy.complete 会同步运行非 async 回调，第一个任务的回调阻塞会卡死
+            // supervisor（批次后续任务不再完成、Watchdog 不再周期检查）。与停服
+            // 路径共用 emergencyExecutor（每任务独立虚拟线程，阻塞只卡自己的
+            // 虚拟线程）；批次保持 ESCALATING 发布，全部终态后由周期检查清空。
+            int dispatched = batchToEscalate.tasks().size();
+            scheduler.escalateRecoveryBatchAsync(batchToEscalate,
+                    "SteadyChunks drain 停摆恢复（UNSAFE_EMERGENCY）", emergencyExecutor,
+                    totalUnsafeRecoveries::addAndGet);
             SteadyChunks.LOGGER.error(
                     "SteadyChunks Watchdog: UNSAFE_EMERGENCY——mailbox 恢复失效，"
-                            + "daemon 线程直接完成 {} 个批次任务（打破卸载重入风暴死锁）",
-                    unsafe);
-            // 阶段 4：第二级升级事故快照（只诊断，限流）
-            IncidentRecorder.recordUnsafeEscalation(scheduler, batchToEscalate.id(), unsafe);
-            // ---- 阶段 2.5（锁内）：全部终态确认后才清空（窗口 B：升级期间批次
-            //      保持发布，直到 proxy 全部终态） ----
-            synchronized (this) {
-                ActiveRecovery ar = activeRecovery;
-                if (ar != null && ar.batch == batchToEscalate) {
-                    if (scheduler.recoveryBatchAllDone(ar.batch)) {
-                        ar.phase = RecoveryPhase.DONE;
-                        activeRecovery = null;
-                    }
-                    // 极端情况仍有未终态（complete 必致终态，实际不可达）：保持
-                    // ESCALATING 发布，下轮继续幂等完成
-                }
-            }
+                            + "已分派 {} 个批次任务异步强制完成（打破卸载重入风暴死锁）",
+                    dispatched);
+            // 阶段 4：第二级升级事故快照（只诊断，限流；completedUnsafely 为分派数，
+            // 实际完成数经回调计入 totalUnsafeRecoveries）
+            IncidentRecorder.recordUnsafeEscalation(scheduler, batchToEscalate.id(), dispatched);
+            // 审查 P0-3 修复：<b>不再当轮检查 allDone</b>——异步分派后虚拟线程
+            // 可能立即完成全部任务（complete 的 CAS 状态置位先于回调），当轮
+            // 检查会把批次在升级触发瞬间清空（窗口 B 测试"升级期间批次可见"
+            // 断言竞态失败）。批次保持 ESCALATING 发布至少一轮，由下轮周期
+            // 检查（case ESCALATING：allDone → DONE → 清空）确认后清除。
+            // 停服路径不依赖此清空（stopRecoveryThread 独立处置）。
         } else if (startFirstLevel) {
             // 第 14 轮 P0-2 修复：测试探针——"判定与捕获之间"暂停点（生产 null）
             Runnable probe = preCaptureProbe;
@@ -495,25 +498,31 @@ public final class Watchdog {
             }
             // ---- 阶段 3（锁内）：先发布 CAPTURING 所有权（P1：捕获不再持锁；
             //      P0-2：判定与捕获之间停服/换代/已有批次 → 不启动） ----
+            // 审查 P0-2 修复：局部保存 owner 对象——捕获期间 stop/start 可能已把
+            // activeRecovery 换成新生命周期/新代数的对象，回填必须比对对象身份
+            // （旧实现只比对 phase==CAPTURING，旧线程可能把旧代数批次写入新对象）。
+            ActiveRecovery owner = new ActiveRecovery(null, RecoveryPhase.CAPTURING, generation);
             synchronized (this) {
                 if (stopRecovery || generation != recoveryGeneration.get() || activeRecovery != null) {
                     return; // 停服或换代后旧线程不得捕获发布
                 }
-                activeRecovery = new ActiveRecovery(null, RecoveryPhase.CAPTURING);
+                activeRecovery = owner;
             }
             // ---- 阶段 4（锁外）：捕获（所有权已发布——stop 摘除后不再等待捕获循环） ----
             ChunkScheduler.RecoveryBatch captured = scheduler.captureRecoveryBatch();
             // ---- 阶段 5（锁内）：回填批次 + 启动独立提交 ----
             boolean abandoned = false;
             synchronized (this) {
-                ActiveRecovery ar = activeRecovery;
-                if (ar != null && ar.phase == RecoveryPhase.CAPTURING) {
-                    ar.batch = captured;
-                    ar.phase = RecoveryPhase.MAILBOX_SUBMITTING;
+                if (activeRecovery == owner
+                        && owner.generation == recoveryGeneration.get()
+                        && !stopRecovery) {
+                    owner.batch = captured;
+                    owner.phase = RecoveryPhase.MAILBOX_SUBMITTING;
                     totalRecoveries.incrementAndGet();
                 } else {
-                    // stop 在捕获期间摘除了所有权（CAPTURING）：任务回退队列，
-                    // 由停服的 closeForShutdown 兜底清理（或新 Watchdog 重新恢复）
+                    // 捕获期间 stop/start/换代：所有权已不属于本线程（对象身份
+                    // 或代数不匹配）——任务回退队列（requeue 内部再做生命周期
+                    // 校验，关闭后直接 error 完成），不得写入新 Watchdog 生命周期
                     abandoned = true;
                 }
             }
@@ -521,9 +530,15 @@ public final class Watchdog {
                 scheduler.requeueRecoveryBatch(captured);
                 return;
             }
-            // ---- 阶段 6（提交线程，P0-1）：独立提交——execute 阻塞只卡提交
-            //      线程，监督线程继续每秒检查（MAILBOX_SUBMITTING 超时升级） ----
-            recoverySubmitter.execute(() -> {
+            // ---- 阶段 6（提交线程，P0-1 + 审查 P1）：每批次独立虚拟线程提交——
+            //      单线程 submitter 永久阻塞会丢失唯一线程并积累无界队列（每个
+            //      Runnable 强引用整批）；独立虚拟线程 + 迟到检查（批次已全终态
+            //      或已换代则跳过提交，旧批次不得迟到执行 mailbox 提交） ----
+            Thread.ofVirtual().name("SteadyChunks-RecoverySubmitter-" + captured.id()).start(() -> {
+                // 迟到提交保护：批次已全部终态（第二级/停服已处置）则跳过
+                if (scheduler.recoveryBatchAllDone(captured)) {
+                    return;
+                }
                 int rejected = scheduler.submitRecoveryBatch(captured);
                 synchronized (Watchdog.this) {
                     ActiveRecovery ar = activeRecovery;

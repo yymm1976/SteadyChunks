@@ -47,6 +47,7 @@ public class WatchdogRecoveryGameTest {
      */
     @GameTest(template = "empty", batch = "steady_mailbox_escalate", timeoutTicks = 600)
     public void mailboxRecoveryMustEscalateToUnsafe(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -87,6 +88,7 @@ public class WatchdogRecoveryGameTest {
         scheduler.setResumeExecutorOverride(null);
         resetScheduler(scheduler);
         helper.succeed();
+        });
     }
 
 
@@ -96,6 +98,7 @@ public class WatchdogRecoveryGameTest {
      */
     @GameTest(template = "empty", batch = "steady_mailbox_reject", timeoutTicks = 600)
     public void mailboxRejectionMustCountUnsafeRecovery(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -130,6 +133,7 @@ public class WatchdogRecoveryGameTest {
         scheduler.setResumeExecutorOverride(null);
         resetScheduler(scheduler);
         helper.succeed();
+        });
     }
 
 
@@ -150,6 +154,7 @@ public class WatchdogRecoveryGameTest {
      */
     @GameTest(template = "empty", batch = "steady_watchdog_state_machine", timeoutTicks = 600)
     public void watchdogStateMachineMustRecoverEndToEnd(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -203,13 +208,15 @@ public class WatchdogRecoveryGameTest {
         helper.assertTrue(!queued.isDone(), "deadline 前任务不应被强制完成");
         helper.assertTrue(wd.totalUnsafeRecoveries() == 0, "deadline 前 unsafe 不得增加");
 
-        // deadline 后：第二级直接完成（UNSAFE_EMERGENCY）
+        // deadline 后：第二级异步强制完成（UNSAFE_EMERGENCY）
+        // 审查 P0-3 适配：升级已异步化（emergency 虚拟线程 per-task），
+        // 终态与指标断言必须轮询
         wd.checkDrainStallForTest(scheduler, System.nanoTime() + 3_000_000_000L);
-        helper.assertTrue(queued.isDone(), "deadline 后批次任务应被强制完成");
+        awaitTrue(() -> queued.isDone(), "deadline 后批次任务应被强制完成");
         helper.assertTrue(!queued.join().isSuccess(), "强制完成应为 error result");
-        helper.assertTrue(wd.totalUnsafeRecoveries() == 1,
+        awaitTrue(() -> wd.totalUnsafeRecoveries() == 1,
                 "第二级应计入 totalUnsafeRecoveries（实际=" + wd.totalUnsafeRecoveries() + "）");
-        helper.assertTrue(!wd.hasActiveRecoveryBatch(), "批次终态后应清空");
+        awaitTrue(() -> !wd.hasActiveRecoveryBatch(), "批次终态后应清空");
         helper.assertTrue(scheduler.pendingCount() == 0, "批次处理后队列应为空");
 
         // 清理
@@ -219,6 +226,7 @@ public class WatchdogRecoveryGameTest {
         resetScheduler(scheduler);
         wd.resetRecoveryMetrics();
         helper.succeed();
+        });
     }
 
 
@@ -232,6 +240,7 @@ public class WatchdogRecoveryGameTest {
      */
     @GameTest(template = "empty", batch = "steady_watchdog_disabled", timeoutTicks = 600)
     public void watchdogMustNotRecoverDuringCorrectnessTests(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         Watchdog wd = Watchdog.getInstance();
         // 此前任何批次的自动恢复都会使此断言失败（暴露调度链竞态）
@@ -242,6 +251,7 @@ public class WatchdogRecoveryGameTest {
         // 禁用恢复线程：后续批次在无 Watchdog 保护下运行（硬门槛）
         wd.stopRecoveryThread();
         helper.succeed();
+        });
     }
 
 
@@ -252,6 +262,7 @@ public class WatchdogRecoveryGameTest {
      */
     @GameTest(template = "empty", batch = "steady_watchdog_immediate", timeoutTicks = 600)
     public void watchdogImmediateStopStartMustLeaveLiveThread(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         Watchdog wd = Watchdog.getInstance();
         ChunkScheduler scheduler = ChunkScheduler.getInstance();
@@ -268,6 +279,7 @@ public class WatchdogRecoveryGameTest {
         // 收尾：停止
         wd.stopRecoveryThread();
         helper.succeed();
+        });
     }
 
 
@@ -278,6 +290,7 @@ public class WatchdogRecoveryGameTest {
      */
     @GameTest(template = "empty", batch = "steady_watchdog_lifecycle", timeoutTicks = 600)
     public void watchdogRestartsAcrossServerLifecycle(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         Watchdog wd = Watchdog.getInstance();
         ChunkScheduler scheduler = ChunkScheduler.getInstance();
@@ -310,6 +323,7 @@ public class WatchdogRecoveryGameTest {
         }
         helper.assertTrue(!wd.isRecoveryThreadAlive(), "再次 stop 后线程应退出");
         helper.succeed();
+        });
     }
 
 
@@ -328,6 +342,7 @@ public class WatchdogRecoveryGameTest {
      */
     @GameTest(template = "empty", batch = "steady_watchdog_shutdown_batch", timeoutTicks = 600)
     public void shutdownMustTerminateActiveRecoveryBatch(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -388,6 +403,7 @@ public class WatchdogRecoveryGameTest {
         resetScheduler(scheduler);
         wd.resetRecoveryMetrics();
         helper.succeed();
+        });
     }
 
 
@@ -404,6 +420,7 @@ public class WatchdogRecoveryGameTest {
      */
     @GameTest(template = "empty", batch = "steady_watchdog_blocking_submit", timeoutTicks = 600)
     public void blockingMailboxSubmissionMustRemainRecoverable(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -491,6 +508,7 @@ public class WatchdogRecoveryGameTest {
         resetScheduler(scheduler);
         wd.resetRecoveryMetrics();
         helper.succeed();
+        });
     }
 
 
@@ -507,6 +525,7 @@ public class WatchdogRecoveryGameTest {
      */
     @GameTest(template = "empty", batch = "steady_watchdog_blocking_escalate", timeoutTicks = 600)
     public void blockingCompletionCallbackMustKeepBatchVisible(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -570,10 +589,12 @@ public class WatchdogRecoveryGameTest {
         helper.assertTrue(wd.hasActiveRecoveryBatch(), "升级期间批次必须保持发布（窗口 B）");
 
         // 第二线程幂等完成剩余任务（评审：第二线程可以继续幂等完成其余任务）
+        // 审查 P0-3 适配：运行期升级已异步化——完成发生在 emergency 虚拟线程，
+        // 终态断言必须轮询（同步断言与异步分派存在竞态）
         wd.checkDrainStallForTest(scheduler, System.nanoTime() + 3_000_000_000L);
-        helper.assertTrue(t2.isDone(), "第二线程应完成剩余任务（幂等）");
+        awaitTrue(() -> t2.isDone(), "第二线程应完成剩余任务（幂等）");
         helper.assertTrue(!t2.join().isSuccess(), "应为 error result");
-        helper.assertTrue(!wd.hasActiveRecoveryBatch(), "全部终态后批次应清空");
+        awaitTrue(() -> !wd.hasActiveRecoveryBatch(), "全部终态后批次应清空");
 
         // 放行任务 1 回调 → 驱动线程 escalate 返回（complete 幂等，指标归并）
         releaseCallback.countDown();
@@ -595,6 +616,7 @@ public class WatchdogRecoveryGameTest {
         resetScheduler(scheduler);
         wd.resetRecoveryMetrics();
         helper.succeed();
+        });
     }
 
 
@@ -612,6 +634,7 @@ public class WatchdogRecoveryGameTest {
      */
     @GameTest(template = "empty", batch = "steady_watchdog_submit_escalate", timeoutTicks = 600)
     public void blockingMailboxSubmissionMustEscalateWithoutShutdown(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -679,6 +702,7 @@ public class WatchdogRecoveryGameTest {
         resetScheduler(scheduler);
         wd.resetRecoveryMetrics();
         helper.succeed();
+        });
     }
 
 
@@ -697,6 +721,7 @@ public class WatchdogRecoveryGameTest {
      */
     @GameTest(template = "empty", batch = "steady_watchdog_stop_start_publish", timeoutTicks = 600)
     public void stoppedWatchdogMustNotPublishNewBatch(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -790,6 +815,7 @@ public class WatchdogRecoveryGameTest {
             wd.resetRecoveryMetrics();
         }
         helper.succeed();
+        });
     }
 
 
@@ -806,6 +832,7 @@ public class WatchdogRecoveryGameTest {
      */
     @GameTest(template = "empty", batch = "steady_watchdog_stop_nonblocking", timeoutTicks = 600)
     public void stopRecoveryThreadMustNotBlockOnCompletionCallback(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
         SchedulerGameTestFixture.resetGlobalState();
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
@@ -883,6 +910,7 @@ public class WatchdogRecoveryGameTest {
         resetScheduler(scheduler);
         wd.resetRecoveryMetrics();
         helper.succeed();
+        });
     }
 
     // ---- 阶段 2：统一 fixture 委托（辅助方法与清理由 SchedulerGameTestFixture 提供） ----
@@ -902,8 +930,8 @@ public class WatchdogRecoveryGameTest {
         SchedulerGameTestFixture.awaitTrue(condition, message);
     }
 
-    /** 重置调度器全局状态（统一清理顺序，见 SchedulerGameTestFixture）。 */
+    /** 重置调度器全局状态（统一清理 + 清洁硬断言 + 追踪复位，见 SchedulerGameTestFixture）。 */
     private static void resetScheduler(ChunkScheduler scheduler) {
-        SchedulerGameTestFixture.resetGlobalState();
+        SchedulerGameTestFixture.forceCleanupAfterFailure();
     }
 }

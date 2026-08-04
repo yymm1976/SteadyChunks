@@ -193,6 +193,17 @@ public final class ChunkScheduler {
         cpuGeneralPermit.setMaxPermits(maxInflight);
     }
 
+    /**
+     * 审查修复：复位紧急/有节奏放行标志（bypass/failOpen）——GameTest fixture
+     * 清洁断言用。setEnabled(false) 会置 bypassMode=true（有节奏放行积压队列），
+     * 断言"bypassMode 未复位"因此必然失败；清理完成且队列已空时必须显式复位。
+     */
+    public void resetEmergencyFlags() {
+        bypassMode.set(false);
+        bypassBudget.set(0);
+        failOpen.set(false);
+    }
+
     public boolean isEnabled() {
         return enabled.get();
     }
@@ -292,6 +303,10 @@ public final class ChunkScheduler {
 
         // 阶段 3：分配任务追踪 id（-1 = 追踪未启用；三条路径共享同一 id）。
         long traceTaskId = InflightDiagnostics.allocateTaskId();
+        // 审查 P1 修复：三条路径统一携带真实维度/坐标（此前 direct/fail-open 传
+        // null/MIN_VALUE，无法把 taskId 对应到 Holder 调查 generationRefCount）
+        int traceChunkX = holder == null ? Integer.MIN_VALUE : holder.getPos().x;
+        int traceChunkZ = holder == null ? Integer.MIN_VALUE : holder.getPos().z;
 
         // P1 修复（第 4 轮）：Mixin 真实拦截计数（供真实生成 GameTest 断言）。
         mixinInterceptCount.incrementAndGet();
@@ -307,14 +322,14 @@ public final class ChunkScheduler {
                         pendingCount.get());
             } else {
                 logFailOpenThrottled();
-                return runUncontrolled(originalOperation, registration, traceTaskId);
+                return runUncontrolled(originalOperation, registration, traceTaskId, dimension, traceChunkX, traceChunkZ);
             }
         }
         if (pendingCount.get() >= pendingCriticalThreshold) {
             failOpen.set(true);
             SteadyChunks.LOGGER.warn("NOISE 等待队列超过紧急阈值 {}，进入 fail-open 透传（pending={}）",
                     pendingCriticalThreshold, pendingCount.get());
-            return runUncontrolled(originalOperation, registration, traceTaskId);
+            return runUncontrolled(originalOperation, registration, traceTaskId, dimension, traceChunkX, traceChunkZ);
         }
 
         // P0-4 修复：紧急暂停时普通任务进入等待队列，依赖关键任务旁路放行
@@ -336,7 +351,8 @@ public final class ChunkScheduler {
         }
 
         // 组合 permit 获取成功：执行原版操作，完成后统一释放（direct 路径共享准入入口的注册 lease）
-        return executeOriginal(targetStatus, originalOperation, null, global, stage, registration, traceTaskId);
+        return executeOriginal(targetStatus, originalOperation, null, global, stage, registration,
+                traceTaskId, dimension, traceChunkX, traceChunkZ);
     }
 
     /**
@@ -352,29 +368,34 @@ public final class ChunkScheduler {
             // 停服等待/维度泄漏检测不遗漏透传任务；原 Future 终态关闭 lease。
             LifecycleCleanupCoordinator.TaskRegistration registration,
             // 阶段 3：任务追踪 id（controlAdmission 分配）
-            long traceTaskId) {
+            long traceTaskId,
+            // 审查 P1 修复：fail-open 任务携带真实维度/坐标（此前 null/MIN_VALUE，
+            // 而该类任务恰是"pending=0 但在途"的重点调查对象）
+            ResourceKey<Level> traceDimension, int traceChunkX, int traceChunkZ) {
         int active = uncontrolledNoiseActive.incrementAndGet();
         // P1-4 修复（第 6 轮）：总并发峰值 = 受控 + 非受控之和
         updateTotalNoisePeak();
-        InflightDiagnostics.record(traceTaskId, TaskEventType.EXECUTING, null, Integer.MIN_VALUE, Integer.MIN_VALUE);
+        InflightDiagnostics.record(traceTaskId, TaskEventType.EXECUTING, traceDimension, traceChunkX, traceChunkZ);
         CompletableFuture<ChunkResult<ChunkAccess>> future;
         try {
             future = originalOperation.get();
         } catch (Throwable ex) {
             uncontrolledNoiseActive.decrementAndGet();
             registration.close();
-            InflightDiagnostics.record(traceTaskId, TaskEventType.REJECTED, null, Integer.MIN_VALUE, Integer.MIN_VALUE);
-            InflightDiagnostics.record(traceTaskId, TaskEventType.TASK_TERMINAL, null, Integer.MIN_VALUE, Integer.MIN_VALUE);
+            // 审查 P0 修复：fail-open 无 proxy——lease 已手工关闭，终态在此发射
+            // （REJECTED 后紧接 REGISTRATION_CLOSED + STEADY_STAGE_TERMINAL）
+            InflightDiagnostics.record(traceTaskId, TaskEventType.REJECTED, traceDimension, traceChunkX, traceChunkZ);
+            traceTerminalAfterClose(traceTaskId, traceDimension, traceChunkX, traceChunkZ);
             CompletableFuture<ChunkResult<ChunkAccess>> failed = new CompletableFuture<>();
             failed.completeExceptionally(ex);
             return failed;
         }
-        InflightDiagnostics.record(traceTaskId, TaskEventType.ORIGINAL_RETURNED, null, Integer.MIN_VALUE, Integer.MIN_VALUE);
+        InflightDiagnostics.record(traceTaskId, TaskEventType.ORIGINAL_RETURNED, traceDimension, traceChunkX, traceChunkZ);
         future.whenComplete((result, ex) -> {
             uncontrolledNoiseActive.decrementAndGet();
             registration.close();
-            InflightDiagnostics.record(traceTaskId, TaskEventType.ORIGINAL_COMPLETED, null, Integer.MIN_VALUE, Integer.MIN_VALUE);
-            InflightDiagnostics.record(traceTaskId, TaskEventType.TASK_TERMINAL, null, Integer.MIN_VALUE, Integer.MIN_VALUE);
+            InflightDiagnostics.record(traceTaskId, TaskEventType.ORIGINAL_COMPLETED, traceDimension, traceChunkX, traceChunkZ);
+            traceTerminalAfterClose(traceTaskId, traceDimension, traceChunkX, traceChunkZ);
         });
         return future;
     }
@@ -416,8 +437,10 @@ public final class ChunkScheduler {
         // 返回 error result 等价于生成失败但不触发致命异常，不会残留永久等待的代理 Future）。
         if (!acceptingTasks.get()) {
             registration.close();
+            // 审查 P0 修复：任务未创建（无 proxy 绑定）——lease 已手工关闭，
+            // REJECTED 后紧接 REGISTRATION_CLOSED + STEADY_STAGE_TERMINAL
             InflightDiagnostics.record(traceTaskId, TaskEventType.REJECTED, dimension, Integer.MIN_VALUE, Integer.MIN_VALUE);
-            InflightDiagnostics.record(traceTaskId, TaskEventType.TASK_TERMINAL, dimension, Integer.MIN_VALUE, Integer.MIN_VALUE);
+            traceTerminalAfterClose(traceTaskId, dimension, Integer.MIN_VALUE, Integer.MIN_VALUE);
             return CompletableFuture.completedFuture(
                     ChunkResult.error("SteadyChunks 调度器已停止接收任务"));
         }
@@ -427,7 +450,7 @@ public final class ChunkScheduler {
         if (!dimensionState.accepting.get()) {
             registration.close();
             InflightDiagnostics.record(traceTaskId, TaskEventType.REJECTED, dimension, Integer.MIN_VALUE, Integer.MIN_VALUE);
-            InflightDiagnostics.record(traceTaskId, TaskEventType.TASK_TERMINAL, dimension, Integer.MIN_VALUE, Integer.MIN_VALUE);
+            traceTerminalAfterClose(traceTaskId, dimension, Integer.MIN_VALUE, Integer.MIN_VALUE);
             return CompletableFuture.completedFuture(
                     ChunkResult.error("SteadyChunks 维度正在卸载"));
         }
@@ -465,7 +488,15 @@ public final class ChunkScheduler {
         // 只需 proxy.complete(...)，close 由本绑定自动触发（幂等 CAS 兜底）。
         // 旧实现八处手工 close：lease 关闭时机略早于代理终态（globalTaskCount 已归零
         // 但 proxy 未完成），且新增错误路径时易遗漏。
-        proxy.whenComplete((result, ex) -> registration.close());
+        // 审查 P0 修复：REGISTRATION_CLOSED + STEADY_STAGE_TERMINAL 严格在 lease
+        // 关闭之后发射（同回调内顺序执行）——"活动表为空"等价于"注册 lease 已
+        // 关闭"；拒绝/取消/恢复路径只经 proxy.complete 汇聚到此，不再各自发终态。
+        proxy.whenComplete((result, ex) -> {
+            registration.close();
+            traceTerminalAfterClose(traceTaskId, dimension,
+                    holder == null ? Integer.MIN_VALUE : holder.getPos().x,
+                    holder == null ? Integer.MIN_VALUE : holder.getPos().z);
+        });
         PendingNoiseTask task = new PendingNoiseTask(
                 originalOperation, proxy, isDependencyUnlock, map, holder,
                 dimension, generation, dimensionGeneration, registration, traceTaskId);
@@ -487,11 +518,12 @@ public final class ChunkScheduler {
             if (pendingNoiseTasks.remove(task)) {
                 pendingCount.updateAndGet(v -> Math.max(0, v - 1));
                 proxy.complete(ChunkResult.error("SteadyChunks 调度器生命周期已变化"));
+                // 审查 P1 修复：终态事件只由成功取得终态所有权的路径记录——
+                // remove 失败（drainer 已并发 poll）时不得在此发终态（任务由
+                // drainer 路径最终完成，绑定回调统一发射）；REJECTED 为诊断事件，
+                // 在 remove 之外记录（校验失败本身成立）
             }
             InflightDiagnostics.record(traceTaskId, TaskEventType.REJECTED, dimension,
-                    holder == null ? Integer.MIN_VALUE : holder.getPos().x,
-                    holder == null ? Integer.MIN_VALUE : holder.getPos().z);
-            InflightDiagnostics.record(traceTaskId, TaskEventType.TASK_TERMINAL, dimension,
                     holder == null ? Integer.MIN_VALUE : holder.getPos().x,
                     holder == null ? Integer.MIN_VALUE : holder.getPos().z);
         }
@@ -523,14 +555,17 @@ public final class ChunkScheduler {
             // 路径只需完成 proxy，不再手工 close。
             LifecycleCleanupCoordinator.TaskRegistration registration,
             // 阶段 3：任务追踪 id（-1 = 未启用）
-            long traceTaskId) {
+            long traceTaskId,
+            // 审查 P1 修复：direct/排队路径统一携带真实维度/坐标（此前 direct 传
+            // null/MIN_VALUE，无法把 taskId 对应到 Holder 做 refCount 调查）
+            ResourceKey<Level> traceDimension, int traceChunkX, int traceChunkZ) {
 
         // P1 修复（第 4 轮）：记录 NOISE 在途任务峰值（真实生成测试验证并发上限）。
         int active = inflightCount.incrementAndGet();
         maxActiveNoise.accumulateAndGet(active, Math::max);
         // P1-4 修复（第 6 轮）：总并发峰值 = 受控 + 非受控之和
         updateTotalNoisePeak();
-        InflightDiagnostics.record(traceTaskId, TaskEventType.EXECUTING, null, Integer.MIN_VALUE, Integer.MIN_VALUE);
+        InflightDiagnostics.record(traceTaskId, TaskEventType.EXECUTING, traceDimension, traceChunkX, traceChunkZ);
         CompletableFuture<ChunkResult<ChunkAccess>> future;
         try {
             future = originalOperation.get();
@@ -547,8 +582,12 @@ public final class ChunkScheduler {
             if (proxy == null && registration != null) {
                 registration.close();
             }
-            InflightDiagnostics.record(traceTaskId, TaskEventType.REJECTED, null, Integer.MIN_VALUE, Integer.MIN_VALUE);
-            InflightDiagnostics.record(traceTaskId, TaskEventType.TASK_TERMINAL, null, Integer.MIN_VALUE, Integer.MIN_VALUE);
+            // 审查 P0 修复：REJECTED 后——direct 路径 lease 已手工关闭，终态在此
+            // 发射；排队路径由 proxy.completeExceptionally 触发绑定回调发射
+            InflightDiagnostics.record(traceTaskId, TaskEventType.REJECTED, traceDimension, traceChunkX, traceChunkZ);
+            if (proxy == null) {
+                traceTerminalAfterClose(traceTaskId, traceDimension, traceChunkX, traceChunkZ);
+            }
             requestDrain();
             if (proxy != null) {
                 proxy.completeExceptionally(ex);
@@ -558,16 +597,26 @@ public final class ChunkScheduler {
             failed.completeExceptionally(ex);
             return failed;
         }
-        InflightDiagnostics.record(traceTaskId, TaskEventType.ORIGINAL_RETURNED, null, Integer.MIN_VALUE, Integer.MIN_VALUE);
+        InflightDiagnostics.record(traceTaskId, TaskEventType.ORIGINAL_RETURNED, traceDimension, traceChunkX, traceChunkZ);
 
         // 第 9 轮 P1 修复：注册 lease 与任务终态 Future 统一绑定——排队路径绑定代理
         // Future（此后所有终态路径只需 proxy.complete），direct 路径绑定原 Future。
         // close 严格发生在任务对外可见终态之后（proxy.complete 同步触发绑定回调），
         // 消除"计数已归零但代理未终态"的窗口；幂等 CAS 仍作为最后保护。
+        // 审查 P0 修复：direct 路径无 enqueuePending 绑定——终态事件（REGISTRATION_
+        // CLOSED + STEADY_STAGE_TERMINAL）在 lease 关闭后在此发射；排队路径的事件
+        // 由 enqueuePending 的 proxy 绑定回调发射（此处只 close，避免重复终态）。
         if (registration != null) {
             CompletableFuture<ChunkResult<ChunkAccess>> terminal =
                     proxy != null ? proxy : future;
-            terminal.whenComplete((result, ex) -> registration.close());
+            if (proxy == null) {
+                terminal.whenComplete((result, ex) -> {
+                    registration.close();
+                    traceTerminalAfterClose(traceTaskId, traceDimension, traceChunkX, traceChunkZ);
+                });
+            } else {
+                terminal.whenComplete((result, ex) -> registration.close());
+            }
         }
 
         future.whenComplete((result, ex) -> {
@@ -575,20 +624,23 @@ public final class ChunkScheduler {
             stage.close();
             global.close();
             inflightCount.decrementAndGet();
-            // 阶段 3：终态事件（原版 Future 终态 → 代理终态 → 每 taskId 唯一终态标记）。
-            // 顺序在 proxy.complete 之前：终态事件先于"调用方可观测完成"落账，
-            // 清洁断言/停滞检测不会看到"已 done 但未终态"的窗口。
-            InflightDiagnostics.record(traceTaskId, TaskEventType.ORIGINAL_COMPLETED, null, Integer.MIN_VALUE, Integer.MIN_VALUE);
-            InflightDiagnostics.record(traceTaskId, TaskEventType.PROXY_COMPLETED, null, Integer.MIN_VALUE, Integer.MIN_VALUE);
-            InflightDiagnostics.record(traceTaskId, TaskEventType.TASK_TERMINAL, null, Integer.MIN_VALUE, Integer.MIN_VALUE);
+            // 审查 P0 修复：终态事件拆分与顺序——原 Future 终态 → permit 释放 →
+            // 代理完成尝试 → [proxy.complete 同步触发绑定回调：registration close
+            // + REGISTRATION_CLOSED + STEADY_STAGE_TERMINAL] → 代理终态确认。
+            // STEADY_STAGE_TERMINAL 不早于 registration close（由绑定回调发射）。
+            InflightDiagnostics.record(traceTaskId, TaskEventType.ORIGINAL_COMPLETED, traceDimension, traceChunkX, traceChunkZ);
+            InflightDiagnostics.record(traceTaskId, TaskEventType.PERMITS_RELEASED, traceDimension, traceChunkX, traceChunkZ);
             if (proxy != null) {
                 // 完成代理 Future（完成顺序：先释放 permit，再完成 proxy——
                 // proxy 完成时触发上方绑定回调关闭注册 lease）
+                InflightDiagnostics.record(traceTaskId, TaskEventType.PROXY_COMPLETE_ATTEMPT, traceDimension, traceChunkX, traceChunkZ);
                 if (ex != null) {
                     proxy.completeExceptionally(ex);
                 } else {
                     proxy.complete(result);
                 }
+                // complete 返回后（绑定回调已同步执行：registration close + 终态）
+                InflightDiagnostics.record(traceTaskId, TaskEventType.PROXY_COMPLETED, traceDimension, traceChunkX, traceChunkZ);
             }
             // 尝试唤醒等待队列（P0-1：只发信号，不递归进入 drain）
             requestDrain();
@@ -772,7 +824,9 @@ public final class ChunkScheduler {
                     return;
                 }
                 executeOriginal(ChunkStatus.NOISE, task.operation(), task.proxy(), global, stage,
-                        task.registration(), task.traceTaskId());
+                        task.registration(), task.traceTaskId(), task.dimension(),
+                        task.holder() == null ? Integer.MIN_VALUE : task.holder().getPos().x,
+                        task.holder() == null ? Integer.MIN_VALUE : task.holder().getPos().z);
             });
         } catch (RejectedExecutionException exception) {
             // P0-1 修复（第 6 轮）：预期的生命周期拒绝（mailbox 停止接收）→ error result 正常完成。
@@ -831,18 +885,27 @@ public final class ChunkScheduler {
     }
 
     // ---- 阶段 3：在途任务追踪辅助（值类型事件，无强引用） ----
+    // 审查 P0 修复：STEADY_STAGE_TERMINAL 只由 registration close 绑定回调发射
+    // （queued：enqueuePending proxy 绑定；direct/fail-open：原 Future 绑定或
+    // 手工 close 路径）——本组辅助方法只记录过程事件；拒绝/取消/恢复路径经
+    // proxy.complete 汇聚到绑定回调统一发终态（每 taskId 唯一）。
     private static void traceRejected(PendingNoiseTask task) {
         int x = task.holder() == null ? Integer.MIN_VALUE : task.holder().getPos().x;
         int z = task.holder() == null ? Integer.MIN_VALUE : task.holder().getPos().z;
         InflightDiagnostics.record(task.traceTaskId(), TaskEventType.REJECTED, task.dimension(), x, z);
-        InflightDiagnostics.record(task.traceTaskId(), TaskEventType.TASK_TERMINAL, task.dimension(), x, z);
     }
 
     private static void traceCancelled(PendingNoiseTask task, TaskEventType type) {
         int x = task.holder() == null ? Integer.MIN_VALUE : task.holder().getPos().x;
         int z = task.holder() == null ? Integer.MIN_VALUE : task.holder().getPos().z;
         InflightDiagnostics.record(task.traceTaskId(), type, task.dimension(), x, z);
-        InflightDiagnostics.record(task.traceTaskId(), TaskEventType.TASK_TERMINAL, task.dimension(), x, z);
+    }
+
+    /** 终态事件：REGISTRATION_CLOSED + STEADY_STAGE_TERMINAL——只在 lease 关闭后调用。 */
+    private static void traceTerminalAfterClose(long traceTaskId, ResourceKey<Level> dimension,
+            int chunkX, int chunkZ) {
+        InflightDiagnostics.record(traceTaskId, TaskEventType.REGISTRATION_CLOSED, dimension, chunkX, chunkZ);
+        InflightDiagnostics.record(traceTaskId, TaskEventType.STEADY_STAGE_TERMINAL, dimension, chunkX, chunkZ);
     }
 
     /**
@@ -1136,7 +1199,6 @@ public final class ChunkScheduler {
         int x = task.holder() == null ? Integer.MIN_VALUE : task.holder().getPos().x;
         int z = task.holder() == null ? Integer.MIN_VALUE : task.holder().getPos().z;
         InflightDiagnostics.record(task.traceTaskId(), TaskEventType.RECOVERY_COMPLETED, task.dimension(), x, z);
-        InflightDiagnostics.record(task.traceTaskId(), TaskEventType.TASK_TERMINAL, task.dimension(), x, z);
     }
 
     /**
@@ -1146,12 +1208,25 @@ public final class ChunkScheduler {
      * 可能已摘除批次（此时无任务可处置）——捕获到的任务必须回退队列，
      * 由停服的 closeForShutdown 兜底清理（或新 Watchdog 重新恢复），不得遗弃。
      * proxy 未完成、lease 未关闭，与普通等待任务语义一致。
+     * <p>
+     * 审查 P0-1 修复：回退前逐任务完整生命周期校验——capture 期间若
+     * closeForShutdown/resetForReload 已执行（accepting=false、全局/维度代数
+     * 已递增），重新入队会产生停服后的孤儿 proxy（队列无人消费）。
+     * 无效任务直接 error 完成（proxy 终态绑定自动关闭 lease），与
+     * {@link #completeLifecycleRejected} 同语义。
      */
     public void requeueRecoveryBatch(RecoveryBatch batch) {
         for (PendingNoiseTask t : batch.tasks()) {
+            if (!acceptingTasks.get() || !lifecycleValid(t)) {
+                // 停服/换代后不得重新入队：error 完成（不触发 fatal）
+                t.proxy().complete(ChunkResult.error("SteadyChunks 调度器已关闭，恢复批次任务无法重新入队"));
+                traceRejected(t);
+                continue;
+            }
             pendingNoiseTasks.offer(t);
             pendingCount.incrementAndGet();
         }
+        requestDrain();
     }
 
     /** 批次内所有任务的代理 Future 是否全部终态（Watchdog 批次状态机用）。 */
@@ -1162,6 +1237,21 @@ public final class ChunkScheduler {
             }
         }
         return true;
+    }
+
+    /**
+     * 审查 P0-4 修复：批次全部 proxy 终态的 Future（停服批次生命周期用）。
+     * <p>
+     * 批次移除必须绑定所有 proxy 的终态，而非"谁成功调用了 complete"——
+     * mailbox 抢先完成时 complete 返回 false、完成回调不触发；部分 emergency
+     * 完成、其余由 mailbox 稍后完成时同样无人再检查。allOf 挂到全部终态，
+     * 无论谁完成必然触发；空批次立即完成。
+     */
+    public CompletableFuture<Void> recoveryBatchAllDoneFuture(RecoveryBatch batch) {
+        CompletableFuture<?>[] proxies = batch.tasks().stream()
+                .map(t -> (CompletableFuture<?>) t.proxy())
+                .toArray(CompletableFuture[]::new);
+        return CompletableFuture.allOf(proxies);
     }
 
     /**
