@@ -1,4 +1,4 @@
-# 阶段 5：GameTest 整夜 soak 运行器（默认 50 轮，失败证据采集）。
+﻿# 阶段 5：GameTest 整夜 soak 运行器（默认 50 轮，失败证据采集）。
 # 用法（原路径 + 默认 gradle 缓存）：
 #   powershell -ExecutionPolicy Bypass -File tools/run-gametest-soak.ps1 [-Rounds 50] [-OutDir artifacts/soak]
 #
@@ -116,9 +116,9 @@ for ($i = 1; $i -le $Rounds; $i++) {
     # 5. 终止本轮服务器进程树（按 PID；仅本轮）
     if ($serverPid) {
         Stop-Process -Id $serverPid -Force -ErrorAction SilentlyContinue
-        Write-Host "round $i: $result (stopped server PID $serverPid)"
+        Write-Host "round ${i}: $result (stopped server PID $serverPid)"
     } else {
-        Write-Host "round $i: $result (no server java found)"
+        Write-Host "round ${i}: $result (no server java found)"
     }
 
     # 结果登记 + 连过统计

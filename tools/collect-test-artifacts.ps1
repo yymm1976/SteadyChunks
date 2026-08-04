@@ -1,4 +1,4 @@
-# 阶段 5：GameTest 失败证据采集助手（soak 运行器每轮调用；也可独立使用）。
+﻿# 阶段 5：GameTest 失败证据采集助手（soak 运行器每轮调用；也可独立使用）。
 # 顺序遵循 /goal 约束：日志 → jstack → PID/命令行 → state → （终止由调用方执行）。
 # 用法：
 #   powershell -ExecutionPolicy Bypass -File tools/collect-test-artifacts.ps1 `
