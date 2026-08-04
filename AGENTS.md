@@ -1,6 +1,6 @@
 # SteadyChunks — Agent 交接文档
 
-> 最后更新：2026-08-04（第 14 轮 6 阶段**全部完成**：分支 `overnight/round14-inflight-diagnostics`，HEAD `5fce083`）。
+> 最后更新：2026-08-04（第 14 轮 6 阶段完成 + 审查第 2 轮修复：分支 `overnight/round14-inflight-diagnostics`，HEAD `0f73ffa`，已推送 origin）。
 > 本文档用于跨 Harness 迁移交接，接手后先读此文件再动手。
 
 ## 1. 项目速览
@@ -48,6 +48,7 @@ Remove-Item -Recurse -Force "run-server\world"; Remove-Item -Force "run-server\l
 | 0010ab9 / d21d196 / 5fcddf7 / f872c7f | 阶段 5a：soak 三件套 + 3 个工具修复（UTF-8 BOM / `-Dfml.modFolders` 精确 PID / null 日志保护） |
 | fbd2797 | 阶段 5b/5c：soak 50 轮结果摘要（21 PASS / 29 STALL / 0 FAIL，42%，全纯原版卡死栈） |
 | 5fce083 | 阶段 5c：AGENTS.md 更新至第 14 轮完成态 |
+| 0f73ffa | 审查第 2 轮修复（9 项，已推送）：P0-1 requeue offer 后二次生命周期校验+测试 requeueMustNotPublishAfterShutdownClear；P0-2 soak 脚本按仓库作用域落地（Test-IsRepoJava/Wait-ProcessGone/Stop-ProcessTree/旧日志前置）+ 两脚本判定串改 `All [0-9]+ required tests passed`（31 测试）；提交线程 phase 回退防护 + 滞留指标；submitRecoveryBatch 每任务 isDone 跳过；环形缓冲零分配 + publishedSequences 防撕裂；逐出 rememberTerminated + 有界 FIFO 记忆；IncidentRecorder 计数（Submitted/Written/Dropped/WriteFailed）|
 
 - **未跟踪**（不入库）：`.reasonix/`、`reasonix.toml`、`artifacts/tool-review/`；证据目录 `artifacts/round14-stalls/`（227MB）、`artifacts/soak/`（177MB）已 gitignore，磁盘保留
 - **待办**：① 重试 `git push origin overnight/round14-inflight-diagnostics`；② 是否 merge 到 main 由用户决定（目标规定"不 merge main，仅推送分支"）。
@@ -58,7 +59,7 @@ Remove-Item -Recurse -Force "run-server\world"; Remove-Item -Force "run-server\l
 - `gametest/SchedulerGameTestFixture.java`：`resetGlobalState()`（统一清理：钩子→停恢复线程→clearAll→unpause→**重试风暴排空**→复位）、`assertCleanState()`（清洁断言）、辅助方法（obtainHolder/waitForQueueDrain/awaitTrue）。
 - **关键机制（重试风暴）**：clearAll 的 error 完成会让原版立即批量重试真实生成任务（12ms 内 ~150 个重新入队）；若测试随后暂停准入，风暴任务涌入队列破坏精确计数断言。fixture 在清理末尾启用调度器并等待队列排空（先等到达再等排空，不用固定 sleep）。
 - **失败隔离**：每个测试首语句注入 `resetGlobalState()`（GameTest 无 before/after 钩子；上一测试断言失败中途中止的残留由下一测试接管清理）。
-- 测试拆分：`SchedulerAdmissionGameTest`（8）/ `SchedulerLifecycleGameTest`（9）/ `WatchdogRecoveryGameTest`（12）/ `WorldgenIntegrationGameTest`（1）= 30 测试。
+- 测试拆分：`SchedulerAdmissionGameTest`（8）/ `SchedulerLifecycleGameTest`（9）/ `WatchdogRecoveryGameTest`（12+1=13，含 requeueMustNotPublishAfterShutdownClear）/ `WorldgenIntegrationGameTest`（1）= 31 测试。
 - **结构文件按类名绑定**：NeoForge 结构名 = `{holder}:{类名小写}.{template}` → 每个测试类需要 `data/steadychunks/structure/{类名小写}.empty.nbt`。
 - 拆分工具：`tools/split-gametests.py`（javadoc 回溯只收集紧邻块，防越界吞前方法）+ `tools/append-fixture-delegates.py`（幂等检查必须用委托块标记，不能用 resetGlobalState 字样——注入语句也含该字符串）。
 
