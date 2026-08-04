@@ -54,6 +54,7 @@ public final class SchedulerGameTestFixture {
         wd.setPreCaptureProbe(null);
         scheduler.setResumeExecutorOverride(null);
         scheduler.setEnqueueProbeHook(null);
+        scheduler.setRequeueProbeHook(null);
         // 2. 停恢复线程（含停服批次异步处置收尾）
         wd.stopRecoveryThread();
         // 3. 先清队列（error 完成所有等待任务 → 终态 → lease/permit 释放）
@@ -138,7 +139,8 @@ public final class SchedulerGameTestFixture {
         if (coordinator.globalTaskCount() != 0) {
             throw new GameTestAssertException("清洁状态失败: lifecycle activeTasks=" + coordinator.globalTaskCount());
         }
-        if (scheduler.resumeExecutorOverride() != null || scheduler.enqueueProbeHook() != null) {
+        if (scheduler.resumeExecutorOverride() != null || scheduler.enqueueProbeHook() != null
+                || scheduler.requeueProbeHook() != null) {
             throw new GameTestAssertException("清洁状态失败: 测试钩子未清空");
         }
         if (wd.isStallCheckIgnorePausedForTest() || wd.preCaptureProbe() != null) {

@@ -26,8 +26,21 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $results = @()
 $incidentsTotal = 0
 
-# ---- 预清理：记录并终止残留 java（仅记录 PID/命令行，不用 taskkill /IM） ----
-$stale = Get-CimInstance Win32_Process -Filter "Name='java.exe'" -ErrorAction SilentlyContinue
+# ---- 审查 P0-2：只处理本仓库相关的 java（禁止全局终止） ----
+function Test-IsRepoJava {
+    param($Process)
+    if (-not $Process -or -not $Process.CommandLine) {
+        return $false
+    }
+    return $Process.CommandLine.IndexOf(
+        $Repo,
+        [System.StringComparison]::OrdinalIgnoreCase
+    ) -ge 0
+}
+
+# 预清理：记录并仅终止命令行含本仓库路径的 java（IDE/其他服务器/用户程序不动）
+$stale = Get-CimInstance Win32_Process -Filter "Name='java.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { Test-IsRepoJava $_ }
 $staleNote = @()
 foreach ($p in $stale) {
     $staleNote += "stale java PID=$($p.ProcessId) cmd=$($p.CommandLine)"
@@ -35,18 +48,59 @@ foreach ($p in $stale) {
 }
 if ($staleNote.Count -gt 0) {
     $staleNote | Set-Content "$OutDir\pre-cleanup-stale.txt"
-    Write-Host "预清理残留 java $($staleNote.Count) 个（记录于 pre-cleanup-stale.txt）"
+    Write-Host "预清理本仓库相关 java $($staleNote.Count) 个（仅限命令行含仓库路径者）"
 }
 
-# 精确识别本服务器 java（命令行含 forgeserverdev，避免误杀 gradle daemon）
+# 精确识别本服务器 java（命令行含本仓库路径 且 -Dfml.modFolders）
 function Get-ServerJavaPid {
     $procs = Get-CimInstance Win32_Process -Filter "Name='java.exe'" -ErrorAction SilentlyContinue
     foreach ($p in $procs) {
-        if ($p.CommandLine -match "-Dfml.modFolders") {
+        if ((Test-IsRepoJava $p) -and $p.CommandLine -match "-Dfml\.modFolders") {
             return $p.ProcessId
         }
     }
     return $null
+}
+
+# 审查 P1：以根 PID 递归收集后代并逆序终止（先子后父）；只终止命令行含仓库
+# 路径的 java 与非 java wrapper——gradle daemon（全局复用）不在仓库路径内，不误杀。
+function Stop-ProcessTree {
+    param([int]$RootPid)
+    $all = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+    $children = @{}
+    foreach ($p in $all) {
+        if ($p.ParentProcessId -gt 0) {
+            if (-not $children.ContainsKey($p.ParentProcessId)) { $children[$p.ParentProcessId] = @() }
+            $children[$p.ParentProcessId] += $p.ProcessId
+        }
+    }
+    $toKill = @()
+    $queue = @($RootPid)
+    while ($queue.Count -gt 0) {
+        $cur = $queue[0]
+        $queue = $queue[1..($queue.Count - 1)]
+        if (-not $cur) { continue }
+        $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$cur" -ErrorAction SilentlyContinue
+        $isJava = $proc -and $proc.Name -eq "java.exe"
+        if (-not $isJava -or (Test-IsRepoJava $proc)) {
+            $toKill += $cur
+        }
+        if ($children.ContainsKey($cur)) { $queue += $children[$cur] }
+    }
+    for ($k = $toKill.Count - 1; $k -ge 0; $k--) {
+        Stop-Process -Id $toKill[$k] -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# 等待进程退出（审查 P1：跨轮确认整棵进程树退出，避免 world/log 锁与 PID 误识别）
+function Wait-ProcessGone {
+    param([int]$Pid, [int]$Seconds = 10)
+    for ($t = 0; $t -lt $Seconds; $t++) {
+        $p = Get-Process -Id $Pid -ErrorAction SilentlyContinue
+        if (-not $p) { return $true }
+        Start-Sleep -Seconds 1
+    }
+    return $false
 }
 
 $passStreak = 0
@@ -61,21 +115,23 @@ for ($i = 1; $i -le $Rounds; $i++) {
     Remove-Item -Force "$Repo\run-server\logs\latest.log" -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force "$Repo\run-server\steadychunks-incidents" -ErrorAction SilentlyContinue
 
+    # 审查 P0-2：旧日志删除成功与否必须在 Start-Process 之前确认——残留日志
+    # 可能含旧 PASS 标记制造假结果；删除失败 → INFRA_FAILURE，不启动服务器
+    $result = "TIMEOUT"
+    if (Test-Path "$Repo\run-server\logs\latest.log") {
+        $result = "INFRA_FAILURE"
+        Write-Host "round ${i}: INFRA_FAILURE (latest.log 删除失败，可能残留旧 PASS 标记)"
+    }
+
+    if ($result -ne "INFRA_FAILURE") {
     # 启动服务器（后台），记录包装 PID
     $wrapper = Start-Process -FilePath "powershell" -ArgumentList @(
         "-NoProfile", "-Command",
         "Set-Location '$Repo'; `$env:PATH += ';C:\Users\杨铭\bin'; rtk err gradlew runGameTestServer"
     ) -PassThru -RedirectStandardOutput "$roundDir\run.out" -RedirectStandardError "$roundDir\run.err"
 
-    $result = "TIMEOUT"
     $prevBatches = -1
     $roundStartUtc = (Get-Date).ToUniversalTime()
-    # 审查 P0：旧日志删除失败 → INFRA_FAILURE——残留日志可能含旧 PASS 标记
-    # 制造假结果；本轮标记基础设施失败，不启动服务器（时间戳防护兜底）
-    if (Test-Path "$Repoun-server\logs\latest.log") {
-        $result = "INFRA_FAILURE"
-        Write-Host "round ${i}: INFRA_FAILURE (latest.log 删除失败，可能残留旧 PASS 标记)"
-    }
     $stallStreak = 0
     for ($t = 0; $t -lt $PollMax -and $result -eq "TIMEOUT"; $t++) {
         Start-Sleep -Seconds $PollSeconds
@@ -87,7 +143,7 @@ for ($i = 1; $i -le $Rounds; $i++) {
             # （删除失败残留的旧日志含 PASS 标记时，时间戳校验拒绝接受）
             $logWrite = (Get-Item $log -ErrorAction SilentlyContinue).LastWriteTimeUtc
             $fresh = $logWrite -and $logWrite -ge $roundStartUtc
-            if ($fresh -and $content -match "All 30 required tests passed") { $result = "PASS"; break }
+            if ($fresh -and $content -match "All \d+ required tests passed") { $result = "PASS"; break }
             if ($fresh -and $content -match "failed at") { $result = "FAIL"; break }
             $batches = ([regex]::Matches($content, "Running test batch")).Count
             if ($batches -eq $prevBatches) { $stallStreak++ } else { $stallStreak = 0 }
@@ -95,6 +151,7 @@ for ($i = 1; $i -le $Rounds; $i++) {
             if ($stallStreak -ge $StallStreakMax) { $result = "STALL"; break }
         }
         # wrapper 死亡不中断轮询（gradle daemon 先退而服务器子进程继续跑的已知现象）
+    }
     }
 
     # ---- 证据采集（顺序遵循约束：日志 → jstack → PID/命令行 → state → 终止） ----
@@ -128,7 +185,6 @@ for ($i = 1; $i -le $Rounds; $i++) {
     # 5. 终止本轮进程树（审查 P1：以 wrapper 为根递归；服务器 java 按
     #    PID 先终止；仅终止命令行含仓库路径的 java——gradle daemon 不误杀）
     if ($serverPid) {
-        Stop-Process -Id $serverPid -Force -ErrorAction SilentlyContinue
         $exited = Wait-ProcessGone -Pid $serverPid
         if (-not $exited) {
             Add-Content "$roundDir\state.txt" "serverNotExited=true"
@@ -143,12 +199,6 @@ for ($i = 1; $i -le $Rounds; $i++) {
     if ($wrapper -and -not $wrapper.HasExited) {
         Stop-ProcessTree -RootPid $wrapper.Id
         $wrapper.WaitForExit(15000) | Out-Null
-    }
-    if ($serverPid) {
-        Stop-Process -Id $serverPid -Force -ErrorAction SilentlyContinue
-        Write-Host "round ${i}: $result (stopped server PID $serverPid)"
-    } else {
-        Write-Host "round ${i}: $result (no server java found)"
     }
 
     # 结果登记 + 连过统计

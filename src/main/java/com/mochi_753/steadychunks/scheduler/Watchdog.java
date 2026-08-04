@@ -160,6 +160,14 @@ public final class Watchdog {
      * （正确性测试仍断言运行期指标为 0）。
      */
     private final AtomicLong totalUnsafeShutdownRecoveries = new AtomicLong(0);
+    // ---- 审查 P1（第 2 轮）修复：提交线程滞留可观测性 ----
+    /** 提交线程累计启动次数 */
+    private final AtomicLong recoverySubmitterStarted = new AtomicLong(0);
+    /** 提交线程累计正常返回次数 */
+    private final AtomicLong recoverySubmitterReturned = new AtomicLong(0);
+    /** 活动提交线程的开始时间戳（nanos），用于最老滞留时长与滞留计数 */
+    private final java.util.concurrent.ConcurrentLinkedQueue<Long> recoverySubmitterAges =
+            new java.util.concurrent.ConcurrentLinkedQueue<>();
 
     /** 是否存在活动恢复批次（第 12 轮 P1：GameTest 状态机断言用）。 */
     public synchronized boolean hasActiveRecoveryBatch() {
@@ -193,6 +201,9 @@ public final class Watchdog {
         totalRecoveries.set(0);
         totalUnsafeRecoveries.set(0);
         totalUnsafeShutdownRecoveries.set(0);
+        recoverySubmitterStarted.set(0);
+        recoverySubmitterReturned.set(0);
+        recoverySubmitterAges.clear();
     }
 
     /**
@@ -349,6 +360,24 @@ public final class Watchdog {
 
     /** UNSAFE_EMERGENCY 直接完成次数（正确性测试必须为 0） */
     public long totalUnsafeRecoveries() { return totalUnsafeRecoveries.get(); }
+
+    // ---- 审查 P1（第 2 轮）修复：提交线程滞留指标（诊断用，供事故快照/测试断言） ----
+    /** 提交线程累计启动次数 */
+    public long recoverySubmitterStarted() { return recoverySubmitterStarted.get(); }
+    /** 提交线程累计正常返回次数 */
+    public long recoverySubmitterReturned() { return recoverySubmitterReturned.get(); }
+    /** 当前滞留（活动）的提交线程数——execute 永久阻塞时 >0 且持续不降 */
+    public int blockedRecoverySubmitterCount() { return recoverySubmitterAges.size(); }
+    /** 最老滞留提交线程驻留毫秒数（无滞留时 -1） */
+    public long oldestRecoverySubmitterAgeMs() {
+        long oldest = Long.MAX_VALUE;
+        for (Long t : recoverySubmitterAges) {
+            if (t < oldest) {
+                oldest = t;
+            }
+        }
+        return oldest == Long.MAX_VALUE ? -1 : (System.nanoTime() - oldest) / 1_000_000;
+    }
 
     /**
      * 第 11 轮 P0 修复：批次状态机 + drain 停滞检测。
@@ -535,21 +564,38 @@ public final class Watchdog {
             //      Runnable 强引用整批）；独立虚拟线程 + 迟到检查（批次已全终态
             //      或已换代则跳过提交，旧批次不得迟到执行 mailbox 提交） ----
             Thread.ofVirtual().name("SteadyChunks-RecoverySubmitter-" + captured.id()).start(() -> {
-                // 迟到提交保护：批次已全部终态（第二级/停服已处置）则跳过
-                if (scheduler.recoveryBatchAllDone(captured)) {
-                    return;
-                }
-                int rejected = scheduler.submitRecoveryBatch(captured);
-                synchronized (Watchdog.this) {
-                    ActiveRecovery ar = activeRecovery;
-                    if (ar != null && ar.batch == captured) {
-                        totalUnsafeRecoveries.addAndGet(rejected);
-                        ar.phase = RecoveryPhase.WAITING_MAILBOX;
-                    } else {
-                        // 停服已处置（stop 分派 emergency 完成覆盖全部任务，
-                        // rejected 实际为 0——P2：complete 返回 false 不计数）
-                        totalUnsafeShutdownRecoveries.addAndGet(rejected);
+                // 审查 P1（第 2 轮）修复：提交线程滞留可观测性——started/returned
+                // 累计、活动集合计滞留数与最老驻留时长；execute 阻塞时唯一可靠
+                // 暴露点是这些指标（与在途停滞检测互补）
+                long submitStartNanos = System.nanoTime();
+                recoverySubmitterStarted.incrementAndGet();
+                recoverySubmitterAges.add(submitStartNanos);
+                try {
+                    // 迟到提交保护：批次已全部终态（第二级/停服已处置）则跳过
+                    if (scheduler.recoveryBatchAllDone(captured)) {
+                        return;
                     }
+                    int rejected = scheduler.submitRecoveryBatch(captured);
+                    synchronized (Watchdog.this) {
+                        ActiveRecovery ar = activeRecovery;
+                        if (ar != null && ar.batch == captured) {
+                            totalUnsafeRecoveries.addAndGet(rejected);
+                            // 审查 P1（第 2 轮）修复：phase 不得回退——提交线程
+                            // 迟到运行时第二级可能已置 ESCALATING、甚至全部终态
+                            // 置 DONE；仅当仍处于提交阶段（MAILBOX_SUBMITTING）
+                            // 才推进到 WAITING_MAILBOX，避免状态机倒退
+                            if (ar.phase == RecoveryPhase.MAILBOX_SUBMITTING) {
+                                ar.phase = RecoveryPhase.WAITING_MAILBOX;
+                            }
+                        } else {
+                            // 停服已处置（stop 分派 emergency 完成覆盖全部任务，
+                            // rejected 实际为 0——P2：complete 返回 false 不计数）
+                            totalUnsafeShutdownRecoveries.addAndGet(rejected);
+                        }
+                    }
+                } finally {
+                    recoverySubmitterAges.remove(submitStartNanos);
+                    recoverySubmitterReturned.incrementAndGet();
                 }
             });
             SteadyChunks.LOGGER.warn(

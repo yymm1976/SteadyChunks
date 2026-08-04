@@ -44,11 +44,26 @@ public final class IncidentRecorder {
     private static final DateTimeFormatter STAMP = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
     private static final Map<String, Long> LAST_RECORDED = new ConcurrentHashMap<>();
 
+    // ---- 审查 P1（第 2 轮）修复：丢弃可观测性——提交/落盘/丢弃/失败计数，
+    //      快照被限流或队列丢掉的量可量化（诊断路径的完整性本身可诊断） ----
+    /** 通过限流并提交 writer 的快照数 */
+    private static final java.util.concurrent.atomic.AtomicLong incidentSubmitted =
+            new java.util.concurrent.atomic.AtomicLong();
+    /** 完整落盘成功的快照数 */
+    private static final java.util.concurrent.atomic.AtomicLong incidentWritten =
+            new java.util.concurrent.atomic.AtomicLong();
+    /** 被 writer 队列拒绝丢弃的快照数（DiscardPolicy 回调） */
+    private static final java.util.concurrent.atomic.AtomicLong incidentDropped =
+            new java.util.concurrent.atomic.AtomicLong();
+    /** 落盘失败（IO/运行时异常）的快照数 */
+    private static final java.util.concurrent.atomic.AtomicLong incidentWriteFailed =
+            new java.util.concurrent.atomic.AtomicLong();
+
     /**
      * 审查 P1 修复：独立有界诊断 executor——Watchdog 只做限流检查 + 提交，
      * 目录创建/文件写入/线程栈收集全部在 writer 线程执行（慢磁盘或杀软扫描
      * 不再阻塞 supervisor、不推迟二级升级）。队列满时丢弃新快照（快照丢失
-     * 优于阻塞监督线程）。
+     * 优于阻塞监督线程）；丢弃经 {@link #incidentDropped} 计数（可观测）。
      */
     private static final java.util.concurrent.ExecutorService WRITER =
             new java.util.concurrent.ThreadPoolExecutor(
@@ -59,7 +74,13 @@ public final class IncidentRecorder {
                         t.setDaemon(true);
                         return t;
                     },
-                    new java.util.concurrent.ThreadPoolExecutor.DiscardPolicy());
+                    new java.util.concurrent.ThreadPoolExecutor.DiscardPolicy() {
+                        @Override
+                        public void rejectedExecution(Runnable r, java.util.concurrent.ThreadPoolExecutor e) {
+                            incidentDropped.incrementAndGet();
+                            super.rejectedExecution(r, e);
+                        }
+                    });
 
     private IncidentRecorder() {
     }
@@ -120,8 +141,9 @@ public final class IncidentRecorder {
 
     private static void writeIncident(String type, Consumer<StringBuilder> summary) {
         String dirName = LocalDateTime.now().format(STAMP) + "-" + type;
+        incidentSubmitted.incrementAndGet();
         // 审查 P1 修复：数据收集（active/ring/线程栈）与磁盘 I/O 全在 writer
-        // 线程；提交失败（队列满）由 DiscardPolicy 静默丢弃——诊断不阻塞主链路
+        // 线程；提交失败（队列满）由 DiscardPolicy 丢弃并计入 incidentDropped
         WRITER.execute(() -> {
             try {
                 Path dir = BASE.resolve(dirName);
@@ -134,11 +156,28 @@ public final class IncidentRecorder {
                 writeFile(dir.resolve("active-tasks.txt"), dumpActiveTasks());
                 writeFile(dir.resolve("ring-events.txt"), dumpRingEvents());
                 writeFile(dir.resolve("threads.txt"), dumpThreads());
+                incidentWritten.incrementAndGet();
                 SteadyChunks.LOGGER.warn("SteadyChunks 事故快照已写入: {}（只诊断，不自动修复）", dir);
             } catch (IOException | RuntimeException ex) {
+                incidentWriteFailed.incrementAndGet();
                 SteadyChunks.LOGGER.warn("写入事故快照失败: {}", ex.toString());
             }
         });
+    }
+
+    /** 审查 P1（第 2 轮）修复：丢弃可观测性 getter（事故快照/诊断指标用）。 */
+    public static long incidentSubmitted() { return incidentSubmitted.get(); }
+    public static long incidentWritten() { return incidentWritten.get(); }
+    public static long incidentDropped() { return incidentDropped.get(); }
+    public static long incidentWriteFailed() { return incidentWriteFailed.get(); }
+
+    /** 测试/生命周期复位：清限流记忆与计数（GameTest 隔离用）。 */
+    public static void reset() {
+        LAST_RECORDED.clear();
+        incidentSubmitted.set(0);
+        incidentWritten.set(0);
+        incidentDropped.set(0);
+        incidentWriteFailed.set(0);
     }
 
     private static void writeFile(Path path, String content) throws IOException {

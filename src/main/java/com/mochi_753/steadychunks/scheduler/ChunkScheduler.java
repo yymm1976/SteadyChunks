@@ -142,6 +142,9 @@ public final class ChunkScheduler {
     // 入队之前调用（默认 null，生产零开销）。GameTest 用它制造"维度检查后、offer 前
     // cancelDimension"的竞态窗口，验证入队后完整生命周期校验（含维度）。
     private volatile Runnable enqueueProbeHook = null;
+    // 审查 P0-1（第 2 轮）修复：requeue 探针——第一次生命周期校验通过后、
+    // offer 之前执行（复现 check-then-offer 竞态窗口；生产路径恒为 null）
+    private volatile Runnable requeueProbeHook = null;
 
     private final ResourcePermit cpuGeneralPermit;
     private final AtomicInteger inflightCount = new AtomicInteger(0);
@@ -1035,6 +1038,8 @@ public final class ChunkScheduler {
     public void setResumeExecutorOverride(Executor executor) { this.resumeExecutorOverride = executor; }
     // 第 8 轮 P1 修复：测试专用探针（GameTest 制造入队竞态窗口，生产不设置）
     public void setEnqueueProbeHook(Runnable probe) { this.enqueueProbeHook = probe; }
+    /** 测试注入的 requeue 探针（阶段 2：清洁断言用；生产 null）。 */
+    public void setRequeueProbeHook(Runnable probe) { this.requeueProbeHook = probe; }
     /** P1 修复（第 4 轮）：重置测试期诊断计数（GameTest 隔离用） */
     public void resetDiagnostics() {
         mixinInterceptCount.set(0);
@@ -1051,6 +1056,9 @@ public final class ChunkScheduler {
 
     /** 测试注入的入队探针当前值（阶段 2：清洁断言用；生产 null）。 */
     public Runnable enqueueProbeHook() { return enqueueProbeHook; }
+
+    /** 测试注入的 requeue 探针当前值（阶段 2：清洁断言用；生产 null）。 */
+    public Runnable requeueProbeHook() { return requeueProbeHook; }
 
     /**
      * §9.4 服务器关闭或维度卸载时调用：异常完成所有等待任务并清空队列。
@@ -1174,6 +1182,11 @@ public final class ChunkScheduler {
     public int submitRecoveryBatch(RecoveryBatch batch) {
         int rejected = 0;
         for (PendingNoiseTask t : batch.tasks()) {
+            // 审查 P1（第 2 轮）修复：任务已终态（第二级/停服/并发路径已处置）
+            // 则跳过提交——避免迟到提交对已终态任务重复 execute/complete
+            if (t.proxy().isDone()) {
+                continue;
+            }
             try {
                 Executor executor = resumeExecutorOverride != null ? resumeExecutorOverride : t.resumeExecutor();
                 executor.execute(() -> {
@@ -1214,6 +1227,12 @@ public final class ChunkScheduler {
      * 已递增），重新入队会产生停服后的孤儿 proxy（队列无人消费）。
      * 无效任务直接 error 完成（proxy 终态绑定自动关闭 lease），与
      * {@link #completeLifecycleRejected} 同语义。
+     * <p>
+     * 审查 P0-1（第 2 轮）修复：首次校验与 offer 之间仍存在 check-then-offer
+     * 窗口——requeue 通过校验后、offer 前 closeForShutdown 已清空队列并停止
+     * 消费，任务以旧生命周期入队即孤儿。offer 后二次校验（同
+     * {@link #enqueuePending} 模式）：remove 成功者 error 完成；remove 失败
+     * （drainer 已并发 poll）则任务由 drainer 路径完成，不重复 complete。
      */
     public void requeueRecoveryBatch(RecoveryBatch batch) {
         for (PendingNoiseTask t : batch.tasks()) {
@@ -1223,8 +1242,19 @@ public final class ChunkScheduler {
                 traceRejected(t);
                 continue;
             }
+            Runnable probe = requeueProbeHook;
+            if (probe != null) {
+                probe.run();
+            }
             pendingNoiseTasks.offer(t);
             pendingCount.incrementAndGet();
+            if (!lifecycleValid(t)) {
+                if (pendingNoiseTasks.remove(t)) {
+                    pendingCount.updateAndGet(v -> Math.max(0, v - 1));
+                    t.proxy().complete(ChunkResult.error("SteadyChunks 调度器生命周期已变化"));
+                }
+                traceRejected(t);
+            }
         }
         requestDrain();
     }

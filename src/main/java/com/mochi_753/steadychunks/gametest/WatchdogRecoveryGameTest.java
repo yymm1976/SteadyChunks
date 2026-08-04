@@ -913,6 +913,58 @@ public class WatchdogRecoveryGameTest {
         });
     }
 
+    /**
+     * 审查 P0-1（第 2 轮）验证：requeueRecoveryBatch 的 check-then-offer 竞态修复。
+     * <p>
+     * 时序（确定性，经 requeueProbeHook 暂停）：requeue 完成第一次生命周期校验
+     * （通过）→ 探针执行 closeForShutdown（清队列 + 停止接收 + 代数递增；任务尚
+     * 未入队、清队列扫不到）→ 释放 requeue 的 offer → 任务以旧生命周期入队。
+     * 若无 offer 后二次校验，任务将驻留无人消费的队列成为孤儿（pending 恒为 1、
+     * proxy 永不终态、registration 不归零）。修复后：二次校验捕获 → remove 成功
+     * → error 完成 → 终态绑定自动关闭 lease。
+     */
+    @GameTest(template = "empty", batch = "steady_requeue_race", timeoutTicks = 600)
+    public void requeueMustNotPublishAfterShutdownClear(GameTestHelper helper) {
+        SchedulerGameTestFixture.runIsolated(helper, () -> {
+        SchedulerGameTestFixture.resetGlobalState();
+        GenerationChunkHolder holder = obtainHolder(helper);
+        ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
+        ChunkScheduler scheduler = ChunkScheduler.getInstance();
+        LifecycleCleanupCoordinator coordinator = LifecycleCleanupCoordinator.getInstance();
+        scheduler.setEnabled(true);
+        scheduler.setAdmissionPaused(false);
+        scheduler.stageLimiter().setResourceLimit(ResourceType.NOISE_HEAVY, 8);
+        waitForQueueDrain(scheduler);
+
+        // 入队 1 个任务（paused 防并发 drain 抢走）→ 捕获进批次
+        scheduler.setAdmissionPaused(true);
+        CompletableFuture<ChunkResult<ChunkAccess>> queued = scheduler.controlAdmission(
+                ChunkStatus.NOISE, false, map, holder,
+                () -> new CompletableFuture<ChunkResult<ChunkAccess>>());
+        helper.assertTrue(scheduler.pendingCount() == 1, "paused 时任务应入队等待");
+        helper.assertTrue(coordinator.globalTaskCount() == 1, "任务应持有注册 lease");
+        var batch = scheduler.captureRecoveryBatch();
+        helper.assertTrue(scheduler.pendingCount() == 0, "捕获后队列应清空");
+        helper.assertTrue(!queued.isDone(), "捕获不得完成 proxy");
+
+        // 探针精确复现竞态窗口：requeue 第一次校验通过后、offer 前停服
+        scheduler.setRequeueProbeHook(() ->
+                scheduler.closeForShutdown(new IllegalStateException("test shutdown")));
+        scheduler.requeueRecoveryBatch(batch);
+        scheduler.setRequeueProbeHook(null);
+
+        // 断言：任务不得成为孤儿——pending 归零、proxy 终态、registration 归零
+        helper.assertTrue(scheduler.pendingCount() == 0,
+                "requeue 后 pending 必须为 0（不得驻留无人消费的队列，实际=" + scheduler.pendingCount() + "）");
+        awaitTrue(() -> queued.isDone(), "任务 proxy 必须终态");
+        awaitTrue(() -> coordinator.globalTaskCount() == 0, "registration 必须归零");
+
+        // 清理
+        resetScheduler(scheduler);
+        helper.succeed();
+        });
+    }
+
     // ---- 阶段 2：统一 fixture 委托（辅助方法与清理由 SchedulerGameTestFixture 提供） ----
     private static GenerationChunkHolder obtainHolder(GameTestHelper helper) {
         return SchedulerGameTestFixture.obtainHolder(helper);

@@ -23,7 +23,7 @@ for i in $(seq 1 "$MAX_ROUNDS"); do
   for t in $(seq 1 110); do   # 最多 ~550 秒
     sleep 5
     if [ -f run-server/logs/latest.log ]; then
-      if grep -q "All 30 required tests passed" run-server/logs/latest.log; then
+      if grep -qE "All [0-9]+ required tests passed" run-server/logs/latest.log; then
         RESULT="PASS"; break
       fi
       if grep -q "failed at" run-server/logs/latest.log; then

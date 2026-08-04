@@ -24,14 +24,60 @@ public final class InflightTaskRegistry {
     private final ConcurrentHashMap<Long, InflightTaskRecord> active = new ConcurrentHashMap<>();
     private final AtomicLong terminalAnomalies = new AtomicLong();
     /** 审查 P1 修复：被容量逐出的未终态任务集合——后续终态不视为重复异常 */
-    private final java.util.Set<Long> evictedTaskIds = ConcurrentHashMap.newKeySet();
-    /** 审查 P1 修复：容量溢出（逐出）计数——事故快照显示诊断容量是否被击穿 */
+    private final BoundedIdSet evictedTaskIds = new BoundedIdSet(EVICTED_CAP);
+    /** 容量溢出（逐出）计数——事故快照显示诊断容量是否被击穿 */
     private final AtomicLong evictionCount = new AtomicLong();
     /** 审查修复：已终态任务集合（有界）——TERMINAL 之后到达的迟到非终态事件
      * （如 PROXY_COMPLETED 在 STEADY_STAGE_TERMINAL 之后记录）不得把已终态任务
      * 重新激活进活动表（实测：活动表残留 last=PROXY_COMPLETED 永久不消） */
-    private final java.util.Set<Long> terminatedTaskIds = ConcurrentHashMap.newKeySet();
+    private final BoundedIdSet terminatedTaskIds = new BoundedIdSet(TERMINATED_CAP);
     private static final int TERMINATED_CAP = 16384;
+    /** 审查 P1（第 2 轮）修复：逐出记忆容量（被逐出任务数量有界，防泄漏场景无界增长） */
+    private static final int EVICTED_CAP = 16384;
+
+    /**
+     * 有界 FIFO 集合：插入序淘汰 + O(1) 判含（诊断记忆，防无界增长）。
+     * <p>
+     * 审查 P1（第 2 轮）修复：替代粗粒度 clear()（清空使全部已终态任务失忆，
+     * 迟到事件窗口内重新激活）——容量超限时只逐出最旧一个，保留最近记忆。
+     */
+    private static final class BoundedIdSet {
+        private final int capacity;
+        private final java.util.concurrent.ConcurrentLinkedQueue<Long> fifo =
+                new java.util.concurrent.ConcurrentLinkedQueue<>();
+        private final java.util.Set<Long> set = ConcurrentHashMap.newKeySet();
+
+        BoundedIdSet(int capacity) {
+            this.capacity = capacity;
+        }
+
+        void add(long id) {
+            fifo.add(id);
+            set.add(id);
+            // 容量超限逐出最旧（set.size() O(1)；每 add 至多需逐出一个，循环兜底并发）
+            while (set.size() > capacity) {
+                Long oldest = fifo.poll();
+                if (oldest == null) {
+                    break;
+                }
+                set.remove(oldest);
+            }
+        }
+
+        boolean contains(long id) {
+            return set.contains(id);
+        }
+
+        boolean remove(long id) {
+            set.remove(id);
+            return fifo.remove(id);
+        }
+
+        void clear() {
+            fifo.clear();
+            set.clear();
+        }
+    }
 
     public InflightTaskRegistry(TaskTraceRingBuffer ring) {
         this.ring = ring;
@@ -51,7 +97,8 @@ public final class InflightTaskRegistry {
     public void record(long taskId, TaskEventType type, int dimensionId, int chunkX, int chunkZ) {
         long now = System.nanoTime();
         long threadId = Thread.currentThread().threadId();
-        ring.record(new TaskTraceEvent(taskId, type, now, threadId, dimensionId, chunkX, chunkZ));
+        // 审查 P1（第 2 轮）修复：零堆分配——直接传字段入环，不构造 TaskTraceEvent
+        ring.record(taskId, type, now, threadId, dimensionId, chunkX, chunkZ);
 
         if (type == TaskEventType.STEADY_STAGE_TERMINAL) {
             InflightTaskRecord record = active.get(taskId);
@@ -61,12 +108,8 @@ public final class InflightTaskRegistry {
                 record.lastThreadId = threadId;
                 active.remove(taskId);
                 // 审查修复：登记已终态——TERMINAL 之后到达的迟到非终态事件（如
-                // PROXY_COMPLETED）不得重新激活；集合有界，满时清空（保留最近，
-                // 迟到窗口为微秒级，清空安全）
+                // PROXY_COMPLETED）不得重新激活；有界 FIFO，满时逐出最旧
                 terminatedTaskIds.add(taskId);
-                if (terminatedTaskIds.size() > TERMINATED_CAP) {
-                    terminatedTaskIds.clear();
-                }
             } else if (evictedTaskIds.remove(taskId)) {
                 // 审查 P1 修复：任务曾被容量逐出（未终态即出表）——终态正常，
                 // 不视为重复异常；从逐出集合移除（释放跟踪）
@@ -111,6 +154,11 @@ public final class InflightTaskRegistry {
             // 审查 P1 修复：逐出必须显式登记——后续终态不计为重复异常，
             // 事故快照可显示诊断容量被击穿（最老任务恰是最可能真卡住的）
             evictedTaskIds.add(victim);
+            // 审查 P1（第 2 轮）修复：rememberTerminated——被逐出任务的迟到
+            // 非终态事件（EXECUTING/PROXY_COMPLETED 等）不得重新激活进活动表
+            // （同已终态语义：诊断放弃跟踪即视为不再活跃）；其真实终态仍走
+            // evictedTaskIds.remove 分支，不误计重复异常
+            terminatedTaskIds.add(victim);
             evictionCount.incrementAndGet();
         }
     }

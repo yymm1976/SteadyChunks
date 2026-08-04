@@ -1,5 +1,7 @@
 package com.mochi_753.steadychunks.diagnostics.inflight;
 
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
@@ -9,15 +11,22 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>
  * 容量恒定 → 内存有界（primitive 数组，总计约 1.5MB）；满时覆盖最旧事件。
  * <p>
- * 审查 P1 修复：<b>写路径无锁</b>——写入槽位由 {@link #writeSequence} 原子
- * 递增决定（{@code slot = sequence & (CAPACITY-1)}），各事件字段写入独立
- * primitive 数组槽位，不创建堆对象、无监视器争用（worldgen 线程并发写安全，
- * 槽位互不重叠；快照读容忍轻微不一致——诊断数据不要求严格一致）。
+ * 审查 P1 修复：<b>写路径无锁且零堆分配</b>——写入槽位由 {@link #writeSequence}
+ * 原子递增决定（{@code slot = sequence & (CAPACITY-1)}），各事件字段直接写入
+ * 独立 primitive 数组槽位（调用方传字段，不构造事件对象），无监视器争用
+ * （worldgen 线程并发写安全，槽位互不重叠）。
+ * <p>
+ * 审查 P1（第 2 轮）修复：<b>快照撕裂防护</b>——{@link #publishedSequences}
+ * 每槽位发布序号（VarHandle release/acquire 语义）：写路径先置 WRITING_MARKER
+ * 再写字段、最后发布真实序号；读路径读字段前后各取一次发布序号，不一致（写中
+ * 或被覆盖）则跳过该槽位——诊断数据只容忍"缺失"，不容忍"错配字段拼装"。
  */
 public final class TaskTraceRingBuffer {
     /** 固定容量：32768 条事件（阶段 3 规格；2 的幂，槽位用掩码） */
     public static final int CAPACITY = 32768;
     private static final int MASK = CAPACITY - 1;
+    /** 槽位写入中的标记（快照读到该值则跳过；sequence 从 0 起，永不等于 -1） */
+    private static final long WRITING_MARKER = -1L;
 
     private final long[] taskIds = new long[CAPACITY];
     private final long[] nanoTimes = new long[CAPACITY];
@@ -26,22 +35,37 @@ public final class TaskTraceRingBuffer {
     private final int[] dimensionIds = new int[CAPACITY];
     private final int[] chunkXs = new int[CAPACITY];
     private final int[] chunkZs = new int[CAPACITY];
+    /** 每槽位发布序号：= 写入该槽位的 sequence（release 语义，先于字段可见） */
+    private final long[] publishedSequences = new long[CAPACITY];
     /** 总写入序列（含被覆盖的）；槽位 = sequence & MASK */
     private final AtomicLong writeSequence = new AtomicLong();
 
-    public void record(TaskTraceEvent event) {
-        long sequence = writeSequence.getAndIncrement();
-        int slot = (int) (sequence & MASK);
-        taskIds[slot] = event.taskId();
-        nanoTimes[slot] = event.nanoTime();
-        threadIds[slot] = event.threadId();
-        eventTypes[slot] = event.type().ordinal();
-        dimensionIds[slot] = event.dimensionId();
-        chunkXs[slot] = event.chunkX();
-        chunkZs[slot] = event.chunkZ();
+    private static final VarHandle PUBLISHED;
+    static {
+        try {
+            PUBLISHED = MethodHandles.arrayElementVarHandle(long[].class);
+        } catch (Exception e) {
+            throw new ExceptionInInitializerError(e);
+        }
     }
 
-    /** 当前快照（按写入顺序，最旧在前；最多 CAPACITY 条；无锁读，容忍轻微不一致）。 */
+    /** 零堆分配写入：调用方传字段，本方法不构造任何对象。 */
+    public void record(long taskId, TaskEventType type, long nanoTime, long threadId,
+                       int dimensionId, int chunkX, int chunkZ) {
+        long sequence = writeSequence.getAndIncrement();
+        int slot = (int) (sequence & MASK);
+        PUBLISHED.setRelease(publishedSequences, slot, WRITING_MARKER);
+        taskIds[slot] = taskId;
+        nanoTimes[slot] = nanoTime;
+        threadIds[slot] = threadId;
+        eventTypes[slot] = type.ordinal();
+        dimensionIds[slot] = dimensionId;
+        chunkXs[slot] = chunkX;
+        chunkZs[slot] = chunkZ;
+        PUBLISHED.setRelease(publishedSequences, slot, sequence);
+    }
+
+    /** 当前快照（按写入顺序，最旧在前；最多 CAPACITY 条；无锁读，容忍缺失）。 */
     public List<TaskTraceEvent> snapshot() {
         long sequence = writeSequence.get();
         int count = (int) Math.min(sequence, CAPACITY);
@@ -51,14 +75,23 @@ public final class TaskTraceRingBuffer {
         // 已写入（sequence < CAPACITY 时是 0..sequence-1；否则全槽位被环形覆盖过）
         for (long seq = base; seq < base + count; seq++) {
             int slot = (int) (seq & MASK);
-            out.add(new TaskTraceEvent(
-                    taskIds[slot],
-                    TaskEventType.values()[eventTypes[slot]],
-                    nanoTimes[slot],
-                    threadIds[slot],
-                    dimensionIds[slot],
-                    chunkXs[slot],
-                    chunkZs[slot]));
+            // 读前取发布序号：写中（WRITING_MARKER）或已被更高序列覆盖 → 跳过
+            if ((long) PUBLISHED.getAcquire(publishedSequences, slot) != seq) {
+                continue;
+            }
+            long taskId = taskIds[slot];
+            long nanoTime = nanoTimes[slot];
+            long threadId = threadIds[slot];
+            int typeOrdinal = eventTypes[slot];
+            int dimensionId = dimensionIds[slot];
+            int chunkX = chunkXs[slot];
+            int chunkZ = chunkZs[slot];
+            // 读后复查：读字段期间该槽位被覆盖/重写 → 丢弃（防字段错配拼装）
+            if ((long) PUBLISHED.getAcquire(publishedSequences, slot) != seq) {
+                continue;
+            }
+            out.add(new TaskTraceEvent(taskId, TaskEventType.values()[typeOrdinal],
+                    nanoTime, threadId, dimensionId, chunkX, chunkZ));
         }
         return out;
     }
@@ -75,6 +108,9 @@ public final class TaskTraceRingBuffer {
 
     public void clear() {
         writeSequence.set(0);
+        // 发布序号复位为 WRITING_MARKER（非 0）：0 是合法发布序列（首条事件），
+        // 未写槽位必须与任何真实序列可区分，否则快照会读到 clear 后的伪事件
+        java.util.Arrays.fill(publishedSequences, WRITING_MARKER);
         java.util.Arrays.fill(taskIds, 0);
         java.util.Arrays.fill(nanoTimes, 0);
         java.util.Arrays.fill(threadIds, 0);
