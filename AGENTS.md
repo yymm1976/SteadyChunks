@@ -1,6 +1,6 @@
 # SteadyChunks — Agent 交接文档
 
-> 最后更新：2026-08-04（第 14 轮 6 阶段 + 审查第 2/3 轮修复：分支 `overnight/round14-inflight-diagnostics`，分支 HEAD `56a0928`（含 docs 提交）、代码 HEAD `0f73ffa`，已推送 origin）。
+> 最后更新：2026-08-04（第 14 轮 6 阶段 + 审查第 2/3 轮修复：分支 `overnight/round14-inflight-diagnostics`，HEAD `849972c`，已推送 origin）。
 > 本文档用于跨 Harness 迁移交接，接手后先读此文件再动手。
 
 ## 1. 项目速览
@@ -51,7 +51,7 @@ Remove-Item -Recurse -Force "run-server\world"; Remove-Item -Force "run-server\l
 | 0f73ffa | 审查第 2 轮修复（9 项，已推送）：P0-1 requeue offer 后二次生命周期校验+测试 requeueMustNotPublishAfterShutdownClear；P0-2 soak 脚本按仓库作用域落地（Test-IsRepoJava/Wait-ProcessGone/Stop-ProcessTree/旧日志前置）+ 两脚本判定串改 `All [0-9]+ required tests passed`（31 测试）；提交线程 phase 回退防护 + 滞留指标；submitRecoveryBatch 每任务 isDone 跳过；环形缓冲零分配 + publishedSequences 防撕裂；逐出 rememberTerminated + 有界 FIFO 记忆；IncidentRecorder 计数（Submitted/Written/Dropped/WriteFailed）|
 
 - **未跟踪**（不入库）：`.reasonix/`、`reasonix.toml`、`artifacts/tool-review/`；证据目录 `artifacts/round14-stalls/`（227MB）、`artifacts/soak/`（177MB）已 gitignore，磁盘保留
-- **待办**：① 等待第 3 轮审查意见与验证（本轮修复提交 `0f73ffa` 后已有复核意见，下一小提交收尾中）；② 是否 merge 到 main 由用户决定（目标规定"不 merge main，仅推送分支"）。
+- **待办**：① 等待第 3 轮审查意见确认（收尾提交 `849972c` 已推送）；② 是否 merge 到 main 由用户决定（目标规定"不 merge main，仅推送分支"）。
 
 ## 4. 第 14 轮交付内容（阶段 2-4 新增，代码结构）
 
