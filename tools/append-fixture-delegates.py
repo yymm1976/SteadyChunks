@@ -31,9 +31,9 @@ BLOCK = '''
         SchedulerGameTestFixture.awaitTrue(condition, message);
     }
 
-    /** 重置调度器全局状态（统一清理顺序，见 SchedulerGameTestFixture）。 */
+    /** 重置调度器全局状态（统一清理 + 清洁硬断言 + 追踪复位，见 SchedulerGameTestFixture）。 */
     private static void resetScheduler(ChunkScheduler scheduler) {
-        SchedulerGameTestFixture.resetGlobalState();
+        SchedulerGameTestFixture.forceCleanupAfterFailure();
     }
 }
 '''

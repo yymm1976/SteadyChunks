@@ -69,15 +69,26 @@ for ($i = 1; $i -le $Rounds; $i++) {
 
     $result = "TIMEOUT"
     $prevBatches = -1
+    $roundStartUtc = (Get-Date).ToUniversalTime()
+    # 审查 P0：旧日志删除失败 → INFRA_FAILURE——残留日志可能含旧 PASS 标记
+    # 制造假结果；本轮标记基础设施失败，不启动服务器（时间戳防护兜底）
+    if (Test-Path "$Repoun-server\logs\latest.log") {
+        $result = "INFRA_FAILURE"
+        Write-Host "round ${i}: INFRA_FAILURE (latest.log 删除失败，可能残留旧 PASS 标记)"
+    }
     $stallStreak = 0
-    for ($t = 0; $t -lt $PollMax; $t++) {
+    for ($t = 0; $t -lt $PollMax -and $result -eq "TIMEOUT"; $t++) {
         Start-Sleep -Seconds $PollSeconds
         $log = "$Repo\run-server\logs\latest.log"
         if (Test-Path $log) {
             $content = Get-Content $log -Raw -ErrorAction SilentlyContinue
             if ($null -eq $content) { continue }   # 文件被写锁/未就绪：跳过本轮轮询
-            if ($content -match "All 30 required tests passed") { $result = "PASS"; break }
-            if ($content -match "failed at") { $result = "FAIL"; break }
+            # 审查 P0：旧日志假 PASS 防护——latest.log 必须在本轮启动后写入
+            # （删除失败残留的旧日志含 PASS 标记时，时间戳校验拒绝接受）
+            $logWrite = (Get-Item $log -ErrorAction SilentlyContinue).LastWriteTimeUtc
+            $fresh = $logWrite -and $logWrite -ge $roundStartUtc
+            if ($fresh -and $content -match "All 30 required tests passed") { $result = "PASS"; break }
+            if ($fresh -and $content -match "failed at") { $result = "FAIL"; break }
             $batches = ([regex]::Matches($content, "Running test batch")).Count
             if ($batches -eq $prevBatches) { $stallStreak++ } else { $stallStreak = 0 }
             $prevBatches = $batches
@@ -114,7 +125,25 @@ for ($i = 1; $i -le $Rounds; $i++) {
         "time=$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
     )
     $state | Set-Content "$roundDir\state.txt"
-    # 5. 终止本轮服务器进程树（按 PID；仅本轮）
+    # 5. 终止本轮进程树（审查 P1：以 wrapper 为根递归；服务器 java 按
+    #    PID 先终止；仅终止命令行含仓库路径的 java——gradle daemon 不误杀）
+    if ($serverPid) {
+        Stop-Process -Id $serverPid -Force -ErrorAction SilentlyContinue
+        $exited = Wait-ProcessGone -Pid $serverPid
+        if (-not $exited) {
+            Add-Content "$roundDir\state.txt" "serverNotExited=true"
+            Write-Host "round ${i}: $result (server PID $serverPid 未在 10 秒内退出)"
+        } else {
+            Write-Host "round ${i}: $result (stopped server PID $serverPid)"
+        }
+    } else {
+        Write-Host "round ${i}: $result (no server java found)"
+    }
+    # wrapper 树收尾（含残留的 gradle client java——命令行含仓库路径者）
+    if ($wrapper -and -not $wrapper.HasExited) {
+        Stop-ProcessTree -RootPid $wrapper.Id
+        $wrapper.WaitForExit(15000) | Out-Null
+    }
     if ($serverPid) {
         Stop-Process -Id $serverPid -Force -ErrorAction SilentlyContinue
         Write-Host "round ${i}: $result (stopped server PID $serverPid)"

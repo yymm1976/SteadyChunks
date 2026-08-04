@@ -1,6 +1,6 @@
 # SteadyChunks — Agent 交接文档
 
-> 最后更新：2026-08-04（第 14 轮 6 阶段**全部完成**：分支 `overnight/round14-inflight-diagnostics`，HEAD `fbd2797`）。
+> 最后更新：2026-08-04（第 14 轮 6 阶段**全部完成**：分支 `overnight/round14-inflight-diagnostics`，HEAD `5fce083`）。
 > 本文档用于跨 Harness 迁移交接，接手后先读此文件再动手。
 
 ## 1. 项目速览
@@ -8,7 +8,7 @@
 - **项目**：SteadyChunks —— NeoForge 1.21.1 区块调度优化模组（NOISE 阶段准入控制 + 生命周期管理）
 - **modid**：`steadychunks`，包根：`com.mochi_753.steadychunks`
 - **仓库**：本地 `c:\Users\杨铭\Desktop\SteadyChunks`
-- **分支**：`main` = 第 13 轮（721e329，已推送 origin/main）；**`overnight/round14-inflight-diagnostics`** = 第 14 轮全部工作（cdce79d → fbd2797，10 个提交，**待推送**——最后一次 push 尝试时 GitHub 网络不可达，需重试 `git push origin overnight/round14-inflight-diagnostics`）
+- **分支**：`main` = 第 13 轮（721e329，已推送 origin/main）；**`overnight/round14-inflight-diagnostics`** = 第 14 轮全部工作（cdce79d → 5fce083，11 个提交，**已推送 origin**；比较 721e329...5fce083）
 - **构建工具**：Gradle 8.14 + NeoForge 21.1.218（`neo_version=21.1.218`），Java 21，moddev 2.0.139
 
 ## 2. 构建与测试环境（重要，违反会卡死或编译失败）
@@ -23,20 +23,20 @@
 | GameTest（整夜 soak） | `powershell -ExecutionPolicy Bypass -File tools/run-gametest-soak.ps1 -Rounds 50` | 50 轮、失败证据采集、卡死 jstack 分类；结果入 `artifacts/soak/`，解析 `python tools/parse-gametest-results.py artifacts/soak` |
 
 **跑 GameTest 前的环境清理（必须）**：
+（审查修正：按 PID 记录终止，禁止全局终止——与第 14 轮硬约束一致）
 ```powershell
-Get-Process java -ErrorAction SilentlyContinue | Stop-Process -Force
+# 记录并仅终止命令行含本仓库路径的 java（IDE/其他服务器/用户程序不动）
+Get-CimInstance Win32_Process -Filter "Name='java.exe'" | Where-Object { $_.CommandLine -match [regex]::Escape('C:\Users\杨铭\Desktop\SteadyChunks') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
 Remove-Item -Recurse -Force "run-server\world"; Remove-Item -Force "run-server\logs\latest.log"
 ```
-跑完必须再次清 java 进程（残留进程会空转烧 CPU）。gameTestServer 正常结束日志标志：`All 30 required tests passed :)`；卡死标志：批次计数 90 秒不增（soak/loop 自动检测 + jstack 取证）。
+跑完必须再次按上述方式清 java 进程（残留进程会空转烧 CPU）。
 
-**rtk 红线**：`gradlew`/`git status/diff/log`/`grep`/`cat` 一律走 `rtk err` / `rtk git` / `rtk grep` / `rtk read`；`git add/commit/push` 可原样执行。
-
-**注意**：Git 提交/推送需网络；最后一次 push 失败（github.com 443 连接重置），重试即可。
+**注意**：分支已推送 origin；若需再次推送 `git push origin overnight/round14-inflight-diagnostics`。
 
 ## 3. 当前 Git 状态（接手第一步）
 
 - **main**：`721e329`（第 13 轮，origin/main 已同步）
-- **overnight/round14-inflight-diagnostics**（当前工作分支）：第 14 轮 6 阶段全部完成，10 个提交：
+- **overnight/round14-inflight-diagnostics**（当前工作分支）：第 14 轮 6 阶段全部完成，11 个提交：
 
 | 提交 | 内容 |
 |---|---|
@@ -47,8 +47,9 @@ Remove-Item -Recurse -Force "run-server\world"; Remove-Item -Force "run-server\l
 | 1fd0655 | 阶段 4：在途停滞检测（独立 daemon）+ 事故快照（IncidentRecorder，只诊断不自愈）+ 3 连过 |
 | 0010ab9 / d21d196 / 5fcddf7 / f872c7f | 阶段 5a：soak 三件套 + 3 个工具修复（UTF-8 BOM / `-Dfml.modFolders` 精确 PID / null 日志保护） |
 | fbd2797 | 阶段 5b/5c：soak 50 轮结果摘要（21 PASS / 29 STALL / 0 FAIL，42%，全纯原版卡死栈） |
+| 5fce083 | 阶段 5c：AGENTS.md 更新至第 14 轮完成态 |
 
-- **未跟踪**（不入库）：`AGENTS.md`、`.reasonix/`、`reasonix.toml`、`artifacts/round14-stalls/`（227MB 证据，gitignore）、`artifacts/soak/`（177MB 证据，gitignore）、`artifacts/tool-review/`
+- **未跟踪**（不入库）：`.reasonix/`、`reasonix.toml`、`artifacts/tool-review/`；证据目录 `artifacts/round14-stalls/`（227MB）、`artifacts/soak/`（177MB）已 gitignore，磁盘保留
 - **待办**：① 重试 `git push origin overnight/round14-inflight-diagnostics`；② 是否 merge 到 main 由用户决定（目标规定"不 merge main，仅推送分支"）。
 
 ## 4. 第 14 轮交付内容（阶段 2-4 新增，代码结构）
@@ -99,7 +100,7 @@ Remove-Item -Recurse -Force "run-server\world"; Remove-Item -Force "run-server\l
 
 ## 8. 已提交轮次回溯（git log 简读）
 
-- `fbd2797`（第 14 轮 soak 结果）→ `0010ab9`（soak 三件套）→ `1fd0655`（在途检测+事故快照）→ `8db1a6a`（环形缓冲追踪）→ `fe9fa59`（测试隔离拆分）→ `b8d7df0`（恢复监督补完）→ `cdce79d`（工作区保护）→ 分支起点
+- `5fce083`（AGENTS.md 完成态）→ `fbd2797`（soak 结果）→ `0010ab9`（soak 三件套）→ `1fd0655`（在途检测+事故快照）→ `8db1a6a`（环形缓冲追踪）→ `fe9fa59`（测试隔离拆分）→ `b8d7df0`（恢复监督补完）→ `cdce79d`（工作区保护）→ 分支起点
 - `721e329` 第 13 轮（main）：恢复状态机窗口 A/B、注册门顺序、27 测试
 - 更早轮次见 git log（第 1-12 轮已推送 main）
 

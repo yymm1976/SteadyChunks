@@ -127,7 +127,28 @@ for cls, names in GROUPS.items():
         # 首语句接管清理（resetGlobalState 幂等），保证"失败后后续测试仍独立运行"。
         off = sig - start
         slice_lines = slice_lines[:off + 1] + ["        SchedulerGameTestFixture.resetGlobalState();\n"] + slice_lines[off + 1:]
-        body.append("".join(slice_lines))
+        # 审查 P1 修复：测试体包进 runIsolated——同步断言失败中途中止时立即
+        # 清理 + 清洁硬断言（不依赖下一测试兜底）；正常返回不清理（succeedWhen
+        # 异步流程仍进行中，由回调内 resetScheduler 清理并硬断言）。
+        body_lines = []
+        opened = False
+        for idx, ln in enumerate(slice_lines):
+            if not opened and ln.strip().startswith("public void "):
+                # 方法签名行之后立即注入 runIsolated 开启
+                body_lines.append(ln)
+                body_lines.append("        SchedulerGameTestFixture.runIsolated(helper, () -> {\n")
+                opened = True
+                continue
+            body_lines.append(ln)
+        # 方法结束：end 行（方法体 }）替换为 lambda 收尾 + 方法闭合
+        # （原 } 关闭 runIsolated lambda 体，); 关闭调用，再补方法自己的 }）
+        final_lines = []
+        for idx, ln in enumerate(body_lines):
+            if idx == len(body_lines) - 1:
+                final_lines.append("        });\n    }\n")
+            else:
+                final_lines.append(ln)
+        body.append("".join(final_lines))
         body.append("\n")
     content = HEADER.format(imports="".join(imports), desc=DESC[cls], cls=cls) + "".join(body) + "}\n"
     out = OUT_DIR + "\\" + cls + ".java"
