@@ -75,6 +75,7 @@ for ($i = 1; $i -le $Rounds; $i++) {
         $log = "$Repo\run-server\logs\latest.log"
         if (Test-Path $log) {
             $content = Get-Content $log -Raw -ErrorAction SilentlyContinue
+            if ($null -eq $content) { continue }   # 文件被写锁/未就绪：跳过本轮轮询
             if ($content -match "All 30 required tests passed") { $result = "PASS"; break }
             if ($content -match "failed at") { $result = "FAIL"; break }
             $batches = ([regex]::Matches($content, "Running test batch")).Count
