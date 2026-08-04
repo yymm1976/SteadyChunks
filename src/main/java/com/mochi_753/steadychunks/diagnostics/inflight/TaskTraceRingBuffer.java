@@ -49,6 +49,15 @@ public final class TaskTraceRingBuffer {
         }
     }
 
+    /**
+     * 审查 P1（第 3 轮）修复：发布序号数组构造时即复位为 WRITING_MARKER——
+     * 默认全 0 而 0 是首条合法事件的 sequence，首条写入的
+     * getAndIncrement 与写字段之间快照会把全零槽位当成伪事件 0。
+     */
+    public TaskTraceRingBuffer() {
+        java.util.Arrays.fill(publishedSequences, WRITING_MARKER);
+    }
+
     /** 零堆分配写入：调用方传字段，本方法不构造任何对象。 */
     public void record(long taskId, TaskEventType type, long nanoTime, long threadId,
                        int dimensionId, int chunkX, int chunkZ) {

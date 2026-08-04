@@ -142,8 +142,9 @@ public final class ChunkScheduler {
     // 入队之前调用（默认 null，生产零开销）。GameTest 用它制造"维度检查后、offer 前
     // cancelDimension"的竞态窗口，验证入队后完整生命周期校验（含维度）。
     private volatile Runnable enqueueProbeHook = null;
-    // 审查 P0-1（第 2 轮）修复：requeue 探针——第一次生命周期校验通过后、
-    // offer 之前执行（复现 check-then-offer 竞态窗口；生产路径恒为 null）
+    // 审查 P0-1（第 2 轮）修复：requeue 探针——首次生命周期校验通过、计数与
+    // offer 完成后、二次校验之前执行（复现"offer 后被 poll"竞态窗口；生产
+    // 路径恒为 null）
     private volatile Runnable requeueProbeHook = null;
 
     private final ResourcePermit cpuGeneralPermit;
@@ -1233,6 +1234,13 @@ public final class ChunkScheduler {
      * 消费，任务以旧生命周期入队即孤儿。offer 后二次校验（同
      * {@link #enqueuePending} 模式）：remove 成功者 error 完成；remove 失败
      * （drainer 已并发 poll）则任务由 drainer 路径完成，不重复 complete。
+     * <p>
+     * 审查阻断 1（第 3 轮）修复：<b>先计数再发布</b>——旧顺序 offer → increment
+     * 存在计数竞态：本线程 offer 后、increment 前，并发 closeForShutdown poll
+     * 走任务并按当时计数 0 扣减（max(0,-1)），本线程随后 increment 把计数加回 1，
+     * 二次校验 remove 又失败（任务已被取走）→ 任务已终态但 pendingCount 永久
+     * 为 1（幽灵计数）。先 increment 再 offer：poll 者扣减时本线程的 +1 已可见，
+     * 任何时序下计数最终归零。
      */
     public void requeueRecoveryBatch(RecoveryBatch batch) {
         for (PendingNoiseTask t : batch.tasks()) {
@@ -1242,18 +1250,22 @@ public final class ChunkScheduler {
                 traceRejected(t);
                 continue;
             }
+            pendingCount.incrementAndGet();
+            pendingNoiseTasks.offer(t);
             Runnable probe = requeueProbeHook;
             if (probe != null) {
                 probe.run();
             }
-            pendingNoiseTasks.offer(t);
-            pendingCount.incrementAndGet();
             if (!lifecycleValid(t)) {
                 if (pendingNoiseTasks.remove(t)) {
                     pendingCount.updateAndGet(v -> Math.max(0, v - 1));
-                    t.proxy().complete(ChunkResult.error("SteadyChunks 调度器生命周期已变化"));
+                    // 审查（第 3 轮）修复：仅 complete 成功者记录 REJECTED——
+                    // remove 成功但 proxy 已被并发路径（poll 者）完成时不得发
+                    // 终态事件（终态唯一性；poll 者路径已发 CANCELLED）
+                    if (t.proxy().complete(ChunkResult.error("SteadyChunks 调度器生命周期已变化"))) {
+                        traceRejected(t);
+                    }
                 }
-                traceRejected(t);
             }
         }
         requestDrain();

@@ -914,14 +914,15 @@ public class WatchdogRecoveryGameTest {
     }
 
     /**
-     * 审查 P0-1（第 2 轮）验证：requeueRecoveryBatch 的 check-then-offer 竞态修复。
+     * 审查 P0-1（第 2 轮）+ 阻断 1（第 3 轮）验证：requeueRecoveryBatch 的
+     * check-then-offer 竞态修复与计数顺序。
      * <p>
-     * 时序（确定性，经 requeueProbeHook 暂停）：requeue 完成第一次生命周期校验
-     * （通过）→ 探针执行 closeForShutdown（清队列 + 停止接收 + 代数递增；任务尚
-     * 未入队、清队列扫不到）→ 释放 requeue 的 offer → 任务以旧生命周期入队。
-     * 若无 offer 后二次校验，任务将驻留无人消费的队列成为孤儿（pending 恒为 1、
-     * proxy 永不终态、registration 不归零）。修复后：二次校验捕获 → remove 成功
-     * → error 完成 → 终态绑定自动关闭 lease。
+     * 时序（确定性，经 requeueProbeHook 暂停）：requeue 完成第一次生命周期
+     * 校验（通过）→ 计数 +1、任务入队（先计数再发布）→ 探针执行
+     * closeForShutdown（poll 走任务：扣减可见的 +1 → 计数归零，error 完成
+     * proxy）→ 释放 requeue 的二次校验（remove 失败，任务已由停服路径完成）。
+     * 任何窗口下任务不得成为孤儿、计数不得幽灵残留。断言：pending 归零、
+     * proxy 终态、registration 归零、无活动恢复批次。
      */
     @GameTest(template = "empty", batch = "steady_requeue_race", timeoutTicks = 600)
     public void requeueMustNotPublishAfterShutdownClear(GameTestHelper helper) {
@@ -930,6 +931,7 @@ public class WatchdogRecoveryGameTest {
         GenerationChunkHolder holder = obtainHolder(helper);
         ChunkMap map = helper.getLevel().getChunkSource().chunkMap;
         ChunkScheduler scheduler = ChunkScheduler.getInstance();
+        Watchdog wd = Watchdog.getInstance();
         LifecycleCleanupCoordinator coordinator = LifecycleCleanupCoordinator.getInstance();
         scheduler.setEnabled(true);
         scheduler.setAdmissionPaused(false);
@@ -947,17 +949,19 @@ public class WatchdogRecoveryGameTest {
         helper.assertTrue(scheduler.pendingCount() == 0, "捕获后队列应清空");
         helper.assertTrue(!queued.isDone(), "捕获不得完成 proxy");
 
-        // 探针精确复现竞态窗口：requeue 第一次校验通过后、offer 前停服
+        // 探针精确复现竞态窗口：requeue 已先计数再入队、二次校验前停服
+        // （closeForShutdown 会 poll 走任务并扣减计数——旧顺序下此处产生幽灵计数）
         scheduler.setRequeueProbeHook(() ->
                 scheduler.closeForShutdown(new IllegalStateException("test shutdown")));
         scheduler.requeueRecoveryBatch(batch);
         scheduler.setRequeueProbeHook(null);
 
-        // 断言：任务不得成为孤儿——pending 归零、proxy 终态、registration 归零
+        // 断言：任务不得成为孤儿、计数不得幽灵残留
         helper.assertTrue(scheduler.pendingCount() == 0,
-                "requeue 后 pending 必须为 0（不得驻留无人消费的队列，实际=" + scheduler.pendingCount() + "）");
+                "requeue 后 pending 必须为 0（不得幽灵残留，实际=" + scheduler.pendingCount() + "）");
         awaitTrue(() -> queued.isDone(), "任务 proxy 必须终态");
         awaitTrue(() -> coordinator.globalTaskCount() == 0, "registration 必须归零");
+        helper.assertTrue(!wd.hasActiveRecoveryBatch(), "不得遗留活动恢复批次");
 
         // 清理
         resetScheduler(scheduler);

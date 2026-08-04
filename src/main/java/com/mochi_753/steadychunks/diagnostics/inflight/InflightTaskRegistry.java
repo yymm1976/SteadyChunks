@@ -40,6 +40,10 @@ public final class InflightTaskRegistry {
      * <p>
      * 审查 P1（第 2 轮）修复：替代粗粒度 clear()（清空使全部已终态任务失忆，
      * 迟到事件窗口内重新激活）——容量超限时只逐出最旧一个，保留最近记忆。
+     * <p>
+     * 审查 P1（第 3 轮）修复：set 判重后再入 fifo——重复 add 不得产生多个
+     * FIFO 节点（否则淘汰其中一个节点会误删整个 set 成员）；remove 以 set
+     * 是否真实存在为准，FIFO 只是淘汰辅助。
      */
     private static final class BoundedIdSet {
         private final int capacity;
@@ -52,8 +56,12 @@ public final class InflightTaskRegistry {
         }
 
         void add(long id) {
+            // 审查（第 3 轮）修复：set.add 成功（首次加入）才入 FIFO——
+            // 并发重复 add 不得产生重复节点
+            if (!set.add(id)) {
+                return;
+            }
             fifo.add(id);
-            set.add(id);
             // 容量超限逐出最旧（set.size() O(1)；每 add 至多需逐出一个，循环兜底并发）
             while (set.size() > capacity) {
                 Long oldest = fifo.poll();
@@ -69,8 +77,13 @@ public final class InflightTaskRegistry {
         }
 
         boolean remove(long id) {
-            set.remove(id);
-            return fifo.remove(id);
+            // 审查（第 3 轮）修复：以 set 是否真实存在为准；FIFO.remove 只做
+            // 淘汰辅助（O(n) 低频），返回值不用于判定
+            boolean existed = set.remove(id);
+            if (existed) {
+                fifo.remove(id);
+            }
+            return existed;
         }
 
         void clear() {
@@ -127,6 +140,13 @@ public final class InflightTaskRegistry {
         }
 
         InflightTaskRecord record = active.computeIfAbsent(taskId, id -> new InflightTaskRecord(id, now));
+        // 审查（第 3 轮）修复：computeIfAbsent 与终态移除之间的并发窗口——
+        // 终态线程可能刚移除记录，迟到事件随后重新创建；更新后复查终止记忆，
+        // 已终态则条件移除（remove(key, value) 只移除本线程创建的记录）
+        if (terminatedTaskIds.contains(taskId)) {
+            active.remove(taskId, record);
+            return;
+        }
         record.lastType = type;
         record.lastNanos = now;
         record.lastThreadId = threadId;
@@ -149,8 +169,10 @@ public final class InflightTaskRegistry {
                 victim = entry.getKey();
             }
         }
-        if (victim >= 0) {
-            active.remove(victim);
+        // 审查（第 3 轮）修复：remove 返回值检查所有权——并发下任务可能已被
+        // 终态线程移除，只有真正取走才登记逐出（否则把已终态任务误登记为逐出）
+        InflightTaskRecord removed = victim >= 0 ? active.remove(victim) : null;
+        if (removed != null) {
             // 审查 P1 修复：逐出必须显式登记——后续终态不计为重复异常，
             // 事故快照可显示诊断容量被击穿（最老任务恰是最可能真卡住的）
             evictedTaskIds.add(victim);

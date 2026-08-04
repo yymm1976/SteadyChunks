@@ -133,6 +133,13 @@ public final class SchedulerGameTestFixture {
         if (wd.hasActiveRecoveryBatch()) {
             throw new GameTestAssertException("清洁状态失败: activeRecovery 非空");
         }
+        // 审查 P1（第 3 轮）修复：活动提交线程表不随 metrics reset 清空——
+        // 滞留的提交线程（execute 永久阻塞）必须在此被硬断言暴露
+        if (wd.blockedRecoverySubmitterCount() != 0) {
+            throw new GameTestAssertException("清洁状态失败: blockedRecoverySubmitterCount="
+                    + wd.blockedRecoverySubmitterCount()
+                    + " oldestAgeMs=" + wd.oldestRecoverySubmitterAgeMs());
+        }
         if (wd.shutdownBatchCount() != 0) {
             throw new GameTestAssertException("清洁状态失败: shutdownBatchCount=" + wd.shutdownBatchCount());
         }

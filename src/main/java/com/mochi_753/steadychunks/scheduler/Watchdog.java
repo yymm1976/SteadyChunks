@@ -165,9 +165,15 @@ public final class Watchdog {
     private final AtomicLong recoverySubmitterStarted = new AtomicLong(0);
     /** 提交线程累计正常返回次数 */
     private final AtomicLong recoverySubmitterReturned = new AtomicLong(0);
-    /** 活动提交线程的开始时间戳（nanos），用于最老滞留时长与滞留计数 */
-    private final java.util.concurrent.ConcurrentLinkedQueue<Long> recoverySubmitterAges =
-            new java.util.concurrent.ConcurrentLinkedQueue<>();
+    /**
+     * 活动提交线程表（batchId → 开始时间戳 nanos）。
+     * <p>
+     * 审查 P1（第 3 轮）修复：<b>不得随 {@link #resetRecoveryMetrics()} 清空</b>
+     * ——若提交线程仍阻塞而指标被复位，blockedRecoverySubmitterCount 会错误归零、
+     * 真实滞留被 fixture 隐藏。本表只由提交线程 finally 自移除，reset 只清累计值。
+     */
+    private final java.util.concurrent.ConcurrentHashMap<Long, Long> recoverySubmitters =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
     /** 是否存在活动恢复批次（第 12 轮 P1：GameTest 状态机断言用）。 */
     public synchronized boolean hasActiveRecoveryBatch() {
@@ -203,7 +209,8 @@ public final class Watchdog {
         totalUnsafeShutdownRecoveries.set(0);
         recoverySubmitterStarted.set(0);
         recoverySubmitterReturned.set(0);
-        recoverySubmitterAges.clear();
+        // 审查 P1（第 3 轮）修复：不清 recoverySubmitters——活动提交线程表只由
+        // 线程自身 finally 移除；阻塞中提交线程不得被 metrics reset 隐藏
     }
 
     /**
@@ -367,11 +374,11 @@ public final class Watchdog {
     /** 提交线程累计正常返回次数 */
     public long recoverySubmitterReturned() { return recoverySubmitterReturned.get(); }
     /** 当前滞留（活动）的提交线程数——execute 永久阻塞时 >0 且持续不降 */
-    public int blockedRecoverySubmitterCount() { return recoverySubmitterAges.size(); }
+    public int blockedRecoverySubmitterCount() { return recoverySubmitters.size(); }
     /** 最老滞留提交线程驻留毫秒数（无滞留时 -1） */
     public long oldestRecoverySubmitterAgeMs() {
         long oldest = Long.MAX_VALUE;
-        for (Long t : recoverySubmitterAges) {
+        for (Long t : recoverySubmitters.values()) {
             if (t < oldest) {
                 oldest = t;
             }
@@ -565,11 +572,11 @@ public final class Watchdog {
             //      或已换代则跳过提交，旧批次不得迟到执行 mailbox 提交） ----
             Thread.ofVirtual().name("SteadyChunks-RecoverySubmitter-" + captured.id()).start(() -> {
                 // 审查 P1（第 2 轮）修复：提交线程滞留可观测性——started/returned
-                // 累计、活动集合计滞留数与最老驻留时长；execute 阻塞时唯一可靠
+                // 累计、活动表计滞留数与最老驻留时长；execute 阻塞时唯一可靠
                 // 暴露点是这些指标（与在途停滞检测互补）
                 long submitStartNanos = System.nanoTime();
                 recoverySubmitterStarted.incrementAndGet();
-                recoverySubmitterAges.add(submitStartNanos);
+                recoverySubmitters.put(captured.id(), submitStartNanos);
                 try {
                     // 迟到提交保护：批次已全部终态（第二级/停服已处置）则跳过
                     if (scheduler.recoveryBatchAllDone(captured)) {
@@ -594,7 +601,7 @@ public final class Watchdog {
                         }
                     }
                 } finally {
-                    recoverySubmitterAges.remove(submitStartNanos);
+                    recoverySubmitters.remove(captured.id());
                     recoverySubmitterReturned.incrementAndGet();
                 }
             });

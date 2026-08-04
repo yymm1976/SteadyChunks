@@ -75,17 +75,23 @@ function Stop-ProcessTree {
         }
     }
     $toKill = @()
-    $queue = @($RootPid)
+    # 审查阻断 2（第 3 轮）修复：改用真正队列（Queue[int]）——旧实现的
+    # $queue[1..($queue.Count - 1)] 在 Count==1 时求值 1..0 降序范围，把刚
+    # 出队的根 PID 经索引 0 重新放回队首，叶节点反复入队造成无限循环
+    $queue = [System.Collections.Generic.Queue[int]]::new()
+    $queue.Enqueue([int]$RootPid)
     while ($queue.Count -gt 0) {
-        $cur = $queue[0]
-        $queue = $queue[1..($queue.Count - 1)]
-        if (-not $cur) { continue }
+        $cur = $queue.Dequeue()
         $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$cur" -ErrorAction SilentlyContinue
         $isJava = $proc -and $proc.Name -eq "java.exe"
         if (-not $isJava -or (Test-IsRepoJava $proc)) {
             $toKill += $cur
         }
-        if ($children.ContainsKey($cur)) { $queue += $children[$cur] }
+        if ($children.ContainsKey($cur)) {
+            foreach ($child in $children[$cur]) {
+                $queue.Enqueue([int]$child)
+            }
+        }
     }
     for ($k = $toKill.Count - 1; $k -ge 0; $k--) {
         Stop-Process -Id $toKill[$k] -Force -ErrorAction SilentlyContinue
@@ -93,10 +99,15 @@ function Stop-ProcessTree {
 }
 
 # 等待进程退出（审查 P1：跨轮确认整棵进程树退出，避免 world/log 锁与 PID 误识别）
+# 审查阻断 2（第 3 轮）修复：参数改名 $ProcessId——$Pid 与 PowerShell 自动
+# 变量 $PID（当前进程）同名（不区分大小写），参数绑定可能冲突
 function Wait-ProcessGone {
-    param([int]$Pid, [int]$Seconds = 10)
+    param(
+        [int]$ProcessId,
+        [int]$Seconds = 10
+    )
     for ($t = 0; $t -lt $Seconds; $t++) {
-        $p = Get-Process -Id $Pid -ErrorAction SilentlyContinue
+        $p = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
         if (-not $p) { return $true }
         Start-Sleep -Seconds 1
     }
@@ -184,8 +195,11 @@ for ($i = 1; $i -le $Rounds; $i++) {
     $state | Set-Content "$roundDir\state.txt"
     # 5. 终止本轮进程树（审查 P1：以 wrapper 为根递归；服务器 java 按
     #    PID 先终止；仅终止命令行含仓库路径的 java——gradle daemon 不误杀）
+    #    审查阻断 2（第 3 轮）修复：先 Stop-Process 再 Wait——旧实现先干等
+    #    10 秒才依赖 wrapper 树间接终止，强制回收路径形同虚设
     if ($serverPid) {
-        $exited = Wait-ProcessGone -Pid $serverPid
+        Stop-Process -Id $serverPid -Force -ErrorAction SilentlyContinue
+        $exited = Wait-ProcessGone -ProcessId $serverPid -Seconds 10
         if (-not $exited) {
             Add-Content "$roundDir\state.txt" "serverNotExited=true"
             Write-Host "round ${i}: $result (server PID $serverPid 未在 10 秒内退出)"
@@ -199,6 +213,21 @@ for ($i = 1; $i -le $Rounds; $i++) {
     if ($wrapper -and -not $wrapper.HasExited) {
         Stop-ProcessTree -RootPid $wrapper.Id
         $wrapper.WaitForExit(15000) | Out-Null
+    }
+    # 审查阻断 2（第 3 轮）修复：轮末残留扫描——进程树回收后仍有本仓库
+    # java 存活说明回收路径失效，本轮标记 INFRA_FAILURE（工具未验收通过）
+    $remainingRepoJava = Get-CimInstance Win32_Process -Filter "Name='java.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { Test-IsRepoJava $_ }
+    if ($remainingRepoJava) {
+        $result = "INFRA_FAILURE"
+        foreach ($rp in $remainingRepoJava) {
+            Add-Content "$roundDir\state.txt" ("remainingJava=" + $rp.ProcessId)
+        }
+        Write-Host "round ${i}: INFRA_FAILURE (进程树回收后仍残留本仓库 java)"
+        # 残留进程按 PID 记录后终止（不用 taskkill /IM）
+        foreach ($rp in $remainingRepoJava) {
+            Stop-Process -Id $rp.ProcessId -Force -ErrorAction SilentlyContinue
+        }
     }
 
     # 结果登记 + 连过统计
@@ -220,9 +249,10 @@ $pass = ($results | Where-Object { $_ -match "=PASS$" }).Count
 $fail = ($results | Where-Object { $_ -match "=FAIL$" }).Count
 $stall = ($results | Where-Object { $_ -match "=STALL$" }).Count
 $timeout = ($results | Where-Object { $_ -match "=TIMEOUT$" }).Count
+$infra = ($results | Where-Object { $_ -match "=INFRA_FAILURE$" }).Count
 $summary = @(
     "=== SOAK SUMMARY ===",
-    "rounds=$Rounds pass=$pass fail=$fail stall=$stall timeout=$timeout",
+    "rounds=$Rounds pass=$pass fail=$fail stall=$stall timeout=$timeout infra=$infra",
     "passRate=$([math]::Round(100.0 * $pass / $Rounds, 1))% bestStreak=$bestStreak",
     "incidents=$incidentsTotal",
     "results=$($results -join ' ')"
