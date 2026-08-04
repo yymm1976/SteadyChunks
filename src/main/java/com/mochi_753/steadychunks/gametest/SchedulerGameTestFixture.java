@@ -1,5 +1,8 @@
 package com.mochi_753.steadychunks.gametest;
 
+import com.mochi_753.steadychunks.SteadyChunks;
+import com.mochi_753.steadychunks.diagnostics.inflight.InflightDiagnostics;
+import com.mochi_753.steadychunks.diagnostics.inflight.InflightTaskRecord;
 import com.mochi_753.steadychunks.io.LifecycleCleanupCoordinator;
 import com.mochi_753.steadychunks.scheduler.ChunkScheduler;
 import com.mochi_753.steadychunks.scheduler.ResourceType;
@@ -74,6 +77,25 @@ public final class SchedulerGameTestFixture {
         scheduler.setEnabled(false);
         scheduler.resetDiagnostics();
         wd.resetRecoveryMetrics();
+        // 5. 阶段 3 追踪诊断：清理完成后活动任务/终态异常应归零。非零说明有任务
+        //    未走完终态路径（在途泄漏的早期信号）——只告警不阻断（诊断语义，
+        //    避免把环境噪声升级为硬失败；阶段 4 停滞检测会用同一数据出事故快照）。
+        int traceActive = InflightDiagnostics.activeTaskCount();
+        long traceAnomalies = InflightDiagnostics.terminalAnomalyCount();
+        if (traceActive != 0 || traceAnomalies != 0) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("SteadyChunks 追踪诊断: 活动任务=").append(traceActive)
+                    .append(" 终态异常=").append(traceAnomalies);
+            for (InflightTaskRecord r : InflightDiagnostics.activeSnapshot()) {
+                sb.append("\n  taskId=").append(r.taskId)
+                        .append(" last=").append(r.lastType)
+                        .append(" ageMs=").append((System.nanoTime() - r.lastNanos) / 1_000_000)
+                        .append(" thread=").append(r.lastThreadId)
+                        .append(" dim=").append(InflightDiagnostics.dimensionName(r.dimensionId))
+                        .append(" chunk=(").append(r.chunkX).append(',').append(r.chunkZ).append(')');
+            }
+            SteadyChunks.LOGGER.warn(sb.toString());
+        }
     }
 
     /**
