@@ -61,3 +61,6 @@ replay_pid*
 
 # GameTest 卡死证据（原始日志/jstack 不入库，磁盘保留）
 artifacts/round14-stalls/
+
+# soak 原始证据（50 轮日志/jstack/incidents 不入库，磁盘保留）
+artifacts/soak/

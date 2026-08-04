@@ -1,0 +1,536 @@
+{
+ "rounds": [
+  {
+   "round": 1,
+   "result": "PASS",
+   "class": "",
+   "frame": "",
+   "incidents": [
+    "20260804-095046-drain-stall",
+    "20260804-095046-unsafe-escalation"
+   ],
+   "pid": ""
+  },
+  {
+   "round": 2,
+   "result": "PASS",
+   "class": "",
+   "frame": "",
+   "incidents": [
+    "20260804-095141-drain-stall",
+    "20260804-095141-unsafe-escalation"
+   ],
+   "pid": ""
+  },
+  {
+   "round": 3,
+   "result": "PASS",
+   "class": "",
+   "frame": "",
+   "incidents": [
+    "20260804-095225-drain-stall",
+    "20260804-095225-unsafe-escalation"
+   ],
+   "pid": ""
+  },
+  {
+   "round": 4,
+   "result": "PASS",
+   "class": "",
+   "frame": "",
+   "incidents": [
+    "20260804-095307-drain-stall",
+    "20260804-095307-unsafe-escalation"
+   ],
+   "pid": ""
+  },
+  {
+   "round": 5,
+   "result": "STALL",
+   "class": "processUnloads",
+   "frame": "net.minecraft.server.level.ChunkMap.processUnloads",
+   "incidents": [],
+   "pid": "7208"
+  },
+  {
+   "round": 6,
+   "result": "STALL",
+   "class": "processUnloads",
+   "frame": "net.minecraft.server.level.ChunkMap.processUnloads",
+   "incidents": [],
+   "pid": "26812"
+  },
+  {
+   "round": 7,
+   "result": "STALL",
+   "class": "processUnloads",
+   "frame": "net.minecraft.server.level.ChunkMap.processUnloads",
+   "incidents": [
+    "20260804-095805-drain-stall",
+    "20260804-095805-unsafe-escalation"
+   ],
+   "pid": "2776"
+  },
+  {
+   "round": 8,
+   "result": "PASS",
+   "class": "",
+   "frame": "",
+   "incidents": [
+    "20260804-100011-drain-stall",
+    "20260804-100011-unsafe-escalation"
+   ],
+   "pid": "29028"
+  },
+  {
+   "round": 9,
+   "result": "STALL",
+   "class": "other-minecraft",
+   "frame": "net.minecraft.server.MinecraftServer.handler$zza000$steadychunks$onTickReturn",
+   "incidents": [],
+   "pid": "25676"
+  },
+  {
+   "round": 10,
+   "result": "STALL",
+   "class": "other-minecraft",
+   "frame": "net.minecraft.world.level.Level.getChunk",
+   "incidents": [
+    "20260804-100307-drain-stall",
+    "20260804-100307-unsafe-escalation"
+   ],
+   "pid": "25984"
+  },
+  {
+   "round": 11,
+   "result": "STALL",
+   "class": "processUnloads",
+   "frame": "net.minecraft.server.level.ChunkMap.processUnloads",
+   "incidents": [
+    "20260804-100513-drain-stall",
+    "20260804-100513-unsafe-escalation"
+   ],
+   "pid": "30648"
+  },
+  {
+   "round": 12,
+   "result": "STALL",
+   "class": "processUnloads",
+   "frame": "net.minecraft.server.level.ChunkMap.processUnloads",
+   "incidents": [
+    "20260804-100729-drain-stall",
+    "20260804-100729-unsafe-escalation"
+   ],
+   "pid": "6616"
+  },
+  {
+   "round": 13,
+   "result": "PASS",
+   "class": "",
+   "frame": "",
+   "incidents": [
+    "20260804-100940-drain-stall",
+    "20260804-100940-unsafe-escalation"
+   ],
+   "pid": ""
+  },
+  {
+   "round": 14,
+   "result": "PASS",
+   "class": "",
+   "frame": "",
+   "incidents": [
+    "20260804-101025-drain-stall",
+    "20260804-101025-unsafe-escalation"
+   ],
+   "pid": ""
+  },
+  {
+   "round": 15,
+   "result": "PASS",
+   "class": "",
+   "frame": "",
+   "incidents": [
+    "20260804-101109-drain-stall",
+    "20260804-101109-unsafe-escalation"
+   ],
+   "pid": "13076"
+  },
+  {
+   "round": 16,
+   "result": "STALL",
+   "class": "processUnloads",
+   "frame": "net.minecraft.server.level.ChunkMap.processUnloads",
+   "incidents": [
+    "20260804-101150-drain-stall",
+    "20260804-101150-unsafe-escalation"
+   ],
+   "pid": "1488"
+  },
+  {
+   "round": 17,
+   "result": "PASS",
+   "class": "",
+   "frame": "",
+   "incidents": [
+    "20260804-101357-drain-stall",
+    "20260804-101357-unsafe-escalation"
+   ],
+   "pid": "22928"
+  },
+  {
+   "round": 18,
+   "result": "STALL",
+   "class": "processUnloads",
+   "frame": "net.minecraft.server.level.ChunkMap.processUnloads",
+   "incidents": [
+    "20260804-101438-drain-stall",
+    "20260804-101438-unsafe-escalation"
+   ],
+   "pid": "23252"
+  },
+  {
+   "round": 19,
+   "result": "STALL",
+   "class": "processUnloads",
+   "frame": "net.minecraft.server.level.ChunkMap.processUnloads",
+   "incidents": [],
+   "pid": "27172"
+  },
+  {
+   "round": 20,
+   "result": "PASS",
+   "class": "",
+   "frame": "",
+   "incidents": [
+    "20260804-101852-drain-stall",
+    "20260804-101852-unsafe-escalation"
+   ],
+   "pid": ""
+  },
+  {
+   "round": 21,
+   "result": "STALL",
+   "class": "processUnloads",
+   "frame": "net.minecraft.server.level.ChunkMap.processUnloads",
+   "incidents": [
+    "20260804-101937-drain-stall",
+    "20260804-101937-unsafe-escalation"
+   ],
+   "pid": "18404"
+  },
+  {
+   "round": 22,
+   "result": "STALL",
+   "class": "processUnloads",
+   "frame": "net.minecraft.server.level.ChunkMap.processUnloads",
+   "incidents": [
+    "20260804-102145-drain-stall",
+    "20260804-102145-unsafe-escalation"
+   ],
+   "pid": "1464"
+  },
+  {
+   "round": 23,
+   "result": "STALL",
+   "class": "processUnloads",
+   "frame": "net.minecraft.server.level.ChunkMap.processUnloads",
+   "incidents": [
+    "20260804-102354-drain-stall",
+    "20260804-102354-unsafe-escalation"
+   ],
+   "pid": "5412"
+  },
+  {
+   "round": 24,
+   "result": "STALL",
+   "class": "other-minecraft",
+   "frame": "net.minecraft.server.MinecraftServer.handler$zza000$steadychunks$onTickReturn",
+   "incidents": [],
+   "pid": "19792"
+  },
+  {
+   "round": 25,
+   "result": "STALL",
+   "class": "tickChunks-shuffle",
+   "frame": "net.minecraft.server.level.ServerChunkCache.tickChunks",
+   "incidents": [
+    "20260804-102813-drain-stall",
+    "20260804-102813-unsafe-escalation"
+   ],
+   "pid": "2524"
+  },
+  {
+   "round": 26,
+   "result": "PASS",
+   "class": "",
+   "frame": "",
+   "incidents": [
+    "20260804-103018-drain-stall",
+    "20260804-103018-unsafe-escalation"
+   ],
+   "pid": ""
+  },
+  {
+   "round": 27,
+   "result": "STALL",
+   "class": "processUnloads",
+   "frame": "net.minecraft.server.level.ChunkMap.processUnloads",
+   "incidents": [
+    "20260804-103105-drain-stall",
+    "20260804-103105-unsafe-escalation"
+   ],
+   "pid": "2552"
+  },
+  {
+   "round": 28,
+   "result": "STALL",
+   "class": "other-minecraft",
+   "frame": "net.minecraft.server.MinecraftServer.resetStatusCache",
+   "incidents": [
+    "20260804-103310-drain-stall",
+    "20260804-103310-unsafe-escalation"
+   ],
+   "pid": "2188"
+  },
+  {
+   "round": 29,
+   "result": "STALL",
+   "class": "processUnloads",
+   "frame": "net.minecraft.server.level.ChunkMap.processUnloads",
+   "incidents": [],
+   "pid": "20952"
+  },
+  {
+   "round": 30,
+   "result": "PASS",
+   "class": "",
+   "frame": "",
+   "incidents": [
+    "20260804-103724-drain-stall",
+    "20260804-103724-unsafe-escalation"
+   ],
+   "pid": ""
+  },
+  {
+   "round": 31,
+   "result": "STALL",
+   "class": "processUnloads",
+   "frame": "net.minecraft.server.level.ChunkMap.processUnloads",
+   "incidents": [
+    "20260804-103808-drain-stall",
+    "20260804-103808-unsafe-escalation"
+   ],
+   "pid": "19568"
+  },
+  {
+   "round": 32,
+   "result": "PASS",
+   "class": "",
+   "frame": "",
+   "incidents": [
+    "20260804-104022-drain-stall",
+    "20260804-104022-unsafe-escalation"
+   ],
+   "pid": ""
+  },
+  {
+   "round": 33,
+   "result": "PASS",
+   "class": "",
+   "frame": "",
+   "incidents": [
+    "20260804-104106-drain-stall",
+    "20260804-104106-unsafe-escalation"
+   ],
+   "pid": ""
+  },
+  {
+   "round": 34,
+   "result": "STALL",
+   "class": "other-minecraft",
+   "frame": "net.minecraft.world.level.levelgen.BitRandomSource.nextInt",
+   "incidents": [
+    "20260804-104153-drain-stall",
+    "20260804-104153-unsafe-escalation"
+   ],
+   "pid": "1000"
+  },
+  {
+   "round": 35,
+   "result": "PASS",
+   "class": "",
+   "frame": "",
+   "incidents": [
+    "20260804-104358-drain-stall",
+    "20260804-104358-unsafe-escalation"
+   ],
+   "pid": ""
+  },
+  {
+   "round": 36,
+   "result": "PASS",
+   "class": "",
+   "frame": "",
+   "incidents": [
+    "20260804-104444-drain-stall",
+    "20260804-104444-unsafe-escalation"
+   ],
+   "pid": "24496"
+  },
+  {
+   "round": 37,
+   "result": "STALL",
+   "class": "other-minecraft",
+   "frame": "net.minecraft.server.MinecraftServer.handler$zza000$steadychunks$onTickReturn",
+   "incidents": [],
+   "pid": "9820"
+  },
+  {
+   "round": 38,
+   "result": "STALL",
+   "class": "processUnloads",
+   "frame": "net.minecraft.server.level.ChunkMap.processUnloads",
+   "incidents": [
+    "20260804-104734-drain-stall",
+    "20260804-104734-unsafe-escalation"
+   ],
+   "pid": "22748"
+  },
+  {
+   "round": 39,
+   "result": "STALL",
+   "class": "processUnloads",
+   "frame": "net.minecraft.server.level.ChunkMap.processUnloads",
+   "incidents": [
+    "20260804-104939-drain-stall",
+    "20260804-104939-unsafe-escalation"
+   ],
+   "pid": "16604"
+  },
+  {
+   "round": 40,
+   "result": "PASS",
+   "class": "",
+   "frame": "",
+   "incidents": [
+    "20260804-105139-drain-stall",
+    "20260804-105139-unsafe-escalation"
+   ],
+   "pid": ""
+  },
+  {
+   "round": 41,
+   "result": "STALL",
+   "class": "processUnloads",
+   "frame": "net.minecraft.server.level.ChunkMap.processUnloads",
+   "incidents": [
+    "20260804-105218-drain-stall",
+    "20260804-105218-unsafe-escalation"
+   ],
+   "pid": "11108"
+  },
+  {
+   "round": 42,
+   "result": "STALL",
+   "class": "other-minecraft",
+   "frame": "net.minecraft.server.level.ChunkHolder.isReadyForSaving",
+   "incidents": [],
+   "pid": "27204"
+  },
+  {
+   "round": 43,
+   "result": "PASS",
+   "class": "",
+   "frame": "",
+   "incidents": [
+    "20260804-105622-drain-stall",
+    "20260804-105622-unsafe-escalation"
+   ],
+   "pid": ""
+  },
+  {
+   "round": 44,
+   "result": "PASS",
+   "class": "",
+   "frame": "",
+   "incidents": [
+    "20260804-105701-drain-stall",
+    "20260804-105701-unsafe-escalation"
+   ],
+   "pid": "18456"
+  },
+  {
+   "round": 45,
+   "result": "STALL",
+   "class": "processUnloads",
+   "frame": "net.minecraft.server.level.ChunkMap.processUnloads",
+   "incidents": [],
+   "pid": "21844"
+  },
+  {
+   "round": 46,
+   "result": "PASS",
+   "class": "",
+   "frame": "",
+   "incidents": [
+    "20260804-105938-drain-stall",
+    "20260804-105938-unsafe-escalation"
+   ],
+   "pid": ""
+  },
+  {
+   "round": 47,
+   "result": "PASS",
+   "class": "",
+   "frame": "",
+   "incidents": [
+    "20260804-110017-drain-stall",
+    "20260804-110017-unsafe-escalation"
+   ],
+   "pid": "5176"
+  },
+  {
+   "round": 48,
+   "result": "STALL",
+   "class": "tickChunks-shuffle",
+   "frame": "net.minecraft.server.level.ServerChunkCache.tickChunks",
+   "incidents": [],
+   "pid": "16608"
+  },
+  {
+   "round": 49,
+   "result": "STALL",
+   "class": "processUnloads",
+   "frame": "net.minecraft.server.level.ChunkMap.processUnloads",
+   "incidents": [],
+   "pid": "5356"
+  },
+  {
+   "round": 50,
+   "result": "STALL",
+   "class": "processUnloads",
+   "frame": "net.minecraft.server.level.ChunkMap.processUnloads",
+   "incidents": [
+    "20260804-110456-drain-stall",
+    "20260804-110456-unsafe-escalation"
+   ],
+   "pid": "30220"
+  }
+ ],
+ "counters": {
+  "PASS": 21,
+  "STALL": 29
+ },
+ "classCounter": {
+  "processUnloads": 20,
+  "other-minecraft": 7,
+  "tickChunks-shuffle": 2
+ },
+ "incidentCounter": {
+  "drain-stall": 39,
+  "unsafe-escalation": 39
+ },
+ "bestStreak": 4,
+ "passRate": 42.0
+}
