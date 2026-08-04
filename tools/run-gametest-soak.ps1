@@ -42,7 +42,7 @@ if ($staleNote.Count -gt 0) {
 function Get-ServerJavaPid {
     $procs = Get-CimInstance Win32_Process -Filter "Name='java.exe'" -ErrorAction SilentlyContinue
     foreach ($p in $procs) {
-        if ($p.CommandLine -match "forgeserverdev|GameTest") {
+        if ($p.CommandLine -match "-Dfml.modFolders") {
             return $p.ProcessId
         }
     }

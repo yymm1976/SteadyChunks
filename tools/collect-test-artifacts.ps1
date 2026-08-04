@@ -21,7 +21,7 @@ Copy-Item "$Repo\run-server\logs\latest.log" "$RoundDir\latest.log" -ErrorAction
 if (-not $ServerPid) {
     $procs = Get-CimInstance Win32_Process -Filter "Name='java.exe'" -ErrorAction SilentlyContinue
     foreach ($p in $procs) {
-        if ($p.CommandLine -match "forgeserverdev|GameTest") { $ServerPid = $p.ProcessId; break }
+        if ($p.CommandLine -match "-Dfml.modFolders") { $ServerPid = $p.ProcessId; break }
     }
 }
 $serverCmd = ""
