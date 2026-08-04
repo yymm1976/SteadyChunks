@@ -12,6 +12,7 @@ import com.mochi_753.steadychunks.network.ChunkSendQuota;
 import com.mochi_753.steadychunks.network.SteadyChunksPayloads;
 import com.mochi_753.steadychunks.config.PresetApplier;
 import com.mochi_753.steadychunks.diagnostics.CrashReportContributor;
+import com.mochi_753.steadychunks.diagnostics.InflightStallDetector;
 import com.mochi_753.steadychunks.io.LifecycleCleanupCoordinator;
 import com.mochi_753.steadychunks.scheduler.ChunkScheduler;
 import com.mochi_753.steadychunks.scheduler.Watchdog;
@@ -147,6 +148,10 @@ public final class ModuleBootstrap {
         // 第 9 轮卡死修复：启动独立 drain 停摆恢复线程（忙转死锁破环，见 Watchdog）。
         Watchdog.getInstance().startRecoveryThread(ChunkScheduler.getInstance());
 
+        // 阶段 4：启动独立在途停滞检测线程（只诊断不自动修复——恢复线程在
+        // GameTest 中会被停启，在途型卡死期间唯一可靠的周期执行者是独立 daemon）。
+        InflightStallDetector.start(ChunkScheduler.getInstance());
+
         ChunkFlightRecorder.syncFromConfig();
         SteadyChunks.LOGGER.info("SteadyChunks 诊断已同步配置：enabled={}", ChunkFlightRecorder.isEnabled());
 
@@ -218,6 +223,8 @@ public final class ModuleBootstrap {
      * （运行中任务此刻应已终结，迟到 lease 已递减计数）。
      */
     private static void onServerStopped(ServerStoppedEvent event) {
+        // 阶段 4：停止在途停滞检测线程（与启动配对）
+        InflightStallDetector.stop();
         LifecycleCleanupCoordinator.getInstance().onServerStopped();
     }
 

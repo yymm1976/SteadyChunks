@@ -1,6 +1,7 @@
 package com.mochi_753.steadychunks.scheduler;
 
 import com.mochi_753.steadychunks.SteadyChunks;
+import com.mochi_753.steadychunks.diagnostics.IncidentRecorder;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.level.ChunkResult;
 import net.minecraft.world.level.Level;
@@ -471,6 +472,8 @@ public final class Watchdog {
                     "SteadyChunks Watchdog: UNSAFE_EMERGENCY——mailbox 恢复失效，"
                             + "daemon 线程直接完成 {} 个批次任务（打破卸载重入风暴死锁）",
                     unsafe);
+            // 阶段 4：第二级升级事故快照（只诊断，限流）
+            IncidentRecorder.recordUnsafeEscalation(scheduler, batchToEscalate.id(), unsafe);
             // ---- 阶段 2.5（锁内）：全部终态确认后才清空（窗口 B：升级期间批次
             //      保持发布，直到 proxy 全部终态） ----
             synchronized (this) {
@@ -539,6 +542,8 @@ public final class Watchdog {
                             + "第一级形成恢复批次 {}（{} 个任务，提交线程分派），"
                             + "2 秒内无终态将升级 UNSAFE_EMERGENCY",
                     pendingAtTrigger, captured.id(), captured.tasks().size());
+            // 阶段 4：第一级恢复事故快照（只诊断，限流）
+            IncidentRecorder.recordDrainStall(scheduler, captured.id(), captured.tasks().size());
         }
     }
 
