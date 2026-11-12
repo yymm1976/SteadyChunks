@@ -1,0 +1,44 @@
+MIT License
+
+Copyright (c) 2026 SteadyChunks Contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+第三方依赖与来源声明
+
+1. NeoForge (https://github.com/neoforged/NeoForge)
+   许可证：LGPL-2.1
+   用途：模组加载框架与 API
+
+2. SpongePowered Mixin (https://github.com/SpongePowered/Mixin)
+   许可证：MIT
+   用途：字节码注入框架
+
+3. Gson (https://github.com/google/gson)
+   许可证：Apache-2.0
+   用途：诊断报告 JSON 导出
+
+4. Parchment Mappings (https://parchmentmc.org/)
+   许可证：CC0-1.0
+   用途：参数名映射
+
+本项目不包含上述项目的源代码，仅在运行时或编译期依赖其 API。
+所有第三方版权归各自所有者所有。

@@ -1,0 +1,66 @@
+# Gradle
+.gradle/
+build/
+out/
+classes/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.project
+.classpath
+*.swp
+
+# Eclipse
+bin/
+.metadata/
+
+# NetBeans
+/nbproject/private/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+*~
+
+# Forge / NeoForge
+run/
+runs/
+run-server/
+logs/
+crash-reports/
+saves/
+world/
+world_backup/
+
+# SteadyChunks 运行时产物
+steadychunks-reports/
+*.zip
+
+# 临时文件
+*.tmp
+*.bak
+*.log
+
+# JVM
+hs_err_pid*
+replay_pid*
+
+# 审查报告（本地产物，不入库）
+审查结果.md
+
+# GameTest 卡死证据（原始日志/jstack 不入库，磁盘保留）
+artifacts/round14-stalls/
+
+# soak 原始证据（50 轮日志/jstack/incidents 不入库，磁盘保留）
+artifacts/soak/

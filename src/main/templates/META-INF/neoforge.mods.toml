@@ -1,0 +1,40 @@
+modLoader = "javafml"
+loaderVersion = "${loader_version_range}"
+license = "${mod_license}"
+
+[[mods]]
+modId = "${mod_id}"
+version = "${mod_version}"
+displayName = "${mod_name}"
+logoFile = "${mod_id}.png"
+description = '''
+早期开发版本（alpha）。目前仅包含诊断与实验性调度基础设施，
+尚未接入真实的区块生成 Mixin 链路，不能替代 C2ME。
+
+警告：
+- 不得用于重要存档。本模组尚未完成核心区块链路接入，
+  可能导致区块生成异常、性能波动或存档数据不一致。
+- 与 C2ME 互斥，请勿同装。
+- 模组当前默认不启用任何调度模块，仅作为架构骨架存在。
+- 待核心 NOISE 阶段 Mixin 接入并完成压力测试后才会进入可用阶段。
+'''
+
+[[mixins]]
+config = "${mod_id}.mixins.json"
+
+[[accessTransformers]]
+file = "META-INF/accesstransformer.cfg"
+
+[[dependencies.${ mod_id }]]
+modId = "neoforge"
+type = "required"
+versionRange = "${neo_version_range}"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.${ mod_id }]]
+modId = "minecraft"
+type = "required"
+versionRange = "${minecraft_version_range}"
+ordering = "NONE"
+side = "BOTH"
