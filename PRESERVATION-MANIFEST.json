@@ -9476,127 +9476,152 @@
     {
       "group": "SteadyChunks",
       "path": ".gradle/8.14/checksums/checksums.lock",
-      "bytes": 17
+      "bytes": 17,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/8.14/checksums/md5-checksums.bin",
-      "bytes": 18947
+      "bytes": 18947,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/8.14/checksums/sha1-checksums.bin",
-      "bytes": 19685
+      "bytes": 19685,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/8.14/executionHistory/executionHistory.bin",
-      "bytes": 602403
+      "bytes": 602403,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/8.14/executionHistory/executionHistory.lock",
-      "bytes": 17
+      "bytes": 17,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/8.14/fileChanges/last-build.bin",
-      "bytes": 1
+      "bytes": 1,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/8.14/fileHashes/fileHashes.bin",
-      "bytes": 76865
+      "bytes": 76865,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/8.14/fileHashes/fileHashes.lock",
-      "bytes": 17
+      "bytes": 17,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/8.14/fileHashes/resourceHashesCache.bin",
-      "bytes": 34137
+      "bytes": 34137,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/8.14/gc.properties",
-      "bytes": 0
+      "bytes": 0,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/9.2.1/checksums/checksums.lock",
-      "bytes": 17
+      "bytes": 17,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/9.2.1/checksums/md5-checksums.bin",
-      "bytes": 31697
+      "bytes": 31697,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/9.2.1/checksums/sha1-checksums.bin",
-      "bytes": 79241
+      "bytes": 79241,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/9.2.1/executionHistory/executionHistory.bin",
-      "bytes": 1414948
+      "bytes": 1414948,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/9.2.1/executionHistory/executionHistory.lock",
-      "bytes": 17
+      "bytes": 17,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/9.2.1/fileChanges/last-build.bin",
-      "bytes": 1
+      "bytes": 1,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/9.2.1/fileHashes/fileHashes.bin",
-      "bytes": 76365
+      "bytes": 76365,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/9.2.1/fileHashes/fileHashes.lock",
-      "bytes": 17
+      "bytes": 17,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/9.2.1/fileHashes/resourceHashesCache.bin",
-      "bytes": 35429
+      "bytes": 35429,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/9.2.1/gc.properties",
-      "bytes": 0
+      "bytes": 0,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/buildOutputCleanup/buildOutputCleanup.lock",
-      "bytes": 17
+      "bytes": 17,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/buildOutputCleanup/cache.properties",
-      "bytes": 52
+      "bytes": 52,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/buildOutputCleanup/outputFiles.bin",
-      "bytes": 19955
+      "bytes": 19955,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/file-system.probe",
-      "bytes": 8
+      "bytes": 8,
+      "matchesSecretName": false
     },
     {
       "group": "SteadyChunks",
       "path": ".gradle/vcs-1/gc.properties",
-      "bytes": 0
+      "bytes": 0,
+      "matchesSecretName": false
     }
   ],
   "links": [],
