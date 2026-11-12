@@ -1,0 +1,475 @@
+{
+  "schema": "dsh112.desktop-minecraft-remote-recovery.v1",
+  "repository": "yymm1976/SteadyChunks",
+  "snapshotBranch": "codex-preservation/2026-11-13/steadychunks",
+  "snapshotCommit": "f3b02e0d802462be6d89e8d85618af1ccc1e6607",
+  "sourceGroups": [
+    "SteadyChunks"
+  ],
+  "release": {
+    "tag": "preservation-2026-11-13-steadychunks",
+    "url": "https://github.com/yymm1976/SteadyChunks/releases/tag/preservation-2026-11-13-steadychunks",
+    "assets": [
+      {
+        "kind": "workspace-asset",
+        "unit": "artifacts",
+        "archive": {
+          "path": "C:\\Users\\杨铭\\Documents\\Codex\\DSH-1.1.2-Temporary\\desktop-minecraft-upload-1\\steadychunks\\steadychunks-artifacts-2026-11-13.tar.gz",
+          "bytes": 11769282,
+          "sha256": "5df25f64966ab6a069b657f66fae85d4fed7e91e03a3bacbbae5060ce8e06c5f",
+          "fileCount": 1045,
+          "uncompressedFileBytes": 412141536
+        },
+        "part": 1,
+        "parts": 1,
+        "name": "steadychunks-artifacts-2026-11-13.tar.gz",
+        "bytes": 11769282,
+        "sha256": "5df25f64966ab6a069b657f66fae85d4fed7e91e03a3bacbbae5060ce8e06c5f",
+        "githubId": 740839444,
+        "apiUrl": "https://api.github.com/repos/yymm1976/SteadyChunks/releases/assets/740839444",
+        "browserDownloadUrl": "https://github.com/yymm1976/SteadyChunks/releases/download/preservation-2026-11-13-steadychunks/steadychunks-artifacts-2026-11-13.tar.gz"
+      },
+      {
+        "kind": "workspace-asset",
+        "unit": "build",
+        "archive": {
+          "path": "C:\\Users\\杨铭\\Documents\\Codex\\DSH-1.1.2-Temporary\\desktop-minecraft-upload-1\\steadychunks\\steadychunks-build-2026-11-13.tar.gz",
+          "bytes": 70361235,
+          "sha256": "29d4695c506d9bbe2eae8aee18f5fc11f6e34f2188438e4fadb3341d00155493",
+          "fileCount": 271,
+          "uncompressedFileBytes": 226917496
+        },
+        "part": 1,
+        "parts": 1,
+        "name": "steadychunks-build-2026-11-13.tar.gz",
+        "bytes": 70361235,
+        "sha256": "29d4695c506d9bbe2eae8aee18f5fc11f6e34f2188438e4fadb3341d00155493",
+        "githubId": 740840686,
+        "apiUrl": "https://api.github.com/repos/yymm1976/SteadyChunks/releases/assets/740840686",
+        "browserDownloadUrl": "https://github.com/yymm1976/SteadyChunks/releases/download/preservation-2026-11-13-steadychunks/steadychunks-build-2026-11-13.tar.gz"
+      },
+      {
+        "kind": "workspace-asset",
+        "unit": "run-server",
+        "archive": {
+          "path": "C:\\Users\\杨铭\\Documents\\Codex\\DSH-1.1.2-Temporary\\desktop-minecraft-upload-1\\steadychunks\\steadychunks-run-server-2026-11-13.tar.gz",
+          "bytes": 6555701,
+          "sha256": "a0f780eb47b6d0c97c1efac29eb724cda18b84742e0da8697b17aa13a3213496",
+          "fileCount": 119,
+          "uncompressedFileBytes": 20560559
+        },
+        "part": 1,
+        "parts": 1,
+        "name": "steadychunks-run-server-2026-11-13.tar.gz",
+        "bytes": 6555701,
+        "sha256": "a0f780eb47b6d0c97c1efac29eb724cda18b84742e0da8697b17aa13a3213496",
+        "githubId": 740843332,
+        "apiUrl": "https://api.github.com/repos/yymm1976/SteadyChunks/releases/assets/740843332",
+        "browserDownloadUrl": "https://github.com/yymm1976/SteadyChunks/releases/download/preservation-2026-11-13-steadychunks/steadychunks-run-server-2026-11-13.tar.gz"
+      }
+    ]
+  },
+  "privateCrossRepositoryAssets": [
+    {
+      "kind": "dpapi-private-config",
+      "sourceFiles": [
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": ".codex/config.toml",
+          "bytes": 231
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": ".dshtest/.anonymous-user-id",
+          "bytes": 37
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": ".dshtest/gh.json",
+          "bytes": 2956
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": "dsh-token-lab/AUDIT.md",
+          "bytes": 2905
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": "dsh-token-lab/FINDINGS.md",
+          "bytes": 3113
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": "dsh-token-lab/README.md",
+          "bytes": 4221
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": "dsh-token-lab/VERIFICATION.md",
+          "bytes": 3752
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": "dsh-token-lab/cordis.patch.yml",
+          "bytes": 564
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": "dsh-token-lab/index.js",
+          "bytes": 21766
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": "dsh-token-lab/package.json",
+          "bytes": 310
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": "dsh-token-lab/test-arg.mjs",
+          "bytes": 1738
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": "dsh-token-lab/test-behavior.mjs",
+          "bytes": 3136
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": "dsh-token-lab/test-cap-real.mjs",
+          "bytes": 2136
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": "dsh-token-lab/test-ceiling.mjs",
+          "bytes": 3050
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": "dsh-token-lab/test-effort.mjs",
+          "bytes": 2666
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": "dsh-token-lab/test-freeze-real.mjs",
+          "bytes": 1452
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": "dsh-token-lab/test-freeze.mjs",
+          "bytes": 298
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": "dsh-token-lab/test-mount.mjs",
+          "bytes": 1272
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": "dsh-token-lab/test-rent.mjs",
+          "bytes": 2276
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": "dsh-token-lab/test-trim-assemble.mjs",
+          "bytes": 1580
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": "dsh-token-lab/test-trim-real.mjs",
+          "bytes": 1461
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": "dsh-token-lab/test-trim-rent.mjs",
+          "bytes": 616
+        },
+        {
+          "target": "Astra",
+          "group": "Astra光影开发",
+          "path": "dsh-token-lab/test-trim-unit.mjs",
+          "bytes": 969
+        }
+      ],
+      "archiveMetadata": {
+        "path": "C:\\Users\\杨铭\\Documents\\Codex\\DSH-1.1.2-Temporary\\desktop-minecraft-upload-1\\minecraft-development-archive\\private-config-2026-11-13.tar.gz",
+        "bytes": 23886,
+        "sha256": "5ed9ade0f45450d70ce6f8a93ff444cb9599f5f5ac7208230209300dca32a722",
+        "fileCount": 23,
+        "uncompressedFileBytes": 62505
+      },
+      "name": "private-config-2026-11-13.tar.gz.dpapi",
+      "bytes": 24102,
+      "sha256": "7176f14b5625beefbb35b060812fd999d742e7fd508e13a7420105033869265f",
+      "githubId": 740838329,
+      "apiUrl": "https://api.github.com/repos/yymm1976/Minecraft-Development-Archive/releases/assets/740838329",
+      "browserDownloadUrl": "https://github.com/yymm1976/Minecraft-Development-Archive/releases/download/preservation-2026-11-13-minecraft-development-archive/private-config-2026-11-13.tar.gz.dpapi"
+    }
+  ],
+  "nestedGitBundleAssets": [
+    {
+      "kind": "nested-git-bundles",
+      "bundleManifest": {
+        "schema": "dsh112.desktop-minecraft-nested-git-bundles.v1",
+        "bundles": [
+          {
+            "relativeSource": "Astra光影开发/_analysis/batch5_unpack/lantern-shader",
+            "bundleName": "astra-analysis-batch5-unpack-lantern-shader.bundle",
+            "bytes": 46441,
+            "sha256": "5b941fba41c323f2fca0ce2fa084bcd0da845d8feb43bf8c38eb322f422d3c9e",
+            "heads": [
+              "e48abf8d69cca1c4147cbec6950543fda2ae16d0 refs/heads/main",
+              "b2f6d7c375b6684ba6c95911eec15788560bd982 refs/remotes/origin/HEAD",
+              "b2f6d7c375b6684ba6c95911eec15788560bd982 refs/remotes/origin/main",
+              "b869c3982107328870a3dac8171f5197c3ce38f5 refs/tags/1.1.6",
+              "bf72144a059d0dfaff37685c26098a815002d98e refs/tags/v1.0.0",
+              "04a2aec56b583f6d2b3dd6e75d0a10a7a174a7c4 refs/tags/v1.1.0",
+              "583965c52861ed6b45cfc6676067b3c594a7f16e refs/tags/v1.1.2",
+              "acbe9aa82e23516d06062f84145dcf5011840634 refs/tags/v1.1.3",
+              "4e8bdbfd94709a007f6620343b432865510e6184 refs/tags/v1.1.5",
+              "e48abf8d69cca1c4147cbec6950543fda2ae16d0 HEAD"
+            ]
+          },
+          {
+            "relativeSource": "Astra光影开发/_analysis/batch5_unpack/raincore",
+            "bundleName": "astra-analysis-batch5-unpack-raincore.bundle",
+            "bytes": 62928,
+            "sha256": "371ada65139832e8d5d7c77314b0c6f6d4e70da023bb4da3117cb24950a178ac",
+            "heads": [
+              "31a2dd9d2f01007d2ff491aaae09b2d0bcb7d71b refs/heads/main",
+              "31a2dd9d2f01007d2ff491aaae09b2d0bcb7d71b refs/remotes/origin/HEAD",
+              "31a2dd9d2f01007d2ff491aaae09b2d0bcb7d71b refs/remotes/origin/main",
+              "d41b49df499c57f795d4f3ee790f0c5d3cfe7b71 refs/tags/Alpha_0.100.rain",
+              "a8b6e8eba1323f335923e247e04c0186b0c5b26c refs/tags/Alpha_0.101.rain",
+              "004d18c742ddd663255960881dea6b9bf2aba563 refs/tags/Alpha_0.98.rain",
+              "6bd62deab965eed0961a88a1f0c65be74fd196c8 refs/tags/Alpha_0.99.rain",
+              "31a2dd9d2f01007d2ff491aaae09b2d0bcb7d71b HEAD"
+            ]
+          },
+          {
+            "relativeSource": "Astra光影开发/_analysis/batch5_unpack/realisticallyoptimized",
+            "bundleName": "astra-analysis-batch5-unpack-realisticallyoptimized.bundle",
+            "bytes": 14758,
+            "sha256": "0bbc48f67a968f465b37e513a5c7abdbfa59a8eb256f082414085cad4edfba7d",
+            "heads": [
+              "fd58b5005bf23cc62b7e9232941dbaa9a797a290 refs/heads/main",
+              "fd58b5005bf23cc62b7e9232941dbaa9a797a290 refs/remotes/origin/HEAD",
+              "fd58b5005bf23cc62b7e9232941dbaa9a797a290 refs/remotes/origin/main",
+              "fd58b5005bf23cc62b7e9232941dbaa9a797a290 HEAD"
+            ]
+          },
+          {
+            "relativeSource": "光影/mellow-sf",
+            "bundleName": "mellow-sf.bundle",
+            "bytes": 1695831,
+            "sha256": "93660338ca889a7df90d0d70644dbcf2e53af0aa26f80be63b96d6ce41b25c45",
+            "heads": [
+              "f53d24c9d03ee717bbe51506bfc4871cf2b8f6c6 refs/heads/master",
+              "f53d24c9d03ee717bbe51506bfc4871cf2b8f6c6 refs/tags/v1.0",
+              "f53d24c9d03ee717bbe51506bfc4871cf2b8f6c6 HEAD"
+            ]
+          },
+          {
+            "relativeSource": "cuiros/MDK-1.21.1-ModDevGradle",
+            "bundleName": "cuiros-mdk-1-21-1-moddevgradle.bundle",
+            "bytes": 480635,
+            "sha256": "c21d59898c423c67a44c86a315b872691f4208eac77fd6f35efbb2636fbcadaa",
+            "heads": [
+              "2fd0c210186047a8912fcdf2ac31b2975d693127 refs/heads/main",
+              "2fd0c210186047a8912fcdf2ac31b2975d693127 refs/remotes/origin/HEAD",
+              "2fd0c210186047a8912fcdf2ac31b2975d693127 refs/remotes/origin/main",
+              "e362255886bd8e12915b52a505071c04d7d0aab6 refs/remotes/origin/update",
+              "2fd0c210186047a8912fcdf2ac31b2975d693127 HEAD"
+            ]
+          }
+        ],
+        "sourceRefsNotPushedToTheirOrigins": true
+      },
+      "name": "nested-git-bundles-2026-11-13.tar.gz",
+      "bytes": 2267884,
+      "sha256": "e3128f515a947207c8af73bc708efcfd245f521e92f2088eed75451462786feb",
+      "githubId": 740839352,
+      "apiUrl": "https://api.github.com/repos/yymm1976/Minecraft-Development-Archive/releases/assets/740839352",
+      "browserDownloadUrl": "https://github.com/yymm1976/Minecraft-Development-Archive/releases/download/preservation-2026-11-13-minecraft-development-archive/nested-git-bundles-2026-11-13.tar.gz"
+    }
+  ],
+  "cachesExcludedAsRegenerable": [
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/8.14/checksums/checksums.lock",
+      "bytes": 17,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/8.14/checksums/md5-checksums.bin",
+      "bytes": 18947,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/8.14/checksums/sha1-checksums.bin",
+      "bytes": 19685,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/8.14/executionHistory/executionHistory.bin",
+      "bytes": 602403,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/8.14/executionHistory/executionHistory.lock",
+      "bytes": 17,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/8.14/fileChanges/last-build.bin",
+      "bytes": 1,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/8.14/fileHashes/fileHashes.bin",
+      "bytes": 76865,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/8.14/fileHashes/fileHashes.lock",
+      "bytes": 17,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/8.14/fileHashes/resourceHashesCache.bin",
+      "bytes": 34137,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/8.14/gc.properties",
+      "bytes": 0,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/9.2.1/checksums/checksums.lock",
+      "bytes": 17,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/9.2.1/checksums/md5-checksums.bin",
+      "bytes": 31697,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/9.2.1/checksums/sha1-checksums.bin",
+      "bytes": 79241,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/9.2.1/executionHistory/executionHistory.bin",
+      "bytes": 1414948,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/9.2.1/executionHistory/executionHistory.lock",
+      "bytes": 17,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/9.2.1/fileChanges/last-build.bin",
+      "bytes": 1,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/9.2.1/fileHashes/fileHashes.bin",
+      "bytes": 76365,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/9.2.1/fileHashes/fileHashes.lock",
+      "bytes": 17,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/9.2.1/fileHashes/resourceHashesCache.bin",
+      "bytes": 35429,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/9.2.1/gc.properties",
+      "bytes": 0,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/buildOutputCleanup/buildOutputCleanup.lock",
+      "bytes": 17,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/buildOutputCleanup/cache.properties",
+      "bytes": 52,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/buildOutputCleanup/outputFiles.bin",
+      "bytes": 19955,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/file-system.probe",
+      "bytes": 8,
+      "matchesSecretName": false
+    },
+    {
+      "group": "SteadyChunks",
+      "path": ".gradle/vcs-1/gc.properties",
+      "bytes": 0,
+      "matchesSecretName": false
+    }
+  ],
+  "recovery": {
+    "git": "git clone --branch codex-preservation/2026-11-13/steadychunks https://github.com/yymm1976/SteadyChunks.git",
+    "releaseAssets": "Download every asset in release.assets. For split parts, concatenate part-001 through the declared final part in numeric order, then verify SHA-256 and extract with tar -xzf.",
+    "externalContent": "Ignored QA, research, build-output, and asset files listed in the preservation manifest are stored in the matching release assets.",
+    "dpapi": "The private tool-configuration asset is DPAPI-protected for the current Windows user. Recovery requires the same user profile and the documented fixed entropy."
+  }
+}
